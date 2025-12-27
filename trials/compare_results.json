@@ -1,0 +1,69 @@
+{
+  "gridstate": "array/gridstate.json",
+  "horizon": 8,
+  "gamma": 0.95,
+  "seed": 0,
+  "runs": [
+    {
+      "name": "gene_random_global",
+      "baseline_obj": 0.798859137510241,
+      "best_obj": 0.8171861282558008,
+      "baseline_h1": 0.4306332298394817,
+      "best_h1": 0.4489602205850416,
+      "baseline_hH": 0.06424496856616034,
+      "best_hH": 0.06424496856616034,
+      "runtime_ms": 10916.459083557129
+    },
+    {
+      "name": "gene_cem_global",
+      "baseline_obj": 0.798859137510241,
+      "best_obj": 0.8171861282558008,
+      "baseline_h1": 0.4306332298394817,
+      "best_h1": 0.4489602205850416,
+      "baseline_hH": 0.06424496856616034,
+      "best_hH": 0.06424496856616034,
+      "runtime_ms": 13212.091207504272
+    },
+    {
+      "name": "gene_cem_two_region",
+      "baseline_obj": 0.798859137510241,
+      "best_obj": 0.8148553860771421,
+      "baseline_h1": 0.4306332298394817,
+      "best_h1": 0.4466294784063829,
+      "baseline_hH": 0.06424496856616034,
+      "best_hH": 0.06424496856616034,
+      "runtime_ms": 13040.331840515137
+    },
+    {
+      "name": "protein_cem_teacher",
+      "baseline_obj": 0.798859137510241,
+      "best_obj": 0.8485569758625762,
+      "baseline_h1": 0.4306332298394817,
+      "best_h1": 0.480331068191817,
+      "baseline_hH": 0.06424496856616034,
+      "best_hH": 0.06424496856616034,
+      "runtime_ms": 13596.737146377563
+    },
+    {
+      "name": "molecule_cem_teacher",
+      "baseline_obj": 0.798859137510241,
+      "best_obj": 0.8171861282558008,
+      "baseline_h1": 0.4306332298394817,
+      "best_h1": 0.4489602205850416,
+      "baseline_hH": 0.06424496856616034,
+      "best_hH": 0.06424496856616034,
+      "runtime_ms": 13301.01728439331
+    },
+    {
+      "name": "all_cem_teacher",
+      "baseline_obj": 0.798859137510241,
+      "best_obj": 0.9049118355570239,
+      "baseline_h1": 0.4306332298394817,
+      "best_h1": 0.4878605992125384,
+      "baseline_hH": 0.06424496856616034,
+      "best_hH": 0.06424496856616034,
+      "runtime_ms": 13961.770057678223
+    }
+  ],
+  "total_runtime_ms": 78414.50905799866
+}

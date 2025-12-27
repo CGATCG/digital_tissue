@@ -1,0 +1,889 @@
+{
+  "gridstate": "array/gridstate.json",
+  "H": 40,
+  "W": 100,
+  "measurement": "morphological_health",
+  "expr": "(mean(cell == morphology))**20",
+  "genes": [
+    "gene_antibiotic",
+    "gene_atp_maker",
+    "gene_divider",
+    "gene_fixer",
+    "gene_grower",
+    "gene_ribosome",
+    "gene_rna_pol"
+  ],
+  "params": {
+    "candidates": 64,
+    "active_k": 8,
+    "seed": 0,
+    "clip_lo": 0.0,
+    "clip_hi": 150.0,
+    "multiplier_choices": [
+      0.5,
+      0.8,
+      1.0,
+      1.2,
+      1.5,
+      2.0
+    ]
+  },
+  "baseline": {
+    "score_t": 1.0,
+    "score_t1": 0.4306332298394817,
+    "delta": -0.5693667701605183
+  },
+  "best_candidate": {
+    "score_t1": 0.4489602205850416,
+    "multipliers": {
+      "gene_fixer": 1.0,
+      "gene_ribosome": 0.5,
+      "gene_grower": 1.2,
+      "gene_atp_maker": 1.0,
+      "gene_rna_pol": 1.5,
+      "gene_antibiotic": 1.2,
+      "gene_divider": 0.5
+    },
+    "improvement_over_baseline_t1": 0.01832699074555988
+  },
+  "candidates": [
+    {
+      "i": -1,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {}
+    },
+    {
+      "i": 0,
+      "score_t1": 0.4420024338794074,
+      "multipliers": {
+        "gene_fixer": 1.0,
+        "gene_divider": 2.0,
+        "gene_grower": 1.0,
+        "gene_antibiotic": 0.8,
+        "gene_ribosome": 1.5,
+        "gene_rna_pol": 1.5,
+        "gene_atp_maker": 2.0
+      }
+    },
+    {
+      "i": 1,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_fixer": 1.2,
+        "gene_antibiotic": 1.0,
+        "gene_divider": 2.0,
+        "gene_rna_pol": 1.5,
+        "gene_atp_maker": 0.8,
+        "gene_grower": 2.0,
+        "gene_ribosome": 1.5
+      }
+    },
+    {
+      "i": 2,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_fixer": 1.0,
+        "gene_grower": 0.5,
+        "gene_atp_maker": 0.5,
+        "gene_ribosome": 1.0,
+        "gene_rna_pol": 0.5,
+        "gene_divider": 1.5,
+        "gene_antibiotic": 0.8
+      }
+    },
+    {
+      "i": 3,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {
+        "gene_grower": 1.5,
+        "gene_fixer": 1.2,
+        "gene_ribosome": 0.8,
+        "gene_antibiotic": 1.0,
+        "gene_atp_maker": 1.5,
+        "gene_divider": 1.0,
+        "gene_rna_pol": 2.0
+      }
+    },
+    {
+      "i": 4,
+      "score_t1": 0.4351471639822611,
+      "multipliers": {
+        "gene_ribosome": 2.0,
+        "gene_rna_pol": 0.8,
+        "gene_atp_maker": 1.5,
+        "gene_antibiotic": 0.8,
+        "gene_grower": 1.0,
+        "gene_fixer": 0.5,
+        "gene_divider": 1.5
+      }
+    },
+    {
+      "i": 5,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {
+        "gene_fixer": 1.0,
+        "gene_divider": 1.2,
+        "gene_rna_pol": 1.2,
+        "gene_grower": 0.8,
+        "gene_ribosome": 1.0,
+        "gene_atp_maker": 1.2,
+        "gene_antibiotic": 2.0
+      }
+    },
+    {
+      "i": 6,
+      "score_t1": 0.43288460745798263,
+      "multipliers": {
+        "gene_antibiotic": 2.0,
+        "gene_grower": 1.0,
+        "gene_atp_maker": 2.0,
+        "gene_fixer": 1.0,
+        "gene_ribosome": 1.0,
+        "gene_rna_pol": 0.5,
+        "gene_divider": 1.2
+      }
+    },
+    {
+      "i": 7,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_antibiotic": 1.0,
+        "gene_ribosome": 1.2,
+        "gene_rna_pol": 1.2,
+        "gene_atp_maker": 2.0,
+        "gene_divider": 0.5,
+        "gene_grower": 2.0,
+        "gene_fixer": 1.0
+      }
+    },
+    {
+      "i": 8,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_fixer": 2.0,
+        "gene_ribosome": 0.5,
+        "gene_grower": 0.8,
+        "gene_antibiotic": 1.0,
+        "gene_divider": 2.0,
+        "gene_rna_pol": 0.8,
+        "gene_atp_maker": 0.8
+      }
+    },
+    {
+      "i": 9,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_fixer": 1.5,
+        "gene_antibiotic": 1.5,
+        "gene_divider": 1.2,
+        "gene_ribosome": 1.5,
+        "gene_atp_maker": 0.8,
+        "gene_grower": 1.2,
+        "gene_rna_pol": 0.5
+      }
+    },
+    {
+      "i": 10,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_fixer": 1.0,
+        "gene_divider": 1.0,
+        "gene_ribosome": 0.5,
+        "gene_antibiotic": 2.0,
+        "gene_grower": 0.5,
+        "gene_rna_pol": 0.5,
+        "gene_atp_maker": 2.0
+      }
+    },
+    {
+      "i": 11,
+      "score_t1": 0.4283929787870778,
+      "multipliers": {
+        "gene_divider": 1.5,
+        "gene_rna_pol": 1.0,
+        "gene_ribosome": 0.8,
+        "gene_antibiotic": 1.5,
+        "gene_fixer": 0.8,
+        "gene_grower": 1.0,
+        "gene_atp_maker": 0.8
+      }
+    },
+    {
+      "i": 12,
+      "score_t1": 0.4466294784063829,
+      "multipliers": {
+        "gene_atp_maker": 1.0,
+        "gene_grower": 2.0,
+        "gene_ribosome": 0.5,
+        "gene_divider": 1.2,
+        "gene_antibiotic": 1.2,
+        "gene_rna_pol": 1.5,
+        "gene_fixer": 1.0
+      }
+    },
+    {
+      "i": 13,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_atp_maker": 0.8,
+        "gene_ribosome": 0.8,
+        "gene_antibiotic": 1.2,
+        "gene_rna_pol": 1.2,
+        "gene_divider": 1.2,
+        "gene_grower": 0.8,
+        "gene_fixer": 0.8
+      }
+    },
+    {
+      "i": 14,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {
+        "gene_rna_pol": 1.0,
+        "gene_grower": 0.8,
+        "gene_atp_maker": 1.5,
+        "gene_fixer": 2.0,
+        "gene_ribosome": 2.0,
+        "gene_antibiotic": 0.5,
+        "gene_divider": 0.5
+      }
+    },
+    {
+      "i": 15,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_fixer": 0.5,
+        "gene_antibiotic": 2.0,
+        "gene_rna_pol": 0.8,
+        "gene_divider": 0.8,
+        "gene_grower": 0.5,
+        "gene_atp_maker": 0.8,
+        "gene_ribosome": 1.0
+      }
+    },
+    {
+      "i": 16,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_fixer": 0.8,
+        "gene_antibiotic": 2.0,
+        "gene_grower": 1.5,
+        "gene_rna_pol": 2.0,
+        "gene_divider": 1.2,
+        "gene_ribosome": 0.5,
+        "gene_atp_maker": 1.5
+      }
+    },
+    {
+      "i": 17,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_divider": 1.5,
+        "gene_atp_maker": 2.0,
+        "gene_grower": 0.8,
+        "gene_ribosome": 1.5,
+        "gene_fixer": 1.0,
+        "gene_rna_pol": 1.5,
+        "gene_antibiotic": 0.5
+      }
+    },
+    {
+      "i": 18,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_antibiotic": 2.0,
+        "gene_fixer": 1.5,
+        "gene_ribosome": 0.5,
+        "gene_atp_maker": 1.2,
+        "gene_divider": 1.5,
+        "gene_rna_pol": 2.0,
+        "gene_grower": 1.5
+      }
+    },
+    {
+      "i": 19,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_ribosome": 0.8,
+        "gene_rna_pol": 1.5,
+        "gene_divider": 0.8,
+        "gene_fixer": 2.0,
+        "gene_antibiotic": 2.0,
+        "gene_grower": 2.0,
+        "gene_atp_maker": 1.0
+      }
+    },
+    {
+      "i": 20,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_divider": 0.8,
+        "gene_antibiotic": 0.5,
+        "gene_fixer": 1.5,
+        "gene_grower": 0.5,
+        "gene_atp_maker": 0.5,
+        "gene_ribosome": 0.5,
+        "gene_rna_pol": 1.2
+      }
+    },
+    {
+      "i": 21,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_fixer": 0.8,
+        "gene_ribosome": 0.5,
+        "gene_antibiotic": 0.8,
+        "gene_atp_maker": 2.0,
+        "gene_rna_pol": 2.0,
+        "gene_grower": 1.5,
+        "gene_divider": 2.0
+      }
+    },
+    {
+      "i": 22,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_antibiotic": 1.5,
+        "gene_atp_maker": 0.8,
+        "gene_fixer": 0.8,
+        "gene_rna_pol": 0.5,
+        "gene_ribosome": 0.8,
+        "gene_divider": 1.5,
+        "gene_grower": 2.0
+      }
+    },
+    {
+      "i": 23,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {
+        "gene_rna_pol": 1.0,
+        "gene_atp_maker": 1.2,
+        "gene_grower": 2.0,
+        "gene_ribosome": 0.5,
+        "gene_fixer": 0.5,
+        "gene_divider": 1.5,
+        "gene_antibiotic": 0.8
+      }
+    },
+    {
+      "i": 24,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_grower": 0.8,
+        "gene_atp_maker": 1.2,
+        "gene_fixer": 0.8,
+        "gene_divider": 2.0,
+        "gene_rna_pol": 0.5,
+        "gene_ribosome": 0.5,
+        "gene_antibiotic": 1.5
+      }
+    },
+    {
+      "i": 25,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_divider": 0.5,
+        "gene_fixer": 1.2,
+        "gene_antibiotic": 0.5,
+        "gene_rna_pol": 0.8,
+        "gene_grower": 1.2,
+        "gene_atp_maker": 1.2,
+        "gene_ribosome": 1.0
+      }
+    },
+    {
+      "i": 26,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_divider": 2.0,
+        "gene_antibiotic": 1.5,
+        "gene_atp_maker": 1.5,
+        "gene_ribosome": 1.2,
+        "gene_grower": 0.5,
+        "gene_rna_pol": 1.0,
+        "gene_fixer": 1.5
+      }
+    },
+    {
+      "i": 27,
+      "score_t1": 0.43970602427017746,
+      "multipliers": {
+        "gene_fixer": 0.8,
+        "gene_divider": 0.5,
+        "gene_antibiotic": 1.0,
+        "gene_ribosome": 1.2,
+        "gene_rna_pol": 0.5,
+        "gene_atp_maker": 1.0,
+        "gene_grower": 0.5
+      }
+    },
+    {
+      "i": 28,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_rna_pol": 2.0,
+        "gene_antibiotic": 0.5,
+        "gene_grower": 0.8,
+        "gene_fixer": 1.5,
+        "gene_divider": 1.5,
+        "gene_atp_maker": 0.5,
+        "gene_ribosome": 2.0
+      }
+    },
+    {
+      "i": 29,
+      "score_t1": 0.43970602427017746,
+      "multipliers": {
+        "gene_antibiotic": 1.0,
+        "gene_fixer": 1.0,
+        "gene_grower": 0.5,
+        "gene_atp_maker": 0.5,
+        "gene_rna_pol": 0.5,
+        "gene_divider": 1.0,
+        "gene_ribosome": 0.5
+      }
+    },
+    {
+      "i": 30,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_grower": 1.5,
+        "gene_antibiotic": 2.0,
+        "gene_atp_maker": 1.2,
+        "gene_divider": 1.2,
+        "gene_rna_pol": 0.8,
+        "gene_ribosome": 1.5,
+        "gene_fixer": 0.5
+      }
+    },
+    {
+      "i": 31,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_divider": 0.8,
+        "gene_ribosome": 1.0,
+        "gene_fixer": 1.2,
+        "gene_grower": 1.5,
+        "gene_atp_maker": 1.2,
+        "gene_antibiotic": 0.5,
+        "gene_rna_pol": 1.0
+      }
+    },
+    {
+      "i": 32,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_divider": 0.8,
+        "gene_atp_maker": 0.8,
+        "gene_fixer": 2.0,
+        "gene_ribosome": 2.0,
+        "gene_antibiotic": 1.5,
+        "gene_grower": 1.0,
+        "gene_rna_pol": 1.2
+      }
+    },
+    {
+      "i": 33,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_antibiotic": 1.2,
+        "gene_divider": 0.5,
+        "gene_atp_maker": 1.2,
+        "gene_fixer": 0.5,
+        "gene_ribosome": 0.5,
+        "gene_grower": 1.5,
+        "gene_rna_pol": 0.5
+      }
+    },
+    {
+      "i": 34,
+      "score_t1": 0.4283929787870778,
+      "multipliers": {
+        "gene_divider": 2.0,
+        "gene_atp_maker": 1.0,
+        "gene_grower": 0.5,
+        "gene_fixer": 1.5,
+        "gene_ribosome": 1.5,
+        "gene_antibiotic": 0.5,
+        "gene_rna_pol": 0.8
+      }
+    },
+    {
+      "i": 35,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_atp_maker": 1.5,
+        "gene_antibiotic": 1.2,
+        "gene_rna_pol": 2.0,
+        "gene_fixer": 0.8,
+        "gene_divider": 0.8,
+        "gene_ribosome": 1.0,
+        "gene_grower": 2.0
+      }
+    },
+    {
+      "i": 36,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_fixer": 1.5,
+        "gene_divider": 0.5,
+        "gene_antibiotic": 1.2,
+        "gene_ribosome": 1.0,
+        "gene_grower": 1.2,
+        "gene_atp_maker": 0.8,
+        "gene_rna_pol": 0.5
+      }
+    },
+    {
+      "i": 37,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_fixer": 0.8,
+        "gene_rna_pol": 0.5,
+        "gene_atp_maker": 2.0,
+        "gene_ribosome": 1.5,
+        "gene_grower": 1.5,
+        "gene_divider": 0.5,
+        "gene_antibiotic": 1.0
+      }
+    },
+    {
+      "i": 38,
+      "score_t1": 0.4420024338794074,
+      "multipliers": {
+        "gene_divider": 1.0,
+        "gene_fixer": 1.2,
+        "gene_ribosome": 1.0,
+        "gene_antibiotic": 1.5,
+        "gene_atp_maker": 2.0,
+        "gene_grower": 1.5,
+        "gene_rna_pol": 2.0
+      }
+    },
+    {
+      "i": 39,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_rna_pol": 2.0,
+        "gene_antibiotic": 1.0,
+        "gene_grower": 0.5,
+        "gene_divider": 0.8,
+        "gene_atp_maker": 2.0,
+        "gene_fixer": 1.2,
+        "gene_ribosome": 1.5
+      }
+    },
+    {
+      "i": 40,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_atp_maker": 0.8,
+        "gene_divider": 1.0,
+        "gene_rna_pol": 2.0,
+        "gene_antibiotic": 0.5,
+        "gene_fixer": 1.2,
+        "gene_ribosome": 2.0,
+        "gene_grower": 0.8
+      }
+    },
+    {
+      "i": 41,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_ribosome": 1.0,
+        "gene_atp_maker": 2.0,
+        "gene_antibiotic": 1.2,
+        "gene_fixer": 0.5,
+        "gene_grower": 1.5,
+        "gene_rna_pol": 1.5,
+        "gene_divider": 2.0
+      }
+    },
+    {
+      "i": 42,
+      "score_t1": 0.43970602427017746,
+      "multipliers": {
+        "gene_fixer": 1.0,
+        "gene_atp_maker": 2.0,
+        "gene_antibiotic": 1.5,
+        "gene_ribosome": 2.0,
+        "gene_rna_pol": 2.0,
+        "gene_divider": 1.5,
+        "gene_grower": 2.0
+      }
+    },
+    {
+      "i": 43,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_ribosome": 2.0,
+        "gene_grower": 1.2,
+        "gene_divider": 0.5,
+        "gene_atp_maker": 0.5,
+        "gene_antibiotic": 1.2,
+        "gene_rna_pol": 1.5,
+        "gene_fixer": 0.8
+      }
+    },
+    {
+      "i": 44,
+      "score_t1": 0.4283929787870778,
+      "multipliers": {
+        "gene_grower": 1.2,
+        "gene_ribosome": 1.0,
+        "gene_divider": 0.8,
+        "gene_atp_maker": 0.5,
+        "gene_antibiotic": 0.5,
+        "gene_fixer": 1.0,
+        "gene_rna_pol": 1.5
+      }
+    },
+    {
+      "i": 45,
+      "score_t1": 0.4489602205850416,
+      "multipliers": {
+        "gene_fixer": 1.0,
+        "gene_ribosome": 0.5,
+        "gene_grower": 1.2,
+        "gene_atp_maker": 1.0,
+        "gene_rna_pol": 1.5,
+        "gene_antibiotic": 1.2,
+        "gene_divider": 0.5
+      }
+    },
+    {
+      "i": 46,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_antibiotic": 1.0,
+        "gene_rna_pol": 2.0,
+        "gene_grower": 0.5,
+        "gene_divider": 1.5,
+        "gene_atp_maker": 1.2,
+        "gene_ribosome": 1.2,
+        "gene_fixer": 1.5
+      }
+    },
+    {
+      "i": 47,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_atp_maker": 0.8,
+        "gene_rna_pol": 1.5,
+        "gene_fixer": 1.5,
+        "gene_antibiotic": 0.8,
+        "gene_divider": 1.0,
+        "gene_grower": 0.5,
+        "gene_ribosome": 2.0
+      }
+    },
+    {
+      "i": 48,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_ribosome": 0.5,
+        "gene_rna_pol": 0.8,
+        "gene_divider": 1.2,
+        "gene_fixer": 1.2,
+        "gene_grower": 0.5,
+        "gene_antibiotic": 0.5,
+        "gene_atp_maker": 1.2
+      }
+    },
+    {
+      "i": 49,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_atp_maker": 0.5,
+        "gene_fixer": 0.5,
+        "gene_divider": 1.0,
+        "gene_antibiotic": 0.5,
+        "gene_ribosome": 0.8,
+        "gene_rna_pol": 1.0,
+        "gene_grower": 1.0
+      }
+    },
+    {
+      "i": 50,
+      "score_t1": 0.43288460745798263,
+      "multipliers": {
+        "gene_grower": 2.0,
+        "gene_antibiotic": 1.2,
+        "gene_rna_pol": 1.2,
+        "gene_fixer": 1.2,
+        "gene_ribosome": 2.0,
+        "gene_divider": 1.0,
+        "gene_atp_maker": 2.0
+      }
+    },
+    {
+      "i": 51,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_atp_maker": 1.0,
+        "gene_antibiotic": 1.5,
+        "gene_divider": 2.0,
+        "gene_ribosome": 2.0,
+        "gene_fixer": 0.5,
+        "gene_rna_pol": 1.5,
+        "gene_grower": 2.0
+      }
+    },
+    {
+      "i": 52,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_ribosome": 1.2,
+        "gene_divider": 2.0,
+        "gene_grower": 2.0,
+        "gene_fixer": 0.5,
+        "gene_antibiotic": 0.5,
+        "gene_rna_pol": 1.5,
+        "gene_atp_maker": 1.5
+      }
+    },
+    {
+      "i": 53,
+      "score_t1": 0.40446983123827995,
+      "multipliers": {
+        "gene_ribosome": 2.0,
+        "gene_fixer": 1.0,
+        "gene_atp_maker": 0.5,
+        "gene_rna_pol": 2.0,
+        "gene_antibiotic": 1.5,
+        "gene_grower": 0.8,
+        "gene_divider": 0.5
+      }
+    },
+    {
+      "i": 54,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {
+        "gene_antibiotic": 0.5,
+        "gene_atp_maker": 1.0,
+        "gene_grower": 1.5,
+        "gene_fixer": 1.0,
+        "gene_rna_pol": 1.2,
+        "gene_ribosome": 0.8,
+        "gene_divider": 1.2
+      }
+    },
+    {
+      "i": 55,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_grower": 1.0,
+        "gene_ribosome": 0.5,
+        "gene_rna_pol": 1.0,
+        "gene_fixer": 0.5,
+        "gene_atp_maker": 1.2,
+        "gene_antibiotic": 1.0,
+        "gene_divider": 1.5
+      }
+    },
+    {
+      "i": 56,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_antibiotic": 1.2,
+        "gene_grower": 1.2,
+        "gene_fixer": 0.5,
+        "gene_divider": 1.0,
+        "gene_rna_pol": 1.2,
+        "gene_atp_maker": 1.0,
+        "gene_ribosome": 0.5
+      }
+    },
+    {
+      "i": 57,
+      "score_t1": 0.4306332298394817,
+      "multipliers": {
+        "gene_ribosome": 1.0,
+        "gene_antibiotic": 2.0,
+        "gene_divider": 1.5,
+        "gene_atp_maker": 1.2,
+        "gene_rna_pol": 1.2,
+        "gene_fixer": 1.5,
+        "gene_grower": 1.2
+      }
+    },
+    {
+      "i": 58,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_atp_maker": 1.0,
+        "gene_fixer": 0.5,
+        "gene_ribosome": 1.5,
+        "gene_divider": 0.5,
+        "gene_rna_pol": 1.5,
+        "gene_grower": 1.5,
+        "gene_antibiotic": 1.0
+      }
+    },
+    {
+      "i": 59,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_rna_pol": 1.2,
+        "gene_fixer": 1.5,
+        "gene_ribosome": 1.5,
+        "gene_antibiotic": 0.5,
+        "gene_divider": 1.2,
+        "gene_atp_maker": 1.5,
+        "gene_grower": 1.5
+      }
+    },
+    {
+      "i": 60,
+      "score_t1": 0.4239456481783813,
+      "multipliers": {
+        "gene_ribosome": 1.2,
+        "gene_antibiotic": 0.5,
+        "gene_grower": 1.5,
+        "gene_rna_pol": 0.5,
+        "gene_divider": 1.2,
+        "gene_fixer": 1.0,
+        "gene_atp_maker": 1.5
+      }
+    },
+    {
+      "i": 61,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_ribosome": 1.2,
+        "gene_rna_pol": 1.2,
+        "gene_divider": 2.0,
+        "gene_antibiotic": 1.0,
+        "gene_grower": 2.0,
+        "gene_atp_maker": 0.5,
+        "gene_fixer": 1.2
+      }
+    },
+    {
+      "i": 62,
+      "score_t1": 0.4065910789576807,
+      "multipliers": {
+        "gene_rna_pol": 1.2,
+        "gene_divider": 0.5,
+        "gene_fixer": 1.2,
+        "gene_grower": 1.5,
+        "gene_ribosome": 0.8,
+        "gene_antibiotic": 1.0,
+        "gene_atp_maker": 2.0
+      }
+    },
+    {
+      "i": 63,
+      "score_t1": 0.42616380219259203,
+      "multipliers": {
+        "gene_ribosome": 1.5,
+        "gene_fixer": 0.5,
+        "gene_antibiotic": 0.5,
+        "gene_atp_maker": 0.5,
+        "gene_grower": 1.0,
+        "gene_divider": 1.2,
+        "gene_rna_pol": 1.5
+      }
+    }
+  ],
+  "runtime_ms": 2044.909954071045
+}

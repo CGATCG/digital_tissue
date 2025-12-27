@@ -1,0 +1,970 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Grid Layer Editor</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar__title">Grid Layer Editor</div>
+        <div class="topbar__actions">
+          <button id="newBtn" class="btn btn--secondary">New</button>
+          <label class="btn btn--secondary">
+            Load
+            <input id="fileInput" type="file" accept="application/json" hidden />
+          </label>
+          <button id="saveBtn" class="btn btn--primary">Save</button>
+          <button id="demoBtn" class="btn btn--secondary">Demo</button>
+        </div>
+      </header>
+
+      <div class="content">
+        <div class="workspace">
+          <div class="screenTabs">
+            <button class="screenBtn screenBtn--active" data-screen="workspace">Workspace</button>
+            <button class="screenBtn" data-screen="manage">Manage</button>
+            <button class="screenBtn" data-screen="assign">Assign values</button>
+            <button class="screenBtn" data-screen="functions">Functions</button>
+            <button class="screenBtn" data-screen="evolution">Evolution</button>
+          </div>
+
+          <div class="screenPanel screenPanel--active" data-screen="workspace">
+            <main class="main">
+              <div id="activeLayerBar" class="activeBar">
+                <div class="activeBar__left">
+                  <div id="activeLayerTitle" class="activeBar__title"></div>
+                  <div id="activeLayerStats" class="activeBar__meta"></div>
+                </div>
+                <div class="activeBar__right">
+                  <select id="layerSelect" class="input input--tiny"></select>
+                  <input id="activeLayerColor" class="input input--tiny" type="color" />
+                </div>
+              </div>
+
+              <div id="canvasWrap" class="canvasWrap">
+                <canvas id="canvas" class="canvas"></canvas>
+                <canvas id="overlay" class="overlay"></canvas>
+              </div>
+            </main>
+
+            <aside class="toolsDock">
+              <div class="tabs">
+                <button class="tabBtn tabBtn--active" data-tab="paint">Paint</button>
+                <button class="tabBtn" data-tab="inspect">Inspect</button>
+                <button class="tabBtn" data-tab="grid">Grid</button>
+              </div>
+
+              <div class="toolsBody">
+                <div class="tabPanel tabPanel--active" data-tab="paint">
+                  <section class="panel">
+                    <div class="panel__title">Paint (categorical)</div>
+                    <div class="row">
+                      <label class="label">Mode</label>
+                      <select id="editMode" class="input">
+                        <option value="brush">brush</option>
+                        <option value="rectangle">rectangle</option>
+                      </select>
+                    </div>
+                    <div class="row">
+                      <label class="label">Value</label>
+                      <input id="paintValue" class="input" type="number" value="1" step="1" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Radius</label>
+                      <input id="brushRadius" class="input" type="range" min="0" max="25" value="2" />
+                    </div>
+                    <div class="row row--inline">
+                      <label class="checkbox"><input id="toggleEraser" type="checkbox" /> Eraser (set 0)</label>
+                    </div>
+                  </section>
+                </div>
+
+                <div class="tabPanel" data-tab="inspect">
+                  <section class="panel">
+                    <div class="panel__title">Inspect</div>
+                    <div class="row row--inline">
+                      <div id="cursorInfo" class="meta">(y,x): –</div>
+                    </div>
+                    <div class="row">
+                      <label class="label">Mode</label>
+                      <select id="inspectMode" class="input">
+                        <option value="summary" selected>Layer summary</option>
+                        <option value="cursor">Cursor table (all layers)</option>
+                      </select>
+                    </div>
+                    <div class="row row--inline">
+                      <div id="inspectCursorValue" class="meta"></div>
+                    </div>
+                    <div class="row row--inline">
+                      <div id="inspectSummaryStats" class="meta"></div>
+                    </div>
+                    <div class="row row--inline">
+                      <canvas id="inspectCanvasHist" class="stepsCanvas stepsCanvas--hist"></canvas>
+                    </div>
+                    <div class="row row--inline">
+                      <div id="inspectTable" class="table"></div>
+                    </div>
+                  </section>
+                </div>
+
+                <div class="tabPanel" data-tab="grid">
+                  <section class="panel">
+                    <div class="panel__title">Grid</div>
+                    <div class="row">
+                      <label class="label">H</label>
+                      <input id="HInput" class="input" type="number" min="4" max="512" value="64" />
+                    </div>
+                    <div class="row">
+                      <label class="label">W</label>
+                      <input id="WInput" class="input" type="number" min="4" max="512" value="96" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Zoom</label>
+                      <input id="zoomInput" class="input" type="range" min="1" max="24" value="8" />
+                    </div>
+                    <div class="row row--inline">
+                      <label class="checkbox"><input id="autoFitZoom" type="checkbox" checked /> Auto-fit zoom</label>
+                    </div>
+                    <div class="row row--inline">
+                      <label class="checkbox"><input id="gridLinesInput" type="checkbox" checked /> Grid lines</label>
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </aside>
+          </div>
+
+          <div class="screenPanel" data-screen="manage">
+            <div class="manageLayout">
+              <aside class="sidebar">
+                <section class="panel">
+                  <div class="panel__title">Layers</div>
+                  <div class="row">
+                    <label class="label">Search</label>
+                    <input id="layerSearchInput" class="input" placeholder="filter layers…" />
+                  </div>
+                  <div class="row row--inline">
+                    <label class="checkbox"><input id="groupByPrefix" type="checkbox" checked /> Group by prefix</label>
+                  </div>
+                  <div class="row row--inline">
+                    <button id="bulkDeleteBtn" class="btn btn--danger btn--full">Delete selected</button>
+                    <div id="bulkDeleteInfo" class="meta"></div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="layersTable" class="table"></div>
+                  </div>
+                </section>
+              </aside>
+
+              <aside class="toolsDock toolsDock--full">
+                <div class="tabs">
+                  <button class="tabBtn tabBtn--active" data-tab="generate">Generate</button>
+                </div>
+
+                <div class="toolsBody">
+                <div class="tabPanel tabPanel--active" data-tab="generate">
+                  <section class="panel">
+                    <div class="panel__title">Bulk add layers (masked)</div>
+                    <div class="help">Create many layers like <span class="mono">prefix1…prefixN</span> and optionally keep only cells where a mask condition is true.</div>
+
+                    <div class="row">
+                      <label class="label">Name prefix</label>
+                      <input id="bulkPrefix" class="input" value="protein_" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Start #</label>
+                      <input id="bulkStart" class="input" type="number" value="1" step="1" />
+                    </div>
+                    <div class="row">
+                      <label class="label">How many</label>
+                      <input id="bulkCount" class="input" type="number" value="100" step="1" min="1" max="10000" />
+                    </div>
+
+                    <div class="row">
+                      <label class="label">If exists</label>
+                      <select id="bulkCollision" class="input">
+                        <option value="error">error</option>
+                        <option value="skip">skip</option>
+                        <option value="overwrite">overwrite</option>
+                      </select>
+                    </div>
+
+                    <div class="row">
+                      <div id="bulkAddPreview" class="meta"></div>
+                    </div>
+
+                    <div class="hr"></div>
+
+                    <div class="row">
+                      <label class="label">Kind</label>
+                      <select id="bulkKind" class="input">
+                        <option value="continuous">continuous</option>
+                        <option value="categorical">categorical</option>
+                        <option value="counts">counts</option>
+                      </select>
+                    </div>
+                    <div class="row">
+                      <label class="label">Initialize</label>
+                      <select id="bulkInit" class="input">
+                        <option value="zeros">zeros</option>
+                        <option value="constant">constant</option>
+                        <option value="random">random</option>
+                        <option value="gradient">gradient</option>
+                      </select>
+                    </div>
+
+                    <details class="details">
+                      <summary class="details__summary">Advanced</summary>
+                      <div class="row">
+                        <label class="label">Value</label>
+                        <input id="bulkValue" class="input" type="number" value="1" step="0.1" />
+                      </div>
+                      <div class="row">
+                        <label class="label">Seed</label>
+                        <input id="bulkSeed" class="input" type="number" value="0" step="1" />
+                      </div>
+                    </details>
+
+                    <div class="hr"></div>
+
+                    <div class="row">
+                      <label class="label">Mask layer</label>
+                      <select id="maskLayer" class="input"></select>
+                    </div>
+                    <div class="row">
+                      <label class="label">Condition</label>
+                      <div class="two">
+                        <select id="maskOp" class="input">
+                          <option value="==">==</option>
+                          <option value="!=">!=</option>
+                          <option value=">">&gt;</option>
+                          <option value=">=">&gt;=</option>
+                          <option value="<">&lt;</option>
+                          <option value="<=">&lt;=</option>
+                        </select>
+                        <input id="maskValue" class="input" type="number" value="1" step="1" />
+                      </div>
+                    </div>
+                    <div class="row row--inline">
+                      <label class="checkbox"><input id="maskInvert" type="checkbox" /> Invert mask</label>
+                    </div>
+
+                    <div class="row">
+                      <button id="bulkAddBtn" class="btn btn--primary btn--full">Bulk add</button>
+                    </div>
+                  </section>
+
+                  <section class="panel">
+                    <div class="panel__title">Derived / patterned layers</div>
+                    <div class="help">Create one new layer per matching source layer. Use <span class="mono">{suffix}</span> in the template to reuse the matched suffix.</div>
+
+                    <div class="row row--inline">
+                      <button id="derivedPresetGeneFromMolecule" class="btn btn--secondary btn--full">Preset: molecule_* → gene_{suffix}</button>
+                    </div>
+
+                    <div class="row">
+                      <label class="label">Match prefix</label>
+                      <input id="derivedSourcePrefix" class="input" value="molecule_" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Create as</label>
+                      <input id="derivedTargetTemplate" class="input" value="gene_{suffix}" />
+                    </div>
+
+                    <div class="row">
+                      <div id="derivedPreview" class="meta"></div>
+                    </div>
+
+                    <details class="details">
+                      <summary class="details__summary">Advanced</summary>
+                      <div class="row">
+                        <label class="label">Kind/color from</label>
+                        <select id="derivedMetaFrom" class="input">
+                          <option value="source">source layer</option>
+                          <option value="prototype">prototype layer</option>
+                        </select>
+                      </div>
+                      <div class="row">
+                        <label class="label">Prototype</label>
+                        <select id="derivedPrototypeLayer" class="input"></select>
+                      </div>
+                      <div class="row">
+                        <label class="label">Data init</label>
+                        <select id="derivedDataInit" class="input">
+                          <option value="zeros">zeros</option>
+                          <option value="copy_source">copy source</option>
+                          <option value="copy_prototype">copy prototype</option>
+                        </select>
+                      </div>
+                      <div class="row row--inline">
+                        <label class="checkbox"><input id="derivedSkipExisting" type="checkbox" checked /> Skip if target exists</label>
+                      </div>
+                    </details>
+                    <div class="row">
+                      <button id="derivedApplyBtn" class="btn btn--primary btn--full">Create derived layers</button>
+                    </div>
+                  </section>
+                </div>
+
+              </div>
+              </aside>
+            </div>
+          </div>
+
+          <div class="screenPanel" data-screen="assign">
+            <div class="assignLayout">
+              <aside class="sidebar">
+                <section class="panel">
+                  <div class="panel__title">Targets</div>
+                  <div class="help">Pick layers to change.</div>
+                  <div class="row">
+                    <label class="label">Search</label>
+                    <input id="opTargetFilter" class="input" placeholder="filter targets…" />
+                  </div>
+                  <div class="row">
+                    <label class="label">+ Prefix</label>
+                    <input id="opTargetPrefix" class="input" placeholder="e.g. gene_" />
+                  </div>
+                  <div class="row row--inline">
+                    <div class="two">
+                      <button id="opTargetsSelectAll" class="btn btn--secondary btn--full">Select all visible</button>
+                      <button id="opTargetsClear" class="btn btn--secondary btn--full">Clear</button>
+                    </div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="opTargetsList" class="targetsList"></div>
+                  </div>
+                </section>
+              </aside>
+
+              <aside class="toolsDock toolsDock--full">
+                <div class="toolsBody">
+                  <section class="panel">
+                    <div class="panel__title">Assign values (masked)</div>
+
+                    <div class="row">
+                      <label class="label">Operation</label>
+                      <select id="opType" class="input">
+                        <option value="set_constant">set constant</option>
+                        <option value="set_random_uniform">set random uniform</option>
+                        <option value="add_random_uniform">add random uniform</option>
+                      </select>
+                    </div>
+                    <div class="row">
+                      <label class="label">Value</label>
+                      <input id="opValue" class="input" type="number" value="1" step="0.1" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Min / Max</label>
+                      <div class="two two--equal">
+                        <input id="opMin" class="input" type="number" value="0" step="0.1" />
+                        <input id="opMax" class="input" type="number" value="1" step="0.1" />
+                      </div>
+                    </div>
+                    <div class="row">
+                      <label class="label">Seed</label>
+                      <input id="opSeed" class="input" type="number" value="0" step="1" />
+                    </div>
+
+                    <div class="hr"></div>
+
+                    <div class="row">
+                      <label class="label">Mask layer</label>
+                      <select id="opMaskLayer" class="input"></select>
+                    </div>
+                    <div class="row">
+                      <label class="label">Condition</label>
+                      <div class="two">
+                        <select id="opMaskOp" class="input">
+                          <option value="==">==</option>
+                          <option value="!=">!=</option>
+                          <option value=">">&gt;</option>
+                          <option value=">=">&gt;=</option>
+                          <option value="<">&lt;</option>
+                          <option value="<=">&lt;=</option>
+                        </select>
+                        <input id="opMaskValue" class="input" type="number" value="1" step="1" />
+                      </div>
+                    </div>
+                    <div class="row row--inline">
+                      <label class="checkbox"><input id="opMaskInvert" type="checkbox" /> Invert mask</label>
+                    </div>
+                    <div class="row row--inline">
+                      <div id="opMaskPreview" class="meta"></div>
+                    </div>
+
+                    <div class="row">
+                      <button id="opApplyBtn" class="btn btn--primary btn--full">Apply to targets</button>
+                    </div>
+                  </section>
+                </div>
+              </aside>
+            </div>
+          </div>
+
+          <div class="screenPanel" data-screen="functions">
+            <div class="functionsLayout">
+              <aside class="toolsDock toolsDock--full">
+                <div class="tabs">
+                  <button class="tabBtn tabBtn--active" data-tab="measurements">Measurements</button>
+                  <button class="tabBtn" data-tab="layerOps">Layer Ops</button>
+                  <button class="tabBtn" data-tab="steps">Steps</button>
+                  <button class="tabBtn" data-tab="runtime">Runtime</button>
+                </div>
+
+                <div class="toolsBody">
+                  <div class="tabPanel tabPanel--active" data-tab="measurements">
+                    <section class="panel">
+                      <div class="panel__title">Measurements</div>
+                      <div class="help">
+                        Define scalar outputs using formulas over layers (spreadsheet-style). These are stored inside gridstate.json and used by the Python CLI.
+                        Use reductions like <span class="mono">mean(x)</span>, <span class="mono">sum(x)</span>, <span class="mono">median(x)</span>, <span class="mono">quantile(x, 0.9)</span>, and optional filters like <span class="mono">where=(circulation==1)</span>.
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Insert layer</label>
+                        <div class="two two--btn">
+                          <select id="fnInsertLayer" class="input"></select>
+                          <button id="fnInsertLayerBtn" class="btn btn--secondary">Insert</button>
+                        </div>
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Insert function</label>
+                        <div class="two two--btn">
+                          <select id="fnInsertFn" class="input"></select>
+                          <button id="fnInsertFnBtn" class="btn btn--secondary">Insert</button>
+                        </div>
+                      </div>
+
+                      <div class="hr"></div>
+
+                      <div class="row row--inline">
+                        <div class="two two--equal">
+                          <button id="fnAddRowBtn" class="btn btn--secondary btn--full">Add measurement</button>
+                          <button id="fnResetBtn" class="btn btn--secondary btn--full">Reset defaults</button>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="fnSpecsTable" class="table"></div>
+                      </div>
+                    </section>
+                  </div>
+
+                  <div class="tabPanel" data-tab="layerOps">
+                    <section class="panel">
+                      <div class="panel__titleRow">
+                        <div class="panel__title">Layer Ops</div>
+                        <button id="opsHelpBtn" class="btn btn--secondary btn--tiny" type="button" aria-label="Layer Ops help">?</button>
+                      </div>
+                      <div class="help">
+                        Define layer-to-layer operations that update existing layers using array expressions (NumPy-style). These are stored inside gridstate.json and executed by a Python script.
+                        Example: <span class="mono">target=cell</span> expr <span class="mono">cell - death</span> or <span class="mono">where(cell==1, atp + glucose*atp_maker*damage, atp)</span>.
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Insert layer</label>
+                        <div class="two two--btn">
+                          <select id="opsInsertLayer" class="input"></select>
+                          <button id="opsInsertLayerBtn" class="btn btn--secondary">Insert</button>
+                        </div>
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Insert function</label>
+                        <div class="two two--btn">
+                          <select id="opsInsertFn" class="input"></select>
+                          <button id="opsInsertFnBtn" class="btn btn--secondary">Insert</button>
+                        </div>
+                      </div>
+
+                      <div class="hr"></div>
+
+                      <div class="opsToolbar">
+                        <div class="opsToolbar__row">
+                          <button id="opsAddRowBtn" class="btn btn--secondary">Add operation</button>
+                          <button id="opsAddVarBtn" class="btn btn--secondary">Add variable</button>
+                          <button id="opsAddForEachBtn" class="btn btn--secondary">Add foreach</button>
+                          <button id="opsAddTransportBtn" class="btn btn--secondary">Add transport</button>
+                          <button id="opsAddDiffusionBtn" class="btn btn--secondary">Add diffusion</button>
+                          <button id="opsAddDivisionBtn" class="btn btn--secondary">Add division</button>
+                        </div>
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Duplicate group</label>
+                        <div class="opsDupGroup">
+                          <select id="opsDupGroupFrom" class="input"></select>
+                          <input id="opsDupGroupTo" class="input" placeholder="new group name (e.g. translation)" />
+                          <button id="opsDupGroupBtn" class="btn btn--secondary">Duplicate</button>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div class="opsToolbar__row opsToolbar__row--secondary">
+                          <button id="opsTestBtn" class="btn btn--secondary">Test operations</button>
+                          <button id="opsResetBtn" class="btn btn--secondary">Clear</button>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="opsSpecsTable" class="table"></div>
+                      </div>
+                    </section>
+                  </div>
+
+                  <div class="tabPanel" data-tab="steps">
+                    <section class="panel">
+                      <div class="panel__title">Steps</div>
+                      <div class="help">
+                        Compare two gridstate JSON snapshots (before/after) and visualize what changed.
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Before</label>
+                        <input id="stepsBeforeFile" class="input" type="file" accept="application/json,.json" />
+                      </div>
+
+                      <div class="row">
+                        <label class="label">After</label>
+                        <input id="stepsAfterFile" class="input" type="file" accept="application/json,.json" />
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="stepsStatus" class="meta"></div>
+                      </div>
+
+                      <div class="hr"></div>
+
+                      <div class="row row--inline">
+                        <label class="meta" style="display:flex;align-items:center;gap:8px;">
+                          <input id="stepsShowLetLayers" type="checkbox" />
+                          show let variables (__let__*)
+                        </label>
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Layer</label>
+                        <select id="stepsLayerSelect" class="input"></select>
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Mask</label>
+                        <div class="stepsMaskRow">
+                          <select id="stepsMaskLayerSelect" class="input"></select>
+                          <select id="stepsMaskMode" class="input input--tiny">
+                            <option value="nonzero">nonzero</option>
+                            <option value="gte">&gt;=</option>
+                            <option value="eq">==</option>
+                          </select>
+                          <input id="stepsMaskValue" class="input input--tiny" type="number" step="any" value="0" />
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="stepsLayerStats" class="meta"></div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="stepsAxes" class="meta"></div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="stepsDiffTable" class="table"></div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div class="stepsViz3">
+                          <div>
+                            <div class="meta">before</div>
+                            <div class="stepsCanvasWrap">
+                              <canvas id="stepsCanvasBefore" class="stepsCanvas"></canvas>
+                              <div class="stepsOverlay">
+                                <div class="stepsLegendTitle">range</div>
+                                <div id="stepsLegendBeforeText" class="stepsLegendText"></div>
+                                <div id="stepsLegendBeforeBar" class="stepsLegendBar"></div>
+                              </div>
+                            </div>
+                          </div>
+                          <div>
+                            <div class="meta">after</div>
+                            <div class="stepsCanvasWrap">
+                              <canvas id="stepsCanvasAfter" class="stepsCanvas"></canvas>
+                              <div class="stepsOverlay">
+                                <div class="stepsLegendTitle">range</div>
+                                <div id="stepsLegendAfterText" class="stepsLegendText"></div>
+                                <div id="stepsLegendAfterBar" class="stepsLegendBar"></div>
+                              </div>
+                            </div>
+                          </div>
+                          <div>
+                            <div class="meta">diff</div>
+                            <div class="stepsCanvasWrap">
+                              <canvas id="stepsCanvasDiff" class="stepsCanvas"></canvas>
+                              <div class="stepsOverlay">
+                                <div class="stepsLegendTitle">scale</div>
+                                <div id="stepsLegendDiffText" class="stepsLegendText"></div>
+                                <div id="stepsLegendDiffBar" class="stepsLegendBar"></div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div>
+                          <div class="meta">histograms</div>
+                          <div class="stepsViz3">
+                            <div>
+                              <div class="meta">before</div>
+                              <canvas id="stepsCanvasHistBefore" class="stepsCanvas stepsCanvas--hist"></canvas>
+                            </div>
+                            <div>
+                              <div class="meta">after</div>
+                              <canvas id="stepsCanvasHistAfter" class="stepsCanvas stepsCanvas--hist"></canvas>
+                            </div>
+                            <div>
+                              <div class="meta">diff</div>
+                              <canvas id="stepsCanvasHistDiff" class="stepsCanvas stepsCanvas--hist"></canvas>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="hr"></div>
+
+                      <div class="row">
+                        <label class="label">Scatter</label>
+                        <div class="stepsMaskRow">
+                          <label class="meta" style="display:flex;align-items:center;gap:8px;">
+                            <input id="stepsScatterEnabled" type="checkbox" />
+                            enabled
+                          </label>
+                          <select id="stepsScatterSource" class="input input--tiny">
+                            <option value="after">after</option>
+                            <option value="before">before</option>
+                            <option value="diff">diff</option>
+                          </select>
+                          <select id="stepsScatterX" class="input"></select>
+                          <select id="stepsScatterY" class="input"></select>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <canvas id="stepsCanvasScatter" class="stepsCanvas stepsCanvas--scatter"></canvas>
+                      </div>
+                    </section>
+                  </div>
+
+                  <div class="tabPanel" data-tab="runtime">
+                    <section class="panel">
+                      <div class="panel__title">Runtime</div>
+                      <div class="help">
+                        Load a gridstate.json, then repeatedly apply Layer Ops (one step per tick) and visualize selected layers as live heatmaps.
+                        This requires running the local runtime server.
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Gridstate</label>
+                        <input id="rtFile" class="input" type="file" accept="application/json,.json" />
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Tick interval (ms)</label>
+                        <div class="two two--btn">
+                          <input id="rtIntervalMs" class="input" type="number" min="50" step="50" value="500" />
+                          <button id="rtStartStopBtn" class="btn btn--secondary">Start</button>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div class="two two--btn">
+                          <button id="rtStepBtn" class="btn btn--secondary">Step once</button>
+                          <button id="rtResetBtn" class="btn btn--secondary">Reset</button>
+                        </div>
+                      </div>
+
+                      <div class="row row--inline">
+                        <div id="rtStatus" class="meta"></div>
+                      </div>
+
+                      <div class="hr"></div>
+
+                      <div class="runtimeDash">
+                        <div class="runtimeDash__left">
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Events</div>
+                            <div id="rtEventsList" class="runtimeEventsList"></div>
+                          </div>
+
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Layer scalars</div>
+                            <div class="runtimeBlock__controls">
+                              <label class="meta">Window (ticks)</label>
+                              <input id="rtScalarsWindow" class="input input--tiny" type="number" min="10" step="10" value="200" />
+                              <label class="checkbox"><input id="rtScalarsLog" type="checkbox" /> Log</label>
+                            </div>
+                            <div id="rtScalarsList" class="runtimeScalarsList"></div>
+                          </div>
+
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Measurements</div>
+                            <div class="runtimeBlock__controls">
+                              <label class="meta">Window (ticks)</label>
+                              <input id="rtMeasWindow" class="input input--tiny" type="number" min="10" step="10" value="300" />
+                              <label class="checkbox"><input id="rtMeasNormalize" type="checkbox" checked /> Normalize</label>
+                              <label class="checkbox"><input id="rtMeasLog" type="checkbox" /> Log</label>
+                            </div>
+                            <div class="runtimeMeasWrap">
+                              <canvas id="rtMeasCanvas" class="runtimeMeasCanvas"></canvas>
+                            </div>
+                            <div id="rtMeasList" class="runtimeMeasList"></div>
+                          </div>
+
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Survival @ t=0</div>
+                            <div class="runtimeBlock__controls">
+                              <label class="meta">Focus</label>
+                              <select id="rtSurvFocus" class="input input--tiny">
+                                <option value="gene">gene_*</option>
+                                <option value="protein">protein_*</option>
+                                <option value="rna">rna_*</option>
+                                <option value="molecule">molecule_*</option>
+                                <option value="damage">damage*</option>
+                                <option value="all">all</option>
+                              </select>
+                              <label class="meta">Top</label>
+                              <input id="rtSurvTopK" class="input input--tiny" type="number" min="5" step="5" value="12" />
+                              <label class="checkbox"><input id="rtSurvLog1p" type="checkbox" checked /> log1p</label>
+                            </div>
+                            <div id="rtSurvList" class="runtimeSurvList"></div>
+                          </div>
+                        </div>
+
+                        <div class="runtimeDash__right">
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Watch layers</div>
+                            <div class="runtimeBlock__controls">
+                              <select id="rtAddLayerSelect" class="input"></select>
+                              <button id="rtAddLayerBtn" class="btn btn--secondary btn--tiny">Add</button>
+                            </div>
+                            <div id="rtWatchList" class="runtimeWatchList"></div>
+                          </div>
+
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Overlay</div>
+                            <div class="runtimeOverlayWrap">
+                              <canvas id="rtOverlayCanvas" class="stepsCanvas"></canvas>
+                            </div>
+                          </div>
+
+                          <div class="runtimeBlock">
+                            <div class="runtimeBlock__title">Heatmaps</div>
+                            <div class="runtimeBlock__controls">
+                              <label class="meta">Columns</label>
+                              <select id="rtVizCols" class="input input--tiny">
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                                <option value="4">4</option>
+                              </select>
+                            </div>
+                            <div class="runtimeHeatmapsWrap">
+                              <div class="runtimeHeatmapsWrap__left">
+                                <div class="runtimeHistControls">
+                                  <label class="meta">Layer</label>
+                                  <select id="rtHistLayer" class="input input--tiny"></select>
+                                  <label class="meta">Bins</label>
+                                  <input id="rtHistBins" class="input input--tiny" type="number" min="10" step="10" value="60" />
+                                  <label class="checkbox"><input id="rtHistLogY" type="checkbox" /> Log Y</label>
+                                </div>
+                                <div class="runtimeHistWrap">
+                                  <canvas id="rtHistCanvas" class="runtimeHistCanvas"></canvas>
+                                </div>
+                              </div>
+                              <div class="runtimeHeatmapsWrap__right">
+                                <div id="rtVizGrid" class="runtimeVizGrid"></div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </section>
+                  </div>
+                </div>
+              </aside>
+            </div>
+          </div>
+
+          <div class="screenPanel" data-screen="evolution">
+            <div class="evoLayout">
+              <aside class="sidebar">
+                <section class="panel">
+                  <div class="panel__title">Evolution</div>
+                  <div class="help">
+                    Run evolutionary search over initial gene/rna/protein layers using scale/bias mutations and select the best-performing candidates.
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Base payload</label>
+                    <select id="evoBase" class="input">
+                      <option value="runtime">Runtime file (if loaded)</option>
+                      <option value="editor">Current editor state</option>
+                    </select>
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Algorithm</label>
+                    <select id="evoAlgo" class="input">
+                      <option value="cem_delta" selected>CEM delta-field</option>
+                      <option value="affine">Affine GA (scale/bias)</option>
+                    </select>
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Variants per generation</label>
+                    <input id="evoVariants" class="input" type="number" min="1" step="1" value="200" />
+                  </div>
+                  <div class="row">
+                    <label class="label">Ticks per evaluation</label>
+                    <input id="evoTicks" class="input" type="number" min="1" step="1" value="50" />
+                  </div>
+                  <div class="row">
+                    <label class="label">Generations</label>
+                    <input id="evoGenerations" class="input" type="number" min="1" step="1" value="30" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Elites</label>
+                    <input id="evoElites" class="input" type="number" min="1" step="1" value="10" />
+                  </div>
+                  <div class="row">
+                    <label class="label">Replicates</label>
+                    <input id="evoReplicates" class="input" type="number" min="1" step="1" value="1" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Workers</label>
+                    <input id="evoWorkers" class="input" type="number" min="1" step="1" value="4" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Seed</label>
+                    <input id="evoSeed" class="input" type="number" step="1" value="1" />
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row">
+                    <label class="label">Mutation rate</label>
+                    <input id="evoMutationRate" class="input" type="number" min="0" max="1" step="0.01" value="0.15" />
+                  </div>
+                  <div class="row">
+                    <label class="label">Scale sigma</label>
+                    <input id="evoSigmaScale" class="input" type="number" min="0" step="0.01" value="0.25" />
+                  </div>
+                  <div class="row">
+                    <label class="label">Bias sigma</label>
+                    <input id="evoSigmaBias" class="input" type="number" min="0" step="0.01" value="0.25" />
+                  </div>
+                  <div class="row">
+                    <label class="label">CEM delta sigma (init)</label>
+                    <input id="evoCemSigma" class="input" type="number" min="0" step="0.01" value="0.50" />
+                  </div>
+                  <div class="row">
+                    <label class="label">CEM alpha</label>
+                    <input id="evoCemAlpha" class="input" type="number" min="0" max="1" step="0.01" value="0.70" />
+                  </div>
+                  <div class="row">
+                    <label class="label">CEM sigma floor</label>
+                    <input id="evoCemSigmaFloor" class="input" type="number" min="0" step="0.01" value="0.05" />
+                  </div>
+                  <div class="row">
+                    <label class="label">CEM delta mask</label>
+                    <select id="evoCemMask" class="input">
+                      <option value="cell" selected>Only initial cells</option>
+                      <option value="all">All grid cells</option>
+                    </select>
+                  </div>
+                  <div class="row">
+                    <label class="label">Huge (upper bound)</label>
+                    <input id="evoHuge" class="input" type="number" min="1" step="1" value="1000000000" />
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row">
+                    <label class="label">Fitness weights</label>
+                    <div class="evoWeights">
+                      <div class="evoWeightRow">
+                        <div class="meta">alive</div>
+                        <input id="evoWAlive" class="input input--tiny" type="number" step="0.1" value="1" />
+                      </div>
+                      <div class="evoWeightRow">
+                        <div class="meta">divisions</div>
+                        <input id="evoWDiv" class="input input--tiny" type="number" step="0.1" value="2" />
+                      </div>
+                      <div class="evoWeightRow">
+                        <div class="meta">starvation deaths</div>
+                        <input id="evoWStarv" class="input input--tiny" type="number" step="0.1" value="-1" />
+                      </div>
+                      <div class="evoWeightRow">
+                        <div class="meta">damage deaths</div>
+                        <input id="evoWDmg" class="input input--tiny" type="number" step="0.1" value="-1" />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="row row--inline">
+                    <div class="two two--btn">
+                      <button id="evoStartBtn" class="btn btn--secondary">Start</button>
+                      <button id="evoStopBtn" class="btn btn--secondary">Stop</button>
+                    </div>
+                  </div>
+
+                  <div class="row row--inline">
+                    <div id="evoStatus" class="meta"></div>
+                  </div>
+                </section>
+              </aside>
+
+              <aside class="toolsDock toolsDock--full">
+                <section class="panel">
+                  <div class="panel__title">Progress</div>
+                  <div class="evoPlotWrap">
+                    <canvas id="evoCanvas" class="evoCanvas"></canvas>
+                  </div>
+                  <div class="hr"></div>
+                  <div class="panel__title">Top candidates</div>
+                  <div id="evoTopList" class="table"></div>
+                </section>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="helpModal" class="modal" aria-hidden="true">
+        <div id="helpModalOverlay" class="modal__overlay"></div>
+        <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="helpModalTitle">
+          <div class="modal__header">
+            <div id="helpModalTitle" class="modal__title">Help</div>
+            <button id="helpModalClose" class="btn btn--secondary btn--tiny" type="button">Close</button>
+          </div>
+          <div id="helpModalBody" class="modal__body"></div>
+        </div>
+      </div>
+
+      <footer class="footer">
+        <div class="hint">
+          Load/Save uses a single JSON file containing grid dimensions, metadata, and base64 Float32 layer buffers.
+        </div>
+      </footer>
+    </div>
+
+    <script type="module" src="app.js?v=div2"></script>
+  </body>
+</html>
