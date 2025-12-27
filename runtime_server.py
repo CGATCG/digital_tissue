@@ -160,6 +160,14 @@ class _EvolutionJob:
         self.candidates: Dict[str, Dict[str, Any]] = {}
         self.top_ids: list[str] = []
 
+        self.perf: Dict[str, Any] = {
+            "evals": 0,
+            "apply_s": 0.0,
+            "ticks_s": 0.0,
+            "decode_cell_s": 0.0,
+            "total_s": 0.0,
+        }
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -191,6 +199,7 @@ class _EvolutionJob:
                 "p10": list(history.get("p10") or []),
                 "p90": list(history.get("p90") or []),
             }
+            perf_out = dict(self.perf) if isinstance(self.perf, dict) else {}
             return {
                 "ok": True,
                 "job_id": self.job_id,
@@ -201,6 +210,7 @@ class _EvolutionJob:
                 "history": history_out,
                 "baseline": baseline,
                 "series": series_out,
+                "perf": perf_out,
                 "top": top,
             }
 
@@ -292,6 +302,13 @@ class _EvolutionJob:
         self._series_sum = 0.0
         self._series_n = 0
         self._series_best = float("-inf")
+        self.perf = {
+            "evals": 0,
+            "apply_s": 0.0,
+            "ticks_s": 0.0,
+            "decode_cell_s": 0.0,
+            "total_s": 0.0,
+        }
         self.progress = {
             "generation": 0,
             "variant": 0,
@@ -414,6 +431,16 @@ class _EvolutionJob:
 
         rng = np.random.default_rng(seed)
 
+        def _perf_add(apply_s: float, ticks_s: float, decode_cell_s: float, total_s: float) -> None:
+            with self._lock:
+                p = self.perf if isinstance(self.perf, dict) else {}
+                p["evals"] = int(p.get("evals") or 0) + 1
+                p["apply_s"] = float(p.get("apply_s") or 0.0) + float(apply_s)
+                p["ticks_s"] = float(p.get("ticks_s") or 0.0) + float(ticks_s)
+                p["decode_cell_s"] = float(p.get("decode_cell_s") or 0.0) + float(decode_cell_s)
+                p["total_s"] = float(p.get("total_s") or 0.0) + float(total_s)
+                self.perf = p
+
         def _mutate_genome(parent: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
             g = {k: {"scale": float(v.get("scale", 1.0)), "bias": float(v.get("bias", 0.0))} for k, v in parent.items()}
             for nm in mutable_names:
@@ -463,18 +490,28 @@ class _EvolutionJob:
             return out
 
         def _eval_genome(genome: Dict[str, Any], seed0: int) -> Dict[str, Any]:
+            t_total0 = time.perf_counter()
+            t_apply0 = time.perf_counter()
             p = _apply_genome_to_payload(base_payload, genome)
+            t_apply = time.perf_counter() - t_apply0
+
+            t_ticks = 0.0
             for t in range(ticks):
                 if self._stop.is_set():
                     raise RuntimeError("stopped")
+                tt0 = time.perf_counter()
                 apply_layer_ops_inplace(p, seed_offset=seed0 + t)
+                t_ticks += time.perf_counter() - tt0
             dd = p.get("data")
             if not isinstance(dd, dict):
                 raise ValueError("payload missing data")
             cell_ent2 = dd.get(cell_layer)
             if not isinstance(cell_ent2, dict) or cell_ent2.get("dtype") != "float32":
                 raise ValueError("payload missing cell layer")
+
+            t_dec0 = time.perf_counter()
             cell_arr = _decode_float32_b64(str(cell_ent2.get("b64") or ""), expected_len=H * W, layer_name=cell_layer)
+            t_decode = time.perf_counter() - t_dec0
             alive = int((cell_arr > 0.5).sum())
             events = p.get("event_counters") if isinstance(p, dict) else None
             totals = events.get("totals") if isinstance(events, dict) else None
@@ -483,6 +520,9 @@ class _EvolutionJob:
             divisions = int(totals.get("divisions") or 0)
             starv = int(totals.get("starvation_deaths") or 0)
             dmg = int(totals.get("damage_deaths") or 0)
+
+            t_total = time.perf_counter() - t_total0
+            _perf_add(apply_s=t_apply, ticks_s=t_ticks, decode_cell_s=t_decode, total_s=t_total)
             return {
                 "alive": alive,
                 "divisions": divisions,
