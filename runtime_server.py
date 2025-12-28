@@ -163,6 +163,12 @@ class _EvolutionJob:
         self.perf: Dict[str, Any] = {
             "evals": 0,
             "apply_s": 0.0,
+            "apply_copy_s": 0.0,
+            "apply_decode_s": 0.0,
+            "apply_math_s": 0.0,
+            "apply_encode_s": 0.0,
+            "sample_s": 0.0,
+            "tick_by_type_s": {},
             "ticks_s": 0.0,
             "decode_cell_s": 0.0,
             "total_s": 0.0,
@@ -305,6 +311,12 @@ class _EvolutionJob:
         self.perf = {
             "evals": 0,
             "apply_s": 0.0,
+            "apply_copy_s": 0.0,
+            "apply_decode_s": 0.0,
+            "apply_math_s": 0.0,
+            "apply_encode_s": 0.0,
+            "sample_s": 0.0,
+            "tick_by_type_s": {},
             "ticks_s": 0.0,
             "decode_cell_s": 0.0,
             "total_s": 0.0,
@@ -431,11 +443,42 @@ class _EvolutionJob:
 
         rng = np.random.default_rng(seed)
 
-        def _perf_add(apply_s: float, ticks_s: float, decode_cell_s: float, total_s: float) -> None:
+        def _perf_add(
+            apply_s: float,
+            ticks_s: float,
+            decode_cell_s: float,
+            total_s: float,
+            apply_copy_s: float = 0.0,
+            apply_decode_s: float = 0.0,
+            apply_math_s: float = 0.0,
+            apply_encode_s: float = 0.0,
+            sample_s: float = 0.0,
+            tick_by_type_s: Optional[Dict[str, float]] = None,
+        ) -> None:
             with self._lock:
                 p = self.perf if isinstance(self.perf, dict) else {}
                 p["evals"] = int(p.get("evals") or 0) + 1
                 p["apply_s"] = float(p.get("apply_s") or 0.0) + float(apply_s)
+                p["apply_copy_s"] = float(p.get("apply_copy_s") or 0.0) + float(apply_copy_s)
+                p["apply_decode_s"] = float(p.get("apply_decode_s") or 0.0) + float(apply_decode_s)
+                p["apply_math_s"] = float(p.get("apply_math_s") or 0.0) + float(apply_math_s)
+                p["apply_encode_s"] = float(p.get("apply_encode_s") or 0.0) + float(apply_encode_s)
+                p["sample_s"] = float(p.get("sample_s") or 0.0) + float(sample_s)
+
+                if isinstance(tick_by_type_s, dict):
+                    cur = p.get("tick_by_type_s")
+                    if not isinstance(cur, dict):
+                        cur = {}
+                    for k, v in tick_by_type_s.items():
+                        if not isinstance(k, str) or not k:
+                            continue
+                        try:
+                            dv = float(v)
+                        except Exception:
+                            continue
+                        cur[k] = float(cur.get(k) or 0.0) + dv
+                    p["tick_by_type_s"] = cur
+
                 p["ticks_s"] = float(p.get("ticks_s") or 0.0) + float(ticks_s)
                 p["decode_cell_s"] = float(p.get("decode_cell_s") or 0.0) + float(decode_cell_s)
                 p["total_s"] = float(p.get("total_s") or 0.0) + float(total_s)
@@ -454,12 +497,20 @@ class _EvolutionJob:
                 g[nm] = {"scale": cur_scale, "bias": cur_bias}
             return g
 
-        def _apply_genome_to_payload(payload: Dict[str, Any], genome: Dict[str, Any]) -> Dict[str, Any]:
+        def _apply_genome_to_payload(
+            payload: Dict[str, Any], genome: Dict[str, Any]
+        ) -> tuple[Dict[str, Any], float, float, float, float]:
+            t_copy0 = time.perf_counter()
             out = _deepcopy_payload(payload)
+            t_copy = time.perf_counter() - t_copy0
             out.pop("event_counters", None)
             out_data = out.get("data")
             if not isinstance(out_data, dict):
                 raise ValueError("payload missing data")
+
+            t_decode = 0.0
+            t_math = 0.0
+            t_encode = 0.0
             for nm, gb in genome.items():
                 ent = out_data.get(nm)
                 if not isinstance(ent, dict) or ent.get("dtype") != "float32":
@@ -467,8 +518,13 @@ class _EvolutionJob:
                 b64 = ent.get("b64")
                 if not isinstance(b64, str) or not b64:
                     continue
+
+                td0 = time.perf_counter()
                 arr = _decode_float32_b64(b64, expected_len=H * W, layer_name=nm)
+                t_decode += time.perf_counter() - td0
                 arr2: np.ndarray
+
+                tm0 = time.perf_counter()
                 if isinstance(gb, dict) and "delta" in gb and isinstance(gb.get("delta"), np.ndarray):
                     delta = gb.get("delta")
                     arr2 = arr + np.asarray(delta, dtype=np.float32)
@@ -486,14 +542,35 @@ class _EvolutionJob:
                 arr2 = np.clip(arr2, 0.0, huge)
                 if kinds.get(nm) == "counts":
                     arr2 = np.clip(np.rint(arr2), 0.0, huge)
-                ent["b64"] = _encode_float32_b64(arr2)
-            return out
+                t_math += time.perf_counter() - tm0
 
-        def _eval_genome(genome: Dict[str, Any], seed0: int) -> Dict[str, Any]:
+                te0 = time.perf_counter()
+                ent["b64"] = _encode_float32_b64(arr2)
+                t_encode += time.perf_counter() - te0
+            return out, float(t_copy), float(t_decode), float(t_math), float(t_encode)
+
+        profile_ticks = bool(cfg.get("profile_ticks") or cfg.get("profile_layer_ops"))
+
+        def _eval_genome(genome: Dict[str, Any], seed0: int, sample_s: float = 0.0) -> Dict[str, Any]:
             t_total0 = time.perf_counter()
             t_apply0 = time.perf_counter()
-            p = _apply_genome_to_payload(base_payload, genome)
+            p, t_copy, t_apply_decode, t_math, t_encode = _apply_genome_to_payload(base_payload, genome)
             t_apply = time.perf_counter() - t_apply0
+
+            lop_cfg = p.get("layer_ops_config") if isinstance(p, dict) else None
+            if isinstance(lop_cfg, dict):
+                if "opt_env_cache" not in lop_cfg and "optimize_env_cache" not in lop_cfg:
+                    lop_cfg["opt_env_cache"] = True
+                if "opt_expr_cache" not in lop_cfg and "optimize_expr_cache" not in lop_cfg:
+                    lop_cfg["opt_expr_cache"] = True
+
+                if not profile_ticks:
+                    for k in ("profile_expr", "profile_step_names", "profile_deep"):
+                        if k in lop_cfg:
+                            lop_cfg[k] = False
+
+            if profile_ticks:
+                p["_profile_layer_ops"] = True
 
             t_ticks = 0.0
             for t in range(ticks):
@@ -511,7 +588,7 @@ class _EvolutionJob:
 
             t_dec0 = time.perf_counter()
             cell_arr = _decode_float32_b64(str(cell_ent2.get("b64") or ""), expected_len=H * W, layer_name=cell_layer)
-            t_decode = time.perf_counter() - t_dec0
+            t_cell_decode = time.perf_counter() - t_dec0
             alive = int((cell_arr > 0.5).sum())
             events = p.get("event_counters") if isinstance(p, dict) else None
             totals = events.get("totals") if isinstance(events, dict) else None
@@ -521,8 +598,33 @@ class _EvolutionJob:
             starv = int(totals.get("starvation_deaths") or 0)
             dmg = int(totals.get("damage_deaths") or 0)
 
+            tick_by_type_s: Dict[str, float] = {}
+            if profile_ticks:
+                ev = p.get("event_counters") if isinstance(p, dict) else None
+                lop = ev.get("layer_ops_perf") if isinstance(ev, dict) else None
+                bt = lop.get("by_type_s") if isinstance(lop, dict) else None
+                if isinstance(bt, dict):
+                    for k, v in bt.items():
+                        if not isinstance(k, str) or not k:
+                            continue
+                        try:
+                            tick_by_type_s[k] = float(v)
+                        except Exception:
+                            continue
+
             t_total = time.perf_counter() - t_total0
-            _perf_add(apply_s=t_apply, ticks_s=t_ticks, decode_cell_s=t_decode, total_s=t_total)
+            _perf_add(
+                apply_s=t_apply,
+                ticks_s=t_ticks,
+                decode_cell_s=t_cell_decode,
+                total_s=t_total,
+                apply_copy_s=t_copy,
+                apply_decode_s=t_apply_decode,
+                apply_math_s=t_math,
+                apply_encode_s=t_encode,
+                sample_s=sample_s,
+                tick_by_type_s=tick_by_type_s if profile_ticks else None,
+            )
             return {
                 "alive": alive,
                 "divisions": divisions,
@@ -547,7 +649,7 @@ class _EvolutionJob:
             if self._stop.is_set():
                 raise RuntimeError("stopped")
             seed0 = seed + (0 * 1000003) + (0 * 1009) + (ri * 97)
-            base_rep_metrics.append(_eval_genome({}, seed0=seed0))
+            base_rep_metrics.append(_eval_genome({}, seed0=seed0, sample_s=0.0))
         alive_m0 = float(np.mean([mm["alive"] for mm in base_rep_metrics]))
         div_m0 = float(np.mean([mm["divisions"] for mm in base_rep_metrics]))
         starv_m0 = float(np.mean([mm["starvation_deaths"] for mm in base_rep_metrics]))
@@ -584,6 +686,194 @@ class _EvolutionJob:
                     mu[nm][~cell_mask] = 0.0
                     sig[nm][~cell_mask] = 0.0
 
+            # Reuse a single executor across generations to reduce overhead and improve scaling.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                for gen in range(generations):
+                    if self._stop.is_set():
+                        break
+
+                    with self._lock:
+                        self.progress["generation"] = int(gen)
+                        self.progress["variant"] = 0
+                        self.progress["updated_at"] = time.time()
+
+                    mu0: Dict[str, np.ndarray] = {nm: mu[nm].copy() for nm in mutable_names}
+                    sig0: Dict[str, np.ndarray] = {nm: sig[nm].copy() for nm in mutable_names}
+
+                    plan = list(range(variants))
+                    gen_workers = max(1, min(workers, len(plan)))
+
+                    def _eval_variant(vi: int) -> Optional[Dict[str, Any]]:
+                        rr = np.random.default_rng(seed + 1234567 + (gen * 1000003) + (vi * 1009))
+                        t_sample0 = time.perf_counter()
+                        genome: Dict[str, Any] = {}
+                        for nm in mutable_names:
+                            eps = rr.normal(0.0, 1.0, size=(H * W,)).astype(np.float32)
+                            delta = mu0[nm] + sig0[nm] * eps
+                            if use_cell_mask:
+                                delta = np.where(cell_mask, delta, 0.0).astype(np.float32)
+                            genome[nm] = {"delta": delta}
+                        t_sample = time.perf_counter() - t_sample0
+
+                        rep_metrics = []
+                        for ri in range(replicates):
+                            if self._stop.is_set():
+                                return None
+                            seed0 = seed + (gen * 1000003) + (vi * 1009) + (ri * 97)
+                            # Sampling the genome is done once per variant; attribute that time once.
+                            m = _eval_genome(genome, seed0=seed0, sample_s=t_sample if ri == 0 else 0.0)
+                            rep_metrics.append(m)
+
+                        if not rep_metrics:
+                            return None
+
+                        alive_m = float(np.mean([mm["alive"] for mm in rep_metrics]))
+                        div_m = float(np.mean([mm["divisions"] for mm in rep_metrics]))
+                        starv_m = float(np.mean([mm["starvation_deaths"] for mm in rep_metrics]))
+                        dmg_m = float(np.mean([mm["damage_deaths"] for mm in rep_metrics]))
+                        metrics = {
+                            "alive": int(round(alive_m)),
+                            "divisions": div_m,
+                            "starvation_deaths": starv_m,
+                            "damage_deaths": dmg_m,
+                        }
+                        fit = float(_fitness(metrics))
+                        return {"vi": int(vi), "metrics": metrics, "fitness": fit, "evals_done": int(replicates)}
+
+                    candidates_this_gen: list[Dict[str, Any]] = []
+                    pending: set[concurrent.futures.Future] = set()
+                    it = iter(plan)
+
+                    def _submit_one() -> None:
+                        if self._stop.is_set():
+                            return
+                        try:
+                            vi = next(it)
+                        except StopIteration:
+                            return
+                        pending.add(ex.submit(_eval_variant, vi))
+
+                    for _ in range(gen_workers):
+                        _submit_one()
+
+                    while pending:
+                        if self._stop.is_set():
+                            break
+                        done, pending = concurrent.futures.wait(
+                            pending, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        for fut in done:
+                            if self._stop.is_set():
+                                break
+                            try:
+                                res = fut.result()
+                            except Exception:
+                                _submit_one()
+                                continue
+                            if not isinstance(res, dict):
+                                _submit_one()
+                                continue
+
+                            vi = int(res.get("vi") or 0)
+                            metrics = res.get("metrics")
+                            fit = float(res.get("fitness") or 0.0)
+                            evals_done = int(res.get("evals_done") or 0)
+                            if not isinstance(metrics, dict):
+                                _submit_one()
+                                continue
+
+                            with self._lock:
+                                self.progress["variant"] = int(vi)
+                                self.progress["evaluations_done"] = int(
+                                    self.progress.get("evaluations_done", 0) + max(0, evals_done)
+                                )
+                                self._series_sum += fit
+                                self._series_n += 1
+                                if fit > self._series_best:
+                                    self._series_best = fit
+                                self.series["fitness"].append(fit)
+                                self.series["best"].append(float(self._series_best))
+                                self.series["mean"].append(float(self._series_sum / max(1, self._series_n)))
+                                while len(self.series["fitness"]) > max_points:
+                                    self.series["fitness"].pop(0)
+                                    self.series["best"].pop(0)
+                                    self.series["mean"].pop(0)
+                                    self.series["offset"] = int(self.series.get("offset") or 0) + 1
+                                self.progress["updated_at"] = time.time()
+
+                            cid = str(uuid.uuid4())
+                            candidates_this_gen.append(
+                                {"id": cid, "gen": gen, "fitness": fit, "metrics": metrics, "vi": vi}
+                            )
+
+                            _submit_one()
+
+                    if not candidates_this_gen:
+                        break
+
+                    candidates_this_gen.sort(key=lambda c: float(c.get("fitness") or 0.0), reverse=True)
+                    fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
+                    best = float(fits.max())
+                    mean = float(fits.mean())
+                    p10 = float(np.quantile(fits, 0.10))
+                    p90 = float(np.quantile(fits, 0.90))
+
+                    top = candidates_this_gen[:topk]
+                    top_deltas: list[Dict[str, np.ndarray]] = []
+                    for c in top:
+                        vi = int(c.get("vi") or 0)
+                        rr = np.random.default_rng(seed + 1234567 + (gen * 1000003) + (vi * 1009))
+                        dd: Dict[str, np.ndarray] = {}
+                        for nm in mutable_names:
+                            eps = rr.normal(0.0, 1.0, size=(H * W,)).astype(np.float32)
+                            delta = mu0[nm] + sig0[nm] * eps
+                            if use_cell_mask:
+                                delta = np.where(cell_mask, delta, 0.0).astype(np.float32)
+                            dd[nm] = delta
+                        top_deltas.append(dd)
+
+                    for nm in mutable_names:
+                        stack = np.stack([d[nm] for d in top_deltas], axis=0)
+                        mu_new = stack.mean(axis=0).astype(np.float32)
+                        sig_new = stack.std(axis=0).astype(np.float32)
+                        mu[nm] = ((1.0 - cem_alpha) * mu[nm] + cem_alpha * mu_new).astype(np.float32)
+                        sig[nm] = ((1.0 - cem_alpha) * sig[nm] + cem_alpha * sig_new).astype(np.float32)
+                        sig[nm] = np.maximum(sig[nm], float(sig_floor.get(nm, 0.0))).astype(np.float32)
+                        if use_cell_mask:
+                            mu[nm][~cell_mask] = 0.0
+                            sig[nm][~cell_mask] = 0.0
+
+                    def _encode_delta_genome_for_vi(vi: int) -> Dict[str, Any]:
+                        rr = np.random.default_rng(seed + 1234567 + (gen * 1000003) + (vi * 1009))
+                        g: Dict[str, Any] = {}
+                        for nm in mutable_names:
+                            eps = rr.normal(0.0, 1.0, size=(H * W,)).astype(np.float32)
+                            delta = mu0[nm] + sig0[nm] * eps
+                            if use_cell_mask:
+                                delta = np.where(cell_mask, delta, 0.0).astype(np.float32)
+                            g[nm] = {"delta_b64": _encode_float32_b64(np.asarray(delta, dtype=np.float32))}
+                        return g
+
+                    with self._lock:
+                        for c in candidates_this_gen[: max(elites, 10)]:
+                            vi = int(c.get("vi") or 0)
+                            c2 = dict(c)
+                            c2["genome"] = _encode_delta_genome_for_vi(vi)
+                            c2["genome_type"] = "delta"
+                            self.candidates[str(c2["id"])] = c2
+                        self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
+                        self.history["best"].append(best)
+                        self.history["mean"].append(mean)
+                        self.history["p10"].append(p10)
+                        self.history["p90"].append(p90)
+                        self.progress["updated_at"] = time.time()
+
+            return
+
+        parents: list[Dict[str, Dict[str, float]]] = [{}]
+
+        # Reuse a single executor across generations to reduce overhead and improve scaling.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             for gen in range(generations):
                 if self._stop.is_set():
                     break
@@ -593,21 +883,18 @@ class _EvolutionJob:
                     self.progress["variant"] = 0
                     self.progress["updated_at"] = time.time()
 
-                mu0: Dict[str, np.ndarray] = {nm: mu[nm].copy() for nm in mutable_names}
-                sig0: Dict[str, np.ndarray] = {nm: sig[nm].copy() for nm in mutable_names}
+                candidates_this_gen: list[Dict[str, Any]] = []
+                plan: list[tuple[int, Dict[str, Dict[str, float]]]] = []
+                for vi in range(variants):
+                    if self._stop.is_set():
+                        break
+                    parent = parents[int(rng.integers(0, len(parents)))]
+                    genome = _mutate_genome(parent)
+                    plan.append((vi, genome))
 
-                plan = list(range(variants))
                 gen_workers = max(1, min(workers, len(plan)))
 
-                def _eval_variant(vi: int) -> Optional[Dict[str, Any]]:
-                    rr = np.random.default_rng(seed + 1234567 + (gen * 1000003) + (vi * 1009))
-                    genome: Dict[str, Any] = {}
-                    for nm in mutable_names:
-                        eps = rr.normal(0.0, 1.0, size=(H * W,)).astype(np.float32)
-                        delta = mu0[nm] + sig0[nm] * eps
-                        if use_cell_mask:
-                            delta = np.where(cell_mask, delta, 0.0).astype(np.float32)
-                        genome[nm] = {"delta": delta}
+                def _eval_variant(vi: int, genome: Dict[str, Dict[str, float]]) -> Optional[Dict[str, Any]]:
                     rep_metrics = []
                     for ri in range(replicates):
                         if self._stop.is_set():
@@ -615,9 +902,6 @@ class _EvolutionJob:
                         seed0 = seed + (gen * 1000003) + (vi * 1009) + (ri * 97)
                         m = _eval_genome(genome, seed0=seed0)
                         rep_metrics.append(m)
-                        with self._lock:
-                            self.progress["evaluations_done"] = int(self.progress.get("evaluations_done", 0) + 1)
-                            self.progress["updated_at"] = time.time()
 
                     if not rep_metrics:
                         return None
@@ -633,36 +917,61 @@ class _EvolutionJob:
                         "damage_deaths": dmg_m,
                     }
                     fit = float(_fitness(metrics))
-                    return {"vi": int(vi), "metrics": metrics, "fitness": fit}
+                    return {
+                        "vi": int(vi),
+                        "genome": genome,
+                        "metrics": metrics,
+                        "fitness": fit,
+                        "evals_done": int(replicates),
+                    }
 
-                ex: Optional[concurrent.futures.ThreadPoolExecutor] = None
-                futs: Dict[concurrent.futures.Future, int] = {}
-                candidates_this_gen: list[Dict[str, Any]] = []
-                try:
-                    ex = concurrent.futures.ThreadPoolExecutor(max_workers=gen_workers)
-                    for vi in plan:
-                        if self._stop.is_set():
-                            break
-                        futs[ex.submit(_eval_variant, vi)] = vi
+                pending: set[concurrent.futures.Future] = set()
+                it = iter(plan)
 
-                    for fut in concurrent.futures.as_completed(list(futs.keys())):
+                def _submit_one() -> None:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        vi, genome = next(it)
+                    except StopIteration:
+                        return
+                    pending.add(ex.submit(_eval_variant, vi, genome))
+
+                for _ in range(gen_workers):
+                    _submit_one()
+
+                while pending:
+                    if self._stop.is_set():
+                        break
+                    done, pending = concurrent.futures.wait(
+                        pending, return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    for fut in done:
                         if self._stop.is_set():
                             break
                         try:
                             res = fut.result()
                         except Exception:
+                            _submit_one()
                             continue
                         if not isinstance(res, dict):
+                            _submit_one()
                             continue
 
                         vi = int(res.get("vi") or 0)
+                        genome = res.get("genome")
                         metrics = res.get("metrics")
                         fit = float(res.get("fitness") or 0.0)
-                        if not isinstance(metrics, dict):
+                        evals_done = int(res.get("evals_done") or 0)
+                        if not isinstance(genome, dict) or not isinstance(metrics, dict):
+                            _submit_one()
                             continue
 
                         with self._lock:
                             self.progress["variant"] = int(vi)
+                            self.progress["evaluations_done"] = int(
+                                self.progress.get("evaluations_done", 0) + max(0, evals_done)
+                            )
                             self._series_sum += fit
                             self._series_n += 1
                             if fit > self._series_best:
@@ -678,16 +987,16 @@ class _EvolutionJob:
                             self.progress["updated_at"] = time.time()
 
                         cid = str(uuid.uuid4())
-                        candidates_this_gen.append({"id": cid, "gen": gen, "fitness": fit, "metrics": metrics, "vi": vi})
-                finally:
-                    if ex is not None:
-                        try:
-                            ex.shutdown(wait=False, cancel_futures=True)
-                        except Exception:
-                            try:
-                                ex.shutdown(wait=False)
-                            except Exception:
-                                pass
+                        cand = {
+                            "id": cid,
+                            "gen": gen,
+                            "fitness": fit,
+                            "metrics": metrics,
+                            "genome": genome,
+                        }
+                        candidates_this_gen.append(cand)
+
+                        _submit_one()
 
                 if not candidates_this_gen:
                     break
@@ -699,49 +1008,9 @@ class _EvolutionJob:
                 p10 = float(np.quantile(fits, 0.10))
                 p90 = float(np.quantile(fits, 0.90))
 
-                top = candidates_this_gen[:topk]
-                top_deltas: list[Dict[str, np.ndarray]] = []
-                for c in top:
-                    vi = int(c.get("vi") or 0)
-                    rr = np.random.default_rng(seed + 1234567 + (gen * 1000003) + (vi * 1009))
-                    dd: Dict[str, np.ndarray] = {}
-                    for nm in mutable_names:
-                        eps = rr.normal(0.0, 1.0, size=(H * W,)).astype(np.float32)
-                        delta = mu0[nm] + sig0[nm] * eps
-                        if use_cell_mask:
-                            delta = np.where(cell_mask, delta, 0.0).astype(np.float32)
-                        dd[nm] = delta
-                    top_deltas.append(dd)
-
-                for nm in mutable_names:
-                    stack = np.stack([d[nm] for d in top_deltas], axis=0)
-                    mu_new = stack.mean(axis=0).astype(np.float32)
-                    sig_new = stack.std(axis=0).astype(np.float32)
-                    mu[nm] = ((1.0 - cem_alpha) * mu[nm] + cem_alpha * mu_new).astype(np.float32)
-                    sig[nm] = ((1.0 - cem_alpha) * sig[nm] + cem_alpha * sig_new).astype(np.float32)
-                    sig[nm] = np.maximum(sig[nm], float(sig_floor.get(nm, 0.0))).astype(np.float32)
-                    if use_cell_mask:
-                        mu[nm][~cell_mask] = 0.0
-                        sig[nm][~cell_mask] = 0.0
-
-                def _encode_delta_genome_for_vi(vi: int) -> Dict[str, Any]:
-                    rr = np.random.default_rng(seed + 1234567 + (gen * 1000003) + (vi * 1009))
-                    g: Dict[str, Any] = {}
-                    for nm in mutable_names:
-                        eps = rr.normal(0.0, 1.0, size=(H * W,)).astype(np.float32)
-                        delta = mu0[nm] + sig0[nm] * eps
-                        if use_cell_mask:
-                            delta = np.where(cell_mask, delta, 0.0).astype(np.float32)
-                        g[nm] = {"delta_b64": _encode_float32_b64(np.asarray(delta, dtype=np.float32))}
-                    return g
-
                 with self._lock:
                     for c in candidates_this_gen[: max(elites, 10)]:
-                        vi = int(c.get("vi") or 0)
-                        c2 = dict(c)
-                        c2["genome"] = _encode_delta_genome_for_vi(vi)
-                        c2["genome_type"] = "delta"
-                        self.candidates[str(c2["id"])] = c2
+                        self.candidates[str(c["id"])] = c
                     self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
                     self.history["best"].append(best)
                     self.history["mean"].append(mean)
@@ -749,145 +1018,7 @@ class _EvolutionJob:
                     self.history["p90"].append(p90)
                     self.progress["updated_at"] = time.time()
 
-            return
-
-        parents: list[Dict[str, Dict[str, float]]] = [{}]
-
-        for gen in range(generations):
-            if self._stop.is_set():
-                break
-
-            with self._lock:
-                self.progress["generation"] = int(gen)
-                self.progress["variant"] = 0
-                self.progress["updated_at"] = time.time()
-
-            candidates_this_gen: list[Dict[str, Any]] = []
-            plan: list[tuple[int, Dict[str, Dict[str, float]]]] = []
-            for vi in range(variants):
-                if self._stop.is_set():
-                    break
-                parent = parents[int(rng.integers(0, len(parents)))]
-                genome = _mutate_genome(parent)
-                plan.append((vi, genome))
-
-            gen_workers = max(1, min(workers, len(plan)))
-
-            def _eval_variant(vi: int, genome: Dict[str, Dict[str, float]]) -> Optional[Dict[str, Any]]:
-                rep_metrics = []
-                for ri in range(replicates):
-                    if self._stop.is_set():
-                        return None
-                    seed0 = seed + (gen * 1000003) + (vi * 1009) + (ri * 97)
-                    m = _eval_genome(genome, seed0=seed0)
-                    rep_metrics.append(m)
-                    with self._lock:
-                        self.progress["evaluations_done"] = int(self.progress.get("evaluations_done", 0) + 1)
-                        self.progress["updated_at"] = time.time()
-
-                if not rep_metrics:
-                    return None
-
-                alive_m = float(np.mean([mm["alive"] for mm in rep_metrics]))
-                div_m = float(np.mean([mm["divisions"] for mm in rep_metrics]))
-                starv_m = float(np.mean([mm["starvation_deaths"] for mm in rep_metrics]))
-                dmg_m = float(np.mean([mm["damage_deaths"] for mm in rep_metrics]))
-                metrics = {
-                    "alive": int(round(alive_m)),
-                    "divisions": div_m,
-                    "starvation_deaths": starv_m,
-                    "damage_deaths": dmg_m,
-                }
-                fit = float(_fitness(metrics))
-                return {
-                    "vi": int(vi),
-                    "genome": genome,
-                    "metrics": metrics,
-                    "fitness": fit,
-                }
-
-            ex: Optional[concurrent.futures.ThreadPoolExecutor] = None
-            futs: Dict[concurrent.futures.Future, int] = {}
-            try:
-                ex = concurrent.futures.ThreadPoolExecutor(max_workers=gen_workers)
-                for vi, genome in plan:
-                    if self._stop.is_set():
-                        break
-                    futs[ex.submit(_eval_variant, vi, genome)] = vi
-
-                for fut in concurrent.futures.as_completed(list(futs.keys())):
-                    if self._stop.is_set():
-                        break
-                    try:
-                        res = fut.result()
-                    except Exception:
-                        continue
-                    if not isinstance(res, dict):
-                        continue
-
-                    vi = int(res.get("vi") or 0)
-                    genome = res.get("genome")
-                    metrics = res.get("metrics")
-                    fit = float(res.get("fitness") or 0.0)
-                    if not isinstance(genome, dict) or not isinstance(metrics, dict):
-                        continue
-
-                    with self._lock:
-                        self.progress["variant"] = int(vi)
-                        self._series_sum += fit
-                        self._series_n += 1
-                        if fit > self._series_best:
-                            self._series_best = fit
-                        self.series["fitness"].append(fit)
-                        self.series["best"].append(float(self._series_best))
-                        self.series["mean"].append(float(self._series_sum / max(1, self._series_n)))
-                        while len(self.series["fitness"]) > max_points:
-                            self.series["fitness"].pop(0)
-                            self.series["best"].pop(0)
-                            self.series["mean"].pop(0)
-                            self.series["offset"] = int(self.series.get("offset") or 0) + 1
-                        self.progress["updated_at"] = time.time()
-
-                    cid = str(uuid.uuid4())
-                    cand = {
-                        "id": cid,
-                        "gen": gen,
-                        "fitness": fit,
-                        "metrics": metrics,
-                        "genome": genome,
-                    }
-                    candidates_this_gen.append(cand)
-            finally:
-                if ex is not None:
-                    try:
-                        ex.shutdown(wait=False, cancel_futures=True)
-                    except Exception:
-                        try:
-                            ex.shutdown(wait=False)
-                        except Exception:
-                            pass
-
-            if not candidates_this_gen:
-                break
-
-            candidates_this_gen.sort(key=lambda c: float(c.get("fitness") or 0.0), reverse=True)
-            fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
-            best = float(fits.max())
-            mean = float(fits.mean())
-            p10 = float(np.quantile(fits, 0.10))
-            p90 = float(np.quantile(fits, 0.90))
-
-            with self._lock:
-                for c in candidates_this_gen[: max(elites, 10)]:
-                    self.candidates[str(c["id"])] = c
-                self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
-                self.history["best"].append(best)
-                self.history["mean"].append(mean)
-                self.history["p10"].append(p10)
-                self.history["p90"].append(p90)
-                self.progress["updated_at"] = time.time()
-
-            parents = [c["genome"] for c in candidates_this_gen[:elites]]
+                parents = [c["genome"] for c in candidates_this_gen[:elites]]
 
 
 _EVO = _EvolutionJob()

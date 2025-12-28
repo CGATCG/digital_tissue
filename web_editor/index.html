@@ -805,7 +805,7 @@
                 <section class="panel">
                   <div class="panel__title">Evolution</div>
                   <div class="help">
-                    Run evolutionary search over initial gene/rna/protein layers using scale/bias mutations and select the best-performing candidates.
+                    Run evolutionary search over initial gene/rna/protein layers and select the best-performing candidates. Evolution runs use optimized layer ops.
                   </div>
 
                   <div class="row">
@@ -858,36 +858,41 @@
 
                   <div class="hr"></div>
 
-                  <div class="row">
-                    <label class="label">Mutation rate</label>
-                    <input id="evoMutationRate" class="input" type="number" min="0" max="1" step="0.01" value="0.15" />
+                  <div id="evoAffineParams">
+                    <div class="row">
+                      <label class="label">Mutation rate</label>
+                      <input id="evoMutationRate" class="input" type="number" min="0" max="1" step="0.01" value="0.15" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Scale sigma</label>
+                      <input id="evoSigmaScale" class="input" type="number" min="0" step="0.01" value="0.25" />
+                    </div>
+                    <div class="row">
+                      <label class="label">Bias sigma</label>
+                      <input id="evoSigmaBias" class="input" type="number" min="0" step="0.01" value="0.25" />
+                    </div>
                   </div>
-                  <div class="row">
-                    <label class="label">Scale sigma</label>
-                    <input id="evoSigmaScale" class="input" type="number" min="0" step="0.01" value="0.25" />
-                  </div>
-                  <div class="row">
-                    <label class="label">Bias sigma</label>
-                    <input id="evoSigmaBias" class="input" type="number" min="0" step="0.01" value="0.25" />
-                  </div>
-                  <div class="row">
-                    <label class="label">CEM delta sigma (init)</label>
-                    <input id="evoCemSigma" class="input" type="number" min="0" step="0.01" value="0.50" />
-                  </div>
-                  <div class="row">
-                    <label class="label">CEM alpha</label>
-                    <input id="evoCemAlpha" class="input" type="number" min="0" max="1" step="0.01" value="0.70" />
-                  </div>
-                  <div class="row">
-                    <label class="label">CEM sigma floor</label>
-                    <input id="evoCemSigmaFloor" class="input" type="number" min="0" step="0.01" value="0.05" />
-                  </div>
-                  <div class="row">
-                    <label class="label">CEM delta mask</label>
-                    <select id="evoCemMask" class="input">
-                      <option value="cell" selected>Only initial cells</option>
-                      <option value="all">All grid cells</option>
-                    </select>
+
+                  <div id="evoCemParams">
+                    <div class="row">
+                      <label class="label">CEM delta sigma (init)</label>
+                      <input id="evoCemSigma" class="input" type="number" min="0" step="0.01" value="0.50" />
+                    </div>
+                    <div class="row">
+                      <label class="label">CEM alpha</label>
+                      <input id="evoCemAlpha" class="input" type="number" min="0" max="1" step="0.01" value="0.70" />
+                    </div>
+                    <div class="row">
+                      <label class="label">CEM sigma floor</label>
+                      <input id="evoCemSigmaFloor" class="input" type="number" min="0" step="0.01" value="0.05" />
+                    </div>
+                    <div class="row">
+                      <label class="label">CEM delta mask</label>
+                      <select id="evoCemMask" class="input">
+                        <option value="cell" selected>Only initial cells</option>
+                        <option value="all">All grid cells</option>
+                      </select>
+                    </div>
                   </div>
                   <div class="row">
                     <label class="label">Huge (upper bound)</label>

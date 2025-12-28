@@ -171,6 +171,8 @@ const ui = {
 
   evoBase: $("evoBase"),
   evoAlgo: $("evoAlgo"),
+  evoAffineParams: $("evoAffineParams"),
+  evoCemParams: $("evoCemParams"),
   evoVariants: $("evoVariants"),
   evoTicks: $("evoTicks"),
   evoGenerations: $("evoGenerations"),
@@ -215,6 +217,14 @@ function _rtClearEvents() {
   rtEventRows.clear();
   if (ui.rtEventsList) ui.rtEventsList.innerHTML = "";
 }
+
+if (ui.evoAlgo) {
+  ui.evoAlgo.addEventListener("change", () => {
+    _evoUpdateAlgoUi();
+  });
+}
+
+_evoUpdateAlgoUi();
 
 function _rtEnsureEventRow(key) {
   if (!ui.rtEventsList) return null;
@@ -1454,6 +1464,12 @@ let evoTimer = null;
 let evoJobId = "";
 let evoLastStatus = null;
 
+function _evoUpdateAlgoUi() {
+  const algo = String(ui.evoAlgo?.value || "cem_delta");
+  if (ui.evoAffineParams) ui.evoAffineParams.style.display = algo === "affine" ? "block" : "none";
+  if (ui.evoCemParams) ui.evoCemParams.style.display = algo === "cem_delta" ? "block" : "none";
+}
+
 function _evoConfigFromUi() {
   const algo = String(ui.evoAlgo?.value || "cem_delta");
   const variants = Math.max(1, Math.floor(Number(ui.evoVariants?.value ?? 200)));
@@ -1477,7 +1493,7 @@ function _evoConfigFromUi() {
   const wStarv = Number(ui.evoWStarv?.value ?? -1);
   const wDmg = Number(ui.evoWDmg?.value ?? -1);
 
-  return {
+  const out = {
     algo,
     variants,
     ticks,
@@ -1486,13 +1502,6 @@ function _evoConfigFromUi() {
     replicates,
     workers,
     seed: Number.isFinite(seed) ? seed : 1,
-    mutation_rate: Number.isFinite(mutationRate) ? mutationRate : 0.15,
-    sigma_scale: Number.isFinite(sigmaScale) ? sigmaScale : 0.25,
-    sigma_bias: Number.isFinite(sigmaBias) ? sigmaBias : 0.25,
-    cem_sigma_init: Number.isFinite(cemSigma) ? cemSigma : 0.5,
-    cem_alpha: Number.isFinite(cemAlpha) ? cemAlpha : 0.7,
-    cem_sigma_floor: Number.isFinite(cemSigmaFloor) ? cemSigmaFloor : 0.05,
-    cem_mask: cemMask,
     huge: Number.isFinite(huge) && huge > 0 ? huge : 1e9,
     fitness_weights: {
       alive: Number.isFinite(wAlive) ? wAlive : 1,
@@ -1501,6 +1510,19 @@ function _evoConfigFromUi() {
       damage_deaths: Number.isFinite(wDmg) ? wDmg : -1,
     },
   };
+
+  if (algo === "affine") {
+    out.mutation_rate = Number.isFinite(mutationRate) ? mutationRate : 0.15;
+    out.sigma_scale = Number.isFinite(sigmaScale) ? sigmaScale : 0.25;
+    out.sigma_bias = Number.isFinite(sigmaBias) ? sigmaBias : 0.25;
+  }
+  if (algo === "cem_delta") {
+    out.cem_sigma_init = Number.isFinite(cemSigma) ? cemSigma : 0.5;
+    out.cem_alpha = Number.isFinite(cemAlpha) ? cemAlpha : 0.7;
+    out.cem_sigma_floor = Number.isFinite(cemSigmaFloor) ? cemSigmaFloor : 0.05;
+    out.cem_mask = cemMask;
+  }
+  return out;
 }
 
 function _evoBasePayloadFromUi() {

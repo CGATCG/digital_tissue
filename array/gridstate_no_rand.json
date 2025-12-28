@@ -84,7 +84,7 @@
           {
             "type": "let",
             "var": "rna_inc_${1}",
-            "expr": "where(cell == 1, gene_${1} * ((1-damage) + (protein_rna_pol)) * rand_beta(20,1.3), 0)"
+            "expr": "where(cell == 1, gene_${1} * ((1-damage) + (protein_rna_pol)) * 0.9389671361502347, 0)"
           },
           {
             "type": "let",
@@ -146,7 +146,7 @@
           {
             "type": "let",
             "var": "protein_inc_${1}",
-            "expr": "where(cell == 1, rna_${1} * (1-damage) * (protein_ribosome / (10 + protein_ribosome)) * (rand_beta(20,1.3) + 1), 0)"
+            "expr": "where(cell == 1, rna_${1} * (1-damage) * (protein_ribosome / (10 + protein_ribosome)) * (0.9389671361502347 + 1), 0)"
           },
           {
             "type": "let",
@@ -289,7 +289,7 @@
           {
             "type": "op",
             "target": "${0}",
-            "expr": "${0} * (1-damage) * rand_beta(20, 2.3)"
+            "expr": "${0} * (1-damage) * 0.8968609865470851"
           }
         ]
       },
@@ -304,7 +304,7 @@
           {
             "type": "op",
             "target": "${0}",
-            "expr": "${0} * (1-damage) * rand_beta(9.6, 2.2)"
+            "expr": "${0} * (1-damage) * 0.8135593220338982"
           }
         ]
       },

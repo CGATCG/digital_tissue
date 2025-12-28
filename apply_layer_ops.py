@@ -2,6 +2,8 @@ import argparse
 import base64
 import fnmatch
 import json
+import time
+import functools
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -10,7 +12,6 @@ import re
 
 import numpy as np
 
-#test comment
 def _decode_float32_b64(b64: str, expected_len: int, layer_name: str) -> np.ndarray:
     try:
         raw = base64.b64decode(b64)
@@ -183,6 +184,87 @@ def _eval_expr(expr: str, env: Dict[str, Any]) -> np.ndarray:
 
     _validate_expr_ast(expr, env)
     code = compile(ast.parse(expr, mode="eval"), "<layer_op>", "eval")
+    out = eval(code, {"__builtins__": {}}, env)  # noqa: S307
+    if not isinstance(out, np.ndarray):
+        out = np.asarray(out)
+    return out
+
+
+@functools.lru_cache(maxsize=512)
+def _compile_expr_cached(expr: str) -> tuple[Any, tuple[str, ...], tuple[str, ...]]:
+    import ast
+
+    tree = ast.parse(expr, mode="eval")
+
+    allowed_node_types = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.BoolOp,
+        ast.Compare,
+        ast.Call,
+        ast.Name,
+        ast.Load,
+        ast.Constant,
+        ast.Subscript,
+        ast.Slice,
+        ast.Tuple,
+        ast.List,
+        # operator / comparator nodes (these appear in ast.walk)
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.Pow,
+        ast.UAdd,
+        ast.USub,
+        ast.Not,
+        ast.Invert,
+        ast.And,
+        ast.Or,
+        ast.BitAnd,
+        ast.BitOr,
+        ast.BitXor,
+        ast.Eq,
+        ast.NotEq,
+        ast.Lt,
+        ast.LtE,
+        ast.Gt,
+        ast.GtE,
+    )
+
+    names: set[str] = set()
+    call_fns: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_node_types):
+            raise ValueError(f"Disallowed syntax in expr: {type(node).__name__}")
+
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only direct function calls are allowed")
+            call_fns.add(node.func.id)
+
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+
+        if hasattr(ast, "Attribute") and isinstance(node, ast.Attribute):
+            raise ValueError("Attribute access is not allowed")
+
+    code = compile(tree, "<layer_op>", "eval")
+    return code, tuple(sorted(names)), tuple(sorted(call_fns))
+
+
+def _eval_expr_fast(expr: str, env: Dict[str, Any]) -> np.ndarray:
+    code, names, call_fns = _compile_expr_cached(expr)
+    for nm in names:
+        if nm not in env:
+            raise ValueError(f"Unknown identifier '{nm}'")
+    for fn in call_fns:
+        if fn not in env or not callable(env.get(fn)):
+            raise ValueError(f"Function '{fn}' is not allowed")
     out = eval(code, {"__builtins__": {}}, env)  # noqa: S307
     if not isinstance(out, np.ndarray):
         out = np.asarray(out)
@@ -403,6 +485,89 @@ def apply_layer_ops_inplace(
         totals = {}
         event_counters["totals"] = totals
 
+    profile_expr_requested = bool(payload.get("_profile_expr") or cfg.get("profile_expr") or cfg.get("profile_deep"))
+    profile_step_names_requested = bool(
+        payload.get("_profile_step_names") or cfg.get("profile_step_names") or cfg.get("profile_deep")
+    )
+
+    profile_layer_ops = bool(
+        payload.get("_profile_layer_ops")
+        or cfg.get("profile")
+        or cfg.get("profile_layer_ops")
+        or profile_expr_requested
+    )
+    if profile_layer_ops:
+        perf = event_counters.get("layer_ops_perf")
+        if not isinstance(perf, dict):
+            perf = {}
+            event_counters["layer_ops_perf"] = perf
+        by_type_s = perf.get("by_type_s")
+        if not isinstance(by_type_s, dict):
+            by_type_s = {}
+            perf["by_type_s"] = by_type_s
+        perf["calls"] = int(perf.get("calls") or 0) + 1
+        perf.setdefault("total_s", 0.0)
+
+        if profile_step_names_requested:
+            step_perf = perf.get("step_perf")
+            if not isinstance(step_perf, dict):
+                step_perf = {}
+                perf["step_perf"] = step_perf
+
+    profile_expr = bool(profile_layer_ops and profile_expr_requested)
+    if profile_expr:
+        perf0 = event_counters.get("layer_ops_perf")
+        if isinstance(perf0, dict):
+            expr_perf = perf0.get("expr_perf")
+            if not isinstance(expr_perf, dict):
+                expr_perf = {}
+                perf0["expr_perf"] = expr_perf
+            expr_perf.setdefault("calls", 0)
+            for k in ("env_s", "validate_s", "compile_s", "eval_s", "asarray_s", "writeback_s", "total_s"):
+                expr_perf.setdefault(k, 0.0)
+
+    def _prof_add(step_type: str, dt_s: float) -> None:
+        if not profile_layer_ops:
+            return
+        perf = event_counters.get("layer_ops_perf")
+        if not isinstance(perf, dict):
+            return
+        perf["total_s"] = float(perf.get("total_s") or 0.0) + float(dt_s)
+        by_type_s = perf.get("by_type_s")
+        if not isinstance(by_type_s, dict):
+            by_type_s = {}
+            perf["by_type_s"] = by_type_s
+        by_type_s[step_type] = float(by_type_s.get(step_type) or 0.0) + float(dt_s)
+
+    def _expr_prof_add(key: str, dt_s: float) -> None:
+        if not profile_expr:
+            return
+        perf = event_counters.get("layer_ops_perf")
+        if not isinstance(perf, dict):
+            return
+        ep = perf.get("expr_perf")
+        if not isinstance(ep, dict):
+            return
+        ep[key] = float(ep.get(key) or 0.0) + float(dt_s)
+
+    def _step_prof_add(step_key: str, field: str, dv: float) -> None:
+        if not (profile_layer_ops and profile_step_names_requested):
+            return
+        perf = event_counters.get("layer_ops_perf")
+        if not isinstance(perf, dict):
+            return
+        sp = perf.get("step_perf")
+        if not isinstance(sp, dict):
+            return
+        ent = sp.get(step_key)
+        if not isinstance(ent, dict):
+            ent = {"calls": 0}
+            sp[step_key] = ent
+        if field == "calls":
+            ent["calls"] = int(ent.get("calls") or 0) + int(dv)
+            return
+        ent[field] = float(ent.get(field) or 0.0) + float(dv)
+
     def _inc_total(key: str, dv: int) -> None:
         try:
             dv_i = int(dv)
@@ -430,8 +595,15 @@ def apply_layer_ops_inplace(
 
     vars2d: Dict[str, np.ndarray] = {}
 
-    rng = np.random.default_rng()
     seed_offset_i = int(seed_offset)
+    base_seed_raw = cfg.get("seed", cfg.get("rng_seed"))
+    if base_seed_raw is None or str(base_seed_raw).strip() == "":
+        rng = np.random.default_rng()
+    else:
+        try:
+            rng = np.random.default_rng(int(base_seed_raw) + seed_offset_i)
+        except Exception:
+            rng = np.random.default_rng()
 
     _GROUP_FUNC_NAMES = {
         "sum_layers",
@@ -509,6 +681,35 @@ def apply_layer_ops_inplace(
         env["rand_logitnorm"] = _rand_logitnorm
         return env
 
+    opt_env_cache = bool(cfg.get("opt_env_cache") or cfg.get("optimize_env_cache"))
+    opt_expr_cache = bool(cfg.get("opt_expr_cache") or cfg.get("optimize_expr_cache"))
+    opt_diffusion_buffers = bool(cfg.get("opt_diffusion_buffers") or cfg.get("optimize_diffusion_buffers"))
+    env_cache: Optional[Dict[str, Any]] = None
+
+    def _env_get() -> Dict[str, Any]:
+        nonlocal env_cache
+        if not opt_env_cache:
+            return make_env()
+        if env_cache is None:
+            env_cache = make_env()
+        return env_cache
+
+    def _env_update_layer(name: str) -> None:
+        if not opt_env_cache or env_cache is None:
+            return
+        arr = layers.get(name)
+        if arr is None:
+            return
+        env_cache[name] = arr.reshape(H, W)
+
+    def _env_update_var(name: str) -> None:
+        if not opt_env_cache or env_cache is None:
+            return
+        arr2d = vars2d.get(name)
+        if arr2d is None:
+            return
+        env_cache[name] = arr2d
+
     _DIR_ALIASES = {
         "n": "north",
         "north": "north",
@@ -568,7 +769,12 @@ def apply_layer_ops_inplace(
             continue
 
         step_type = str(step.get("type") or "op").strip().lower()
+        t_step0 = time.perf_counter() if profile_layer_ops else 0.0
+
+        step_name = str(step.get("name") or "").strip()
+        step_key = f"{step_type}:{step_name}" if step_name else f"{step_type}:#{i}"
         if step_type == "diffusion":
+            t0_step = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
             molecules_spec = step.get("molecules", "molecule_*")
             if isinstance(molecules_spec, str):
                 pat = molecules_spec.strip()
@@ -582,6 +788,9 @@ def apply_layer_ops_inplace(
 
             if not molecule_layers:
                 raise ValueError(f"Step #{i}: diffusion matched no molecule layers")
+
+            _step_prof_add(step_key, "calls", 1)
+            _step_prof_add(step_key, "molecules", float(len(molecule_layers)))
 
             cell_layer = str(step.get("cell_layer", "cell") or "").strip()
             if not cell_layer:
@@ -676,7 +885,24 @@ def apply_layer_ops_inplace(
             pW = (dt0 * gW).astype(np.float32)
             pMove = np.clip(pN + pS + pE + pW, 0.0, 1.0).astype(np.float32)
 
+            qN_buf = None
+            qS_buf = None
+            qE_buf = None
+            pRem_buf = None
+            inflow_buf = None
+            if opt_diffusion_buffers:
+                qN_buf = np.zeros((H, W), dtype=np.float32)
+                qS_buf = np.zeros((H, W), dtype=np.float32)
+                qE_buf = np.zeros((H, W), dtype=np.float32)
+                pRem_buf = np.zeros((H, W), dtype=np.float32)
+                inflow_buf = np.zeros((H, W), dtype=np.int64)
+
+            t_setup_done = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "setup_s", t_setup_done - t0_step)
+
             for mol_name in molecule_layers:
+                t_mol0 = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
                 if mol_name not in layers:
                     raise ValueError(f"Step #{i}: diffusion unknown molecule layer '{mol_name}'")
                 if kinds.get(mol_name) != "counts":
@@ -688,27 +914,42 @@ def apply_layer_ops_inplace(
 
                 n_out = rng_diff.binomial(m_old, pMove).astype(np.int64)
 
-                qN = np.zeros((H, W), dtype=np.float32)
+                qN = qN_buf if qN_buf is not None else np.zeros((H, W), dtype=np.float32)
+                if qN_buf is not None:
+                    qN.fill(0)
                 np.divide(pN, pMove, out=qN, where=pMove > 0)
-                qN = np.clip(qN, 0.0, 1.0)
+                np.clip(qN, 0.0, 1.0, out=qN)
                 outN = rng_diff.binomial(n_out, qN).astype(np.int64)
 
                 rem = n_out - outN
-                pRem = np.maximum(np.float32(0.0), pMove - pN)
-                qS = np.zeros((H, W), dtype=np.float32)
+                pRem = pRem_buf if pRem_buf is not None else np.maximum(np.float32(0.0), pMove - pN)
+                if pRem_buf is not None:
+                    np.subtract(pMove, pN, out=pRem)
+                    np.maximum(pRem, np.float32(0.0), out=pRem)
+                qS = qS_buf if qS_buf is not None else np.zeros((H, W), dtype=np.float32)
+                if qS_buf is not None:
+                    qS.fill(0)
                 np.divide(pS, pRem, out=qS, where=pRem > 0)
-                qS = np.clip(qS, 0.0, 1.0)
+                np.clip(qS, 0.0, 1.0, out=qS)
                 outS = rng_diff.binomial(rem, qS).astype(np.int64)
 
                 rem = rem - outS
-                pRem = np.maximum(np.float32(0.0), pRem - pS)
-                qE = np.zeros((H, W), dtype=np.float32)
+                if pRem_buf is not None:
+                    np.subtract(pRem, pS, out=pRem)
+                    np.maximum(pRem, np.float32(0.0), out=pRem)
+                else:
+                    pRem = np.maximum(np.float32(0.0), pRem - pS)
+                qE = qE_buf if qE_buf is not None else np.zeros((H, W), dtype=np.float32)
+                if qE_buf is not None:
+                    qE.fill(0)
                 np.divide(pE, pRem, out=qE, where=pRem > 0)
-                qE = np.clip(qE, 0.0, 1.0)
+                np.clip(qE, 0.0, 1.0, out=qE)
                 outE = rng_diff.binomial(rem, qE).astype(np.int64)
                 outW = (rem - outE).astype(np.int64)
 
-                inflow = np.zeros((H, W), dtype=np.int64)
+                inflow = inflow_buf if inflow_buf is not None else np.zeros((H, W), dtype=np.int64)
+                if inflow_buf is not None:
+                    inflow.fill(0)
                 inflow[1:, :] += outS[0 : H - 1, :]
                 inflow[0 : H - 1, :] += outN[1:, :]
                 inflow[:, 1:] += outE[:, 0 : W - 1]
@@ -716,11 +957,21 @@ def apply_layer_ops_inplace(
 
                 m_new = m_old - (outN + outS + outE + outW) + inflow
                 layers[mol_name] = np.asarray(m_new, dtype=np.float32).reshape(H * W)
+                _env_update_layer(mol_name)
+
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "molecule_s", time.perf_counter() - t_mol0)
 
             applied += 1
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
         if step_type == "divide_cells":
+            t0_step = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
+            _step_prof_add(step_key, "calls", 1)
             cell_layer = str(step.get("cell_layer", "cell") or "").strip()
             if not cell_layer:
                 raise ValueError(f"Step #{i}: divide_cells missing 'cell_layer'")
@@ -792,6 +1043,10 @@ def apply_layer_ops_inplace(
             div_mask = is_cell & (trig2d > np.float32(threshold))
             if not np.any(div_mask) or not np.any(is_empty):
                 applied += 1
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+                if profile_layer_ops:
+                    _prof_add(step_type, time.perf_counter() - t_step0)
                 continue
 
             available = np.array(is_empty, dtype=bool)
@@ -874,6 +1129,10 @@ def apply_layer_ops_inplace(
 
             if not assignments:
                 applied += 1
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+                if profile_layer_ops:
+                    _prof_add(step_type, time.perf_counter() - t_step0)
                 continue
 
             split_layers = []
@@ -903,6 +1162,7 @@ def apply_layer_ops_inplace(
                         v = float(arr2d[sy, sx])
                         arr2d[ty, tx] = np.float32(v)
                         layers[nm] = np.asarray(arr2d, dtype=np.float32).reshape(H * W)
+                        _env_update_layer(nm)
                         continue
                     if kind == "counts":
                         v = int(np.clip(np.rint(arr2d[sy, sx]), 0, None))
@@ -919,14 +1179,21 @@ def apply_layer_ops_inplace(
                         arr2d[sy, sx] = np.float32(v - moved)
                         arr2d[ty, tx] = np.float32(float(arr2d[ty, tx]) + moved)
                     layers[nm] = np.asarray(arr2d, dtype=np.float32).reshape(H * W)
+                    _env_update_layer(nm)
 
             layers[cell_layer] = np.asarray(cell2d, dtype=np.float32).reshape(H * W)
+            _env_update_layer(cell_layer)
             if div_success:
                 step_events["divisions"] = int(step_events.get("divisions", 0) + int(div_success))
             applied += 1
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
         if step_type == "transport":
+            t0_step = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
             molecules_spec = step.get("molecules", "molecule_*")
             if isinstance(molecules_spec, str):
                 pat = molecules_spec.strip()
@@ -940,6 +1207,9 @@ def apply_layer_ops_inplace(
 
             if not molecule_layers:
                 raise ValueError(f"Step #{i}: transport matched no molecule layers")
+
+            _step_prof_add(step_key, "calls", 1)
+            _step_prof_add(step_key, "molecules", float(len(molecule_layers)))
 
             dirs_raw = step.get("dirs")
             if dirs_raw is None:
@@ -979,7 +1249,12 @@ def apply_layer_ops_inplace(
                 except Exception as e:
                     raise ValueError(f"Step #{i}: transport invalid seed {seed!r}: {e}") from e
 
+            t_setup_done = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "setup_s", t_setup_done - t0_step)
+
             for mol_name in molecule_layers:
+                t_mol0 = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
                 if mol_name not in layers:
                     raise ValueError(f"Step #{i}: transport unknown molecule layer '{mol_name}'")
                 if kinds.get(mol_name) != "counts":
@@ -1075,8 +1350,14 @@ def apply_layer_ops_inplace(
 
                 m_new = m_old - (outN + outS + outE + outW) + inflow
                 layers[mol_name] = np.asarray(m_new, dtype=np.float32).reshape(H * W)
+                _env_update_layer(mol_name)
+
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "molecule_s", time.perf_counter() - t_mol0)
 
             applied += 1
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
             continue
 
         if step_type not in ("op", "let"):
@@ -1086,15 +1367,74 @@ def apply_layer_ops_inplace(
 
         expr = str(step.get("expr") or "").strip()
         if not expr:
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
-        env = make_env()
+        t_expr0 = time.perf_counter() if profile_expr else 0.0
+        if profile_expr:
+            perf = event_counters.get("layer_ops_perf")
+            ep = perf.get("expr_perf") if isinstance(perf, dict) else None
+            if isinstance(ep, dict):
+                ep["calls"] = int(ep.get("calls") or 0) + 1
+
+        t0 = time.perf_counter() if profile_expr else 0.0
+        env = _env_get() if opt_env_cache else make_env()
+        if profile_expr:
+            _expr_prof_add("env_s", time.perf_counter() - t0)
+
         try:
-            out2d = _eval_expr(expr, env)
+            if profile_expr:
+                import ast
+
+                if opt_expr_cache:
+                    tc0 = time.perf_counter()
+                    code, names, call_fns = _compile_expr_cached(expr)
+                    _expr_prof_add("compile_s", time.perf_counter() - tc0)
+
+                    tchk0 = time.perf_counter()
+                    for nm in names:
+                        if nm not in env:
+                            raise ValueError(f"Unknown identifier '{nm}'")
+                    for fn in call_fns:
+                        if fn not in env or not callable(env.get(fn)):
+                            raise ValueError(f"Function '{fn}' is not allowed")
+                    _expr_prof_add("validate_s", time.perf_counter() - tchk0)
+
+                    te0 = time.perf_counter()
+                    out2d = eval(code, {"__builtins__": {}}, env)  # noqa: S307
+                    _expr_prof_add("eval_s", time.perf_counter() - te0)
+
+                    if not isinstance(out2d, np.ndarray):
+                        ta0 = time.perf_counter()
+                        out2d = np.asarray(out2d)
+                        _expr_prof_add("asarray_s", time.perf_counter() - ta0)
+                else:
+                    tv0 = time.perf_counter()
+                    _validate_expr_ast(expr, env)
+                    _expr_prof_add("validate_s", time.perf_counter() - tv0)
+
+                    tc0 = time.perf_counter()
+                    code = compile(ast.parse(expr, mode="eval"), "<layer_op>", "eval")
+                    _expr_prof_add("compile_s", time.perf_counter() - tc0)
+
+                    te0 = time.perf_counter()
+                    out2d = eval(code, {"__builtins__": {}}, env)  # noqa: S307
+                    _expr_prof_add("eval_s", time.perf_counter() - te0)
+
+                    if not isinstance(out2d, np.ndarray):
+                        ta0 = time.perf_counter()
+                        out2d = np.asarray(out2d)
+                        _expr_prof_add("asarray_s", time.perf_counter() - ta0)
+            else:
+                out2d = _eval_expr_fast(expr, env) if opt_expr_cache else _eval_expr(expr, env)
         except Exception as e:
             raise ValueError(
                 f"Step #{i} (type='{step_type}') failed for expr: {expr!r}; error: {e}"
             ) from e
+
+        if profile_expr:
+            _expr_prof_add("total_s", time.perf_counter() - t_expr0)
         if out2d.shape != (H, W):
             # Allow scalar outputs; treat them as constants by broadcasting over the grid.
             if np.asarray(out2d).size == 1:
@@ -1104,6 +1444,8 @@ def apply_layer_ops_inplace(
                 raise ValueError(
                     f"Step #{i}: expression result has shape {tuple(out2d.shape)}, expected {(H, W)}"
                 )
+
+        t_wb0 = time.perf_counter() if profile_expr else 0.0
 
         if step_type == "let":
             var = str(step.get("var") or "").strip()
@@ -1118,10 +1460,17 @@ def apply_layer_ops_inplace(
             if var in vars2d:
                 raise ValueError(f"Step #{i}: var already defined: {var!r}")
             vars2d[var] = np.asarray(out2d)
+            _env_update_var(var)
+            if profile_expr:
+                _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
         target = str(step.get("target") or "").strip()
         if not target:
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
         if target not in layers:
@@ -1167,6 +1516,9 @@ def apply_layer_ops_inplace(
             if target == "cell" and out_i.shape == (H, W):
                 old_i = np.rint(layers[target].reshape(H, W)).astype(np.int64)
             layers[target] = np.asarray(out_i, dtype=np.float32).reshape(H * W)
+            _env_update_layer(target)
+            if profile_expr:
+                _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
             if old_i is not None:
                 step_name = str(step.get("name") or "").strip()
                 deaths = int(((old_i == 1) & (out_i == 0)).sum())
@@ -1176,6 +1528,8 @@ def apply_layer_ops_inplace(
                     elif step_name == "cell_death":
                         step_events["damage_deaths"] = int(step_events.get("damage_deaths", 0) + deaths)
             applied += 1
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
         if kind == "counts":
@@ -1183,7 +1537,12 @@ def apply_layer_ops_inplace(
             out2d = np.clip(np.rint(out2d), 0, None)
 
         layers[target] = np.asarray(out2d, dtype=np.float32).reshape(H * W)
+        _env_update_layer(target)
         applied += 1
+        if profile_expr:
+            _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
+        if profile_layer_ops:
+            _prof_add(step_type, time.perf_counter() - t_step0)
 
     # Write updated b64 buffers back into payload
     data = payload.get("data")
@@ -1244,12 +1603,154 @@ def main() -> int:
         action="store_true",
         help="Export let variables as debug layers named '__let__<var>' for inspection",
     )
+    p.add_argument(
+        "--ticks",
+        dest="ticks",
+        type=int,
+        default=1,
+        help="Number of ticks to run (default: 1)",
+    )
+    p.add_argument(
+        "--seed",
+        dest="seed",
+        type=int,
+        default=None,
+        help="Optional deterministic seed for rand_* funcs when layer_ops_config omits per-step seeds",
+    )
+    p.add_argument(
+        "--opt-env-cache",
+        dest="opt_env_cache",
+        action="store_true",
+        help="Enable env caching optimization for op/let steps",
+    )
+    p.add_argument(
+        "--opt-expr-cache",
+        dest="opt_expr_cache",
+        action="store_true",
+        help="Enable compiled expression caching optimization for op/let steps",
+    )
+    p.add_argument(
+        "--opt-diffusion-buffers",
+        dest="opt_diffusion_buffers",
+        action="store_true",
+        help="Enable diffusion buffer reuse optimization",
+    )
+    p.add_argument(
+        "--ab-test",
+        dest="ab_test",
+        action="store_true",
+        help="Run X ticks with and without optimizations and assert identical outputs",
+    )
     args = p.parse_args()
 
     in_path = Path(args.in_path)
     payload = _load_gridstate_payload(in_path)
 
-    applied = apply_layer_ops_inplace(payload, export_let_layers=args.export_let_layers)
+    ticks = int(args.ticks or 1)
+    if ticks < 1:
+        ticks = 1
+
+    def _set_cfg_flag(p0: Dict[str, Any], key: str, val: Any) -> None:
+        cfg0 = p0.get("layer_ops_config")
+        if not isinstance(cfg0, dict):
+            return
+        cfg0[key] = val
+
+    def _run_ticks(p0: Dict[str, Any]) -> None:
+        applied0 = 0
+        for t in range(ticks):
+            applied0 += int(
+                apply_layer_ops_inplace(p0, export_let_layers=args.export_let_layers, seed_offset=t)
+            )
+        p0.setdefault("_cli_stats", {})
+        if isinstance(p0.get("_cli_stats"), dict):
+            p0["_cli_stats"]["applied_ops"] = int(applied0)
+
+    if args.seed is not None:
+        _set_cfg_flag(payload, "seed", int(args.seed))
+
+    if args.ab_test:
+        base_txt = json.dumps(payload)
+        a_payload = json.loads(base_txt)
+        b_payload = json.loads(base_txt)
+
+        if args.seed is None:
+            _set_cfg_flag(a_payload, "seed", 0)
+            _set_cfg_flag(b_payload, "seed", 0)
+
+        opt_env = bool(args.opt_env_cache)
+        opt_expr = bool(args.opt_expr_cache)
+        opt_diff = bool(args.opt_diffusion_buffers)
+        if not opt_env and not opt_expr and not opt_diff:
+            # preserve previous behavior: default to env-cache on
+            opt_env = True
+
+        _set_cfg_flag(a_payload, "opt_env_cache", False)
+        _set_cfg_flag(a_payload, "opt_expr_cache", False)
+        _set_cfg_flag(a_payload, "opt_diffusion_buffers", False)
+        _set_cfg_flag(b_payload, "opt_env_cache", opt_env)
+        _set_cfg_flag(b_payload, "opt_expr_cache", opt_expr)
+        _set_cfg_flag(b_payload, "opt_diffusion_buffers", opt_diff)
+
+        t0 = time.perf_counter()
+        _run_ticks(a_payload)
+        t_a = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        _run_ticks(b_payload)
+        t_b = time.perf_counter() - t0
+
+        a_stats = a_payload.get("_cli_stats") if isinstance(a_payload, dict) else None
+        b_stats = b_payload.get("_cli_stats") if isinstance(b_payload, dict) else None
+        a_applied = int(a_stats.get("applied_ops") or 0) if isinstance(a_stats, dict) else 0
+        b_applied = int(b_stats.get("applied_ops") or 0) if isinstance(b_stats, dict) else 0
+
+        a_data = a_payload.get("data") if isinstance(a_payload, dict) else None
+        b_data = b_payload.get("data") if isinstance(b_payload, dict) else None
+        if not isinstance(a_data, dict) or not isinstance(b_data, dict):
+            raise ValueError("missing data")
+
+        mismatches = []
+        names = sorted(set(a_data.keys()) | set(b_data.keys()))
+        for nm in names:
+            ea = a_data.get(nm)
+            eb = b_data.get(nm)
+            if not isinstance(ea, dict) or not isinstance(eb, dict):
+                continue
+            if ea.get("dtype") != "float32" or eb.get("dtype") != "float32":
+                continue
+            ba = ea.get("b64")
+            bb = eb.get("b64")
+            if isinstance(ba, str) and isinstance(bb, str) and ba == bb:
+                continue
+            mismatches.append(nm)
+
+        print(f"ticks={ticks}")
+        print(f"baseline_s={t_a:.6f}")
+        print(f"optimized_s={t_b:.6f}")
+        print(f"baseline_applied_ops={a_applied}")
+        print(f"optimized_applied_ops={b_applied}")
+        if t_b > 0:
+            print(f"speedup_x={t_a / t_b:.3f}")
+
+        if mismatches:
+            print(f"mismatched_layers={len(mismatches)}")
+            for nm in mismatches[:10]:
+                print(f"- {nm}")
+            return 2
+        print("outputs_match=true")
+        return 0
+
+    if args.opt_env_cache:
+        _set_cfg_flag(payload, "opt_env_cache", True)
+    if args.opt_expr_cache:
+        _set_cfg_flag(payload, "opt_expr_cache", True)
+    if args.opt_diffusion_buffers:
+        _set_cfg_flag(payload, "opt_diffusion_buffers", True)
+
+    _run_ticks(payload)
+    stats = payload.get("_cli_stats") if isinstance(payload, dict) else None
+    applied = int(stats.get("applied_ops") or 0) if isinstance(stats, dict) else 0
 
     if args.out_path:
         out_path = Path(args.out_path)
