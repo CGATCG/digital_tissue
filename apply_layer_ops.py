@@ -89,8 +89,22 @@ def _extract_layers(payload: Dict[str, Any]) -> Tuple[int, int, Dict[str, np.nda
         if not isinstance(entry, dict):
             continue
         dtype = entry.get("dtype")
+        if dtype != "float32":
+            continue
+
+        arr = entry.get("arr")
+        if isinstance(arr, np.ndarray):
+            if arr.dtype != np.float32:
+                arr = arr.astype(np.float32)
+            if arr.size != expected_len:
+                raise ValueError(
+                    f"Layer '{name}' has length {arr.size}, expected {expected_len} (H*W)"
+                )
+            layers[str(name)] = arr.reshape(expected_len)
+            continue
+
         b64 = entry.get("b64")
-        if dtype != "float32" or not isinstance(b64, str):
+        if not isinstance(b64, str):
             continue
         layers[str(name)] = _decode_float32_b64(b64, expected_len=expected_len, layer_name=str(name))
 
@@ -484,6 +498,8 @@ def apply_layer_ops_inplace(
     if not isinstance(totals, dict):
         totals = {}
         event_counters["totals"] = totals
+
+    dirty_layers: set[str] = set()
 
     profile_expr_requested = bool(payload.get("_profile_expr") or cfg.get("profile_expr") or cfg.get("profile_deep"))
     profile_step_names_requested = bool(
@@ -958,6 +974,7 @@ def apply_layer_ops_inplace(
                 m_new = m_old - (outN + outS + outE + outW) + inflow
                 layers[mol_name] = np.asarray(m_new, dtype=np.float32).reshape(H * W)
                 _env_update_layer(mol_name)
+                dirty_layers.add(mol_name)
 
                 if profile_layer_ops and profile_step_names_requested:
                     _step_prof_add(step_key, "molecule_s", time.perf_counter() - t_mol0)
@@ -1144,6 +1161,8 @@ def apply_layer_ops_inplace(
                         continue
                     split_layers.append(nm)
 
+            updated = {}
+
             div_success = 0
             for win_si, ty, tx in assignments:
                 sy = int(sources[win_si, 0])
@@ -1161,8 +1180,7 @@ def apply_layer_ops_inplace(
                     if str(nm).startswith("damage"):
                         v = float(arr2d[sy, sx])
                         arr2d[ty, tx] = np.float32(v)
-                        layers[nm] = np.asarray(arr2d, dtype=np.float32).reshape(H * W)
-                        _env_update_layer(nm)
+                        updated[nm] = arr2d
                         continue
                     if kind == "counts":
                         v = int(np.clip(np.rint(arr2d[sy, sx]), 0, None))
@@ -1178,11 +1196,16 @@ def apply_layer_ops_inplace(
                         moved = v * split_fraction
                         arr2d[sy, sx] = np.float32(v - moved)
                         arr2d[ty, tx] = np.float32(float(arr2d[ty, tx]) + moved)
-                    layers[nm] = np.asarray(arr2d, dtype=np.float32).reshape(H * W)
-                    _env_update_layer(nm)
+                    updated[nm] = arr2d
+
+            for nm, arr2d in updated.items():
+                layers[nm] = np.asarray(arr2d, dtype=np.float32).reshape(H * W)
+                _env_update_layer(nm)
+                dirty_layers.add(nm)
 
             layers[cell_layer] = np.asarray(cell2d, dtype=np.float32).reshape(H * W)
             _env_update_layer(cell_layer)
+            dirty_layers.add(cell_layer)
             if div_success:
                 step_events["divisions"] = int(step_events.get("divisions", 0) + int(div_success))
             applied += 1
@@ -1351,6 +1374,7 @@ def apply_layer_ops_inplace(
                 m_new = m_old - (outN + outS + outE + outW) + inflow
                 layers[mol_name] = np.asarray(m_new, dtype=np.float32).reshape(H * W)
                 _env_update_layer(mol_name)
+                dirty_layers.add(mol_name)
 
                 if profile_layer_ops and profile_step_names_requested:
                     _step_prof_add(step_key, "molecule_s", time.perf_counter() - t_mol0)
@@ -1360,9 +1384,221 @@ def apply_layer_ops_inplace(
                 _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
             continue
 
+        if step_type == "pathway":
+            t0_step = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
+            _step_prof_add(step_key, "calls", 1)
+            
+            pathway_name = str(step.get("pathway_name", step.get("name", "")) or "").strip()
+            if not pathway_name:
+                raise ValueError(f"Step #{i}: pathway missing 'pathway_name'")
+            
+            inputs_raw = step.get("inputs", [])
+            if isinstance(inputs_raw, str):
+                inputs = [s.strip() for s in inputs_raw.split(",") if s.strip()]
+            elif isinstance(inputs_raw, list):
+                inputs = [str(x).strip() for x in inputs_raw if x]
+            else:
+                raise ValueError(f"Step #{i}: pathway 'inputs' must be a list or comma-separated string")
+            
+            if not inputs:
+                raise ValueError(f"Step #{i}: pathway requires at least one input layer")
+            
+            outputs_raw = step.get("outputs", [])
+            if isinstance(outputs_raw, str):
+                outputs = [s.strip() for s in outputs_raw.split(",") if s.strip()]
+            elif isinstance(outputs_raw, list):
+                outputs = [str(x).strip() for x in outputs_raw if x]
+            else:
+                raise ValueError(f"Step #{i}: pathway 'outputs' must be a list or comma-separated string")
+            
+            if not outputs:
+                raise ValueError(f"Step #{i}: pathway requires at least one output layer")
+            
+            num_enzymes = int(step.get("num_enzymes", 3))
+            if num_enzymes < 1:
+                num_enzymes = 1
+            
+            cell_layer = str(step.get("cell_layer", "cell") or "").strip()
+            if not cell_layer:
+                raise ValueError(f"Step #{i}: pathway missing 'cell_layer'")
+            if cell_layer not in layers:
+                raise ValueError(f"Step #{i}: pathway unknown cell_layer '{cell_layer}'")
+            
+            cell_value = int(step.get("cell_value", 1))
+            cell2d = np.rint(layers[cell_layer].reshape(H, W)).astype(np.int64)
+            is_cell = cell2d == cell_value
+            
+            efficiency = float(step.get("efficiency", 1.0))
+            if efficiency < 0:
+                efficiency = 0.0
+
+            def _resolve_layer_name(nm: str) -> str:
+                nm2 = str(nm or "").strip()
+                if not nm2:
+                    return ""
+                if nm2 in layers:
+                    return nm2
+                if not nm2.startswith("molecule_"):
+                    cand = f"molecule_{nm2}"
+                    if cand in layers:
+                        return cand
+                if not nm2.startswith("mol_"):
+                    cand = f"mol_{nm2}"
+                    if cand in layers:
+                        return cand
+                return nm2
+
+            inputs = [_resolve_layer_name(nm) for nm in inputs if _resolve_layer_name(nm)]
+            outputs = [_resolve_layer_name(nm) for nm in outputs if _resolve_layer_name(nm)]
+            
+            # Generate unique neural network-like topology based on pathway name
+            # This creates a DAG with parallel paths and skip connections
+            topo_seed = sum(ord(c) * (idx + 1) for idx, c in enumerate(pathway_name))
+            topo_rng = np.random.default_rng(topo_seed)
+            
+            # Node types: "input", "enzyme_1", "enzyme_2", ..., "output"
+            # Build adjacency: each enzyme receives from some sources, feeds to some targets
+            # Ensure DAG property: enzyme_i can only receive from inputs or enzyme_j where j < i
+            
+            # connections[enzyme_idx] = list of (source_type, source_idx, weight_idx)
+            # source_type: "input" or "enzyme"
+            # For enzymes, we also track which enzymes feed to output
+            enzyme_connections = []  # For each enzyme: list of input sources
+            output_connections = []  # List of enzymes that feed to output
+            
+            for e in range(num_enzymes):
+                sources = []
+                # Each enzyme has 30-70% chance to connect to each valid source
+                # Valid sources: inputs (always available) and previous enzymes
+                
+                # Connect to inputs with some probability
+                for inp_idx in range(len(inputs)):
+                    if topo_rng.random() < 0.4 + 0.3 * (e == 0):  # First enzyme more likely to connect to inputs
+                        sources.append(("input", inp_idx))
+                
+                # Connect to previous enzymes (skip connections possible)
+                for prev_e in range(e):
+                    # Higher chance to connect to immediately previous enzyme
+                    prob = 0.6 if prev_e == e - 1 else 0.25
+                    if topo_rng.random() < prob:
+                        sources.append(("enzyme", prev_e))
+                
+                # Ensure at least one connection
+                if not sources:
+                    if e == 0:
+                        sources.append(("input", 0))
+                    else:
+                        sources.append(("enzyme", e - 1))
+                
+                enzyme_connections.append(sources)
+            
+            # Determine which enzymes feed to output (last few enzymes more likely)
+            for e in range(num_enzymes):
+                # Later enzymes more likely to connect to output
+                prob = 0.3 + 0.5 * (e / max(1, num_enzymes - 1))
+                if topo_rng.random() < prob or e == num_enzymes - 1:
+                    output_connections.append(e)
+            
+            # Ensure at least one output connection
+            if not output_connections:
+                output_connections.append(num_enzymes - 1)
+            
+            # Get input signals
+            input_signals = []
+            for inp_name in inputs:
+                if inp_name in layers:
+                    inp_arr = np.clip(np.rint(layers[inp_name].reshape(H, W)), 0, None).astype(np.float32)
+                else:
+                    inp_arr = np.zeros((H, W), dtype=np.float32)
+                input_signals.append(inp_arr)
+            
+            # Process enzymes in order (topological order is guaranteed by construction)
+            enzyme_outputs = []
+            for e in range(num_enzymes):
+                # Gather inputs to this enzyme
+                enzyme_input = np.zeros((H, W), dtype=np.float32)
+                for source_type, source_idx in enzyme_connections[e]:
+                    if source_type == "input":
+                        enzyme_input += input_signals[source_idx]
+                    else:  # enzyme
+                        enzyme_input += enzyme_outputs[source_idx]
+                
+                # Normalize by number of connections to prevent explosion
+                num_conn = len(enzyme_connections[e])
+                if num_conn > 1:
+                    enzyme_input = enzyme_input / np.sqrt(float(num_conn))
+                
+                # Apply enzyme modulation
+                protein_name = f"protein_{pathway_name}_enzyme_{e + 1}"
+                if protein_name in layers:
+                    protein_arr = np.clip(layers[protein_name].reshape(H, W), 0, None).astype(np.float32)
+                    enzyme_factor = (protein_arr + 1.0) / (protein_arr + 2.0 + 1e-9)
+                else:
+                    enzyme_factor = 0.5
+                
+                enzyme_out = enzyme_input * enzyme_factor
+                enzyme_outputs.append(enzyme_out)
+            
+            # Gather output signal from enzymes that connect to output
+            final_signal = np.zeros((H, W), dtype=np.float32)
+            for e_idx in output_connections:
+                final_signal += enzyme_outputs[e_idx]
+            
+            # Normalize output
+            if len(output_connections) > 1:
+                final_signal = final_signal / np.sqrt(float(len(output_connections)))
+            
+            # Apply efficiency multiplier
+            final_signal = final_signal * efficiency
+            
+            # Only apply in cells
+            final_signal = np.where(is_cell, final_signal, 0.0)
+            
+            # Calculate how much output to produce (integer counts)
+            output_amount = np.clip(np.floor(final_signal), 0, None).astype(np.int64)
+            
+            # Calculate how much input to consume
+            remaining_to_consume = output_amount.copy()
+            
+            for inp_name in inputs:
+                if inp_name not in layers:
+                    continue
+                if kinds.get(inp_name) not in ("counts", None):
+                    continue
+                inp_arr = np.clip(np.rint(layers[inp_name].reshape(H, W)), 0, None).astype(np.int64)
+                consume_from_this = np.minimum(inp_arr, remaining_to_consume)
+                new_inp = (inp_arr - consume_from_this).astype(np.float32)
+                layers[inp_name] = new_inp.ravel()
+                _env_update_layer(inp_name)
+                dirty_layers.add(inp_name)
+                remaining_to_consume -= consume_from_this
+            
+            # Distribute output to output layers
+            output_per_layer = output_amount // max(1, len(outputs))
+            remainder = output_amount % max(1, len(outputs))
+            
+            for idx, out_name in enumerate(outputs):
+                if out_name not in layers:
+                    continue
+                if kinds.get(out_name) not in ("counts", None):
+                    continue
+                out_arr = np.clip(np.rint(layers[out_name].reshape(H, W)), 0, None).astype(np.int64)
+                add_amount = output_per_layer + (1 if idx == 0 else 0) * remainder
+                new_out = (out_arr + add_amount).astype(np.float32)
+                layers[out_name] = new_out.ravel()
+                _env_update_layer(out_name)
+                dirty_layers.add(out_name)
+            
+            applied += 1
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+            continue
+
         if step_type not in ("op", "let"):
             raise ValueError(
-                f"Step #{i}: invalid type {step_type!r} (expected 'op', 'let', 'transport', 'diffusion', or 'divide_cells')"
+                f"Step #{i}: invalid type {step_type!r} (expected 'op', 'let', 'transport', 'diffusion', 'divide_cells', or 'pathway')"
             )
 
         expr = str(step.get("expr") or "").strip()
@@ -1517,6 +1753,7 @@ def apply_layer_ops_inplace(
                 old_i = np.rint(layers[target].reshape(H, W)).astype(np.int64)
             layers[target] = np.asarray(out_i, dtype=np.float32).reshape(H * W)
             _env_update_layer(target)
+            dirty_layers.add(target)
             if profile_expr:
                 _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
             if old_i is not None:
@@ -1538,6 +1775,7 @@ def apply_layer_ops_inplace(
 
         layers[target] = np.asarray(out2d, dtype=np.float32).reshape(H * W)
         _env_update_layer(target)
+        dirty_layers.add(target)
         applied += 1
         if profile_expr:
             _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
@@ -1547,6 +1785,8 @@ def apply_layer_ops_inplace(
     # Write updated b64 buffers back into payload
     data = payload.get("data")
     assert isinstance(data, dict)
+
+    skip_b64_writeback = bool(payload.get("_skip_b64_writeback"))
 
     if export_let_layers and vars2d:
         layer_meta = payload.get("layers")
@@ -1564,13 +1804,22 @@ def apply_layer_ops_inplace(
             kinds[debug_name] = "continuous"
             layers[debug_name] = np.asarray(arr2d, dtype=np.float32).reshape(H * W)
             data[debug_name] = {"dtype": "float32", "b64": ""}
-    for name, arr in layers.items():
+
+            dirty_layers.add(debug_name)
+
+    for name in dirty_layers:
+        arr = layers.get(name)
+        if not isinstance(arr, np.ndarray):
+            continue
         entry = data.get(name)
         if not isinstance(entry, dict):
             continue
         if entry.get("dtype") != "float32":
             continue
-        entry["b64"] = _encode_float32_b64(arr)
+        if skip_b64_writeback:
+            entry["arr"] = np.asarray(arr, dtype=np.float32).reshape(-1)
+        else:
+            entry["b64"] = _encode_float32_b64(arr)
 
     event_counters["last"] = {
         "starvation_deaths": int(step_events.get("starvation_deaths", 0)),

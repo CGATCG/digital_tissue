@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 
 const ui = {
+  currentFileInfo: $("currentFileInfo"),
   fileInput: $("fileInput"),
   newBtn: $("newBtn"),
   saveBtn: $("saveBtn"),
@@ -14,6 +15,8 @@ const ui = {
   layersTable: $("layersTable"),
   layerSearchInput: $("layerSearchInput"),
   groupByPrefix: $("groupByPrefix"),
+  collapseAllBtn: $("collapseAllBtn"),
+  expandAllBtn: $("expandAllBtn"),
   activeLayerTitle: $("activeLayerTitle"),
   activeLayerStats: $("activeLayerStats"),
   activeLayerColor: $("activeLayerColor"),
@@ -70,7 +73,6 @@ const ui = {
   opApplyBtn: $("opApplyBtn"),
 
   opTargetFilter: $("opTargetFilter"),
-  opTargetPrefix: $("opTargetPrefix"),
   opTargetsSelectAll: $("opTargetsSelectAll"),
   opTargetsClear: $("opTargetsClear"),
   opTargetsList: $("opTargetsList"),
@@ -93,6 +95,7 @@ const ui = {
   opsAddTransportBtn: $("opsAddTransportBtn"),
   opsAddDiffusionBtn: $("opsAddDiffusionBtn"),
   opsAddDivisionBtn: $("opsAddDivisionBtn"),
+  opsAddPathwayBtn: $("opsAddPathwayBtn"),
   opsResetBtn: $("opsResetBtn"),
   opsTestBtn: $("opsTestBtn"),
   opsSpecsTable: $("opsSpecsTable"),
@@ -108,42 +111,11 @@ const ui = {
   helpModalTitle: $("helpModalTitle"),
   helpModalBody: $("helpModalBody"),
 
-  stepsBeforeFile: $("stepsBeforeFile"),
-  stepsAfterFile: $("stepsAfterFile"),
-  stepsStatus: $("stepsStatus"),
-  stepsShowLetLayers: $("stepsShowLetLayers"),
-  stepsLayerSelect: $("stepsLayerSelect"),
-  stepsLayerStats: $("stepsLayerStats"),
-  stepsAxes: $("stepsAxes"),
-  stepsDiffTable: $("stepsDiffTable"),
-  stepsCanvasBefore: $("stepsCanvasBefore"),
-  stepsCanvasAfter: $("stepsCanvasAfter"),
-  stepsCanvasDiff: $("stepsCanvasDiff"),
-  stepsCanvasHistBefore: $("stepsCanvasHistBefore"),
-  stepsCanvasHistAfter: $("stepsCanvasHistAfter"),
-  stepsCanvasHistDiff: $("stepsCanvasHistDiff"),
-  stepsLegendBeforeText: $("stepsLegendBeforeText"),
-  stepsLegendBeforeBar: $("stepsLegendBeforeBar"),
-  stepsLegendAfterText: $("stepsLegendAfterText"),
-  stepsLegendAfterBar: $("stepsLegendAfterBar"),
-  stepsLegendDiffText: $("stepsLegendDiffText"),
-  stepsLegendDiffBar: $("stepsLegendDiffBar"),
-
-  stepsMaskLayerSelect: $("stepsMaskLayerSelect"),
-  stepsMaskMode: $("stepsMaskMode"),
-  stepsMaskValue: $("stepsMaskValue"),
-
-  stepsScatterEnabled: $("stepsScatterEnabled"),
-  stepsScatterSource: $("stepsScatterSource"),
-  stepsScatterX: $("stepsScatterX"),
-  stepsScatterY: $("stepsScatterY"),
-  stepsCanvasScatter: $("stepsCanvasScatter"),
-
-  rtFile: $("rtFile"),
   rtIntervalMs: $("rtIntervalMs"),
   rtStartStopBtn: $("rtStartStopBtn"),
   rtStepBtn: $("rtStepBtn"),
   rtResetBtn: $("rtResetBtn"),
+  rtDownloadBtn: $("rtDownloadBtn"),
   rtStatus: $("rtStatus"),
   rtEventsList: $("rtEventsList"),
   rtScalarsWindow: $("rtScalarsWindow"),
@@ -165,8 +137,12 @@ const ui = {
   rtHistLayer: $("rtHistLayer"),
   rtHistBins: $("rtHistBins"),
   rtHistLogY: $("rtHistLogY"),
+  rtHistMaskLayer: $("rtHistMaskLayer"),
+  rtHistMaskOp: $("rtHistMaskOp"),
+  rtHistMaskValue: $("rtHistMaskValue"),
   rtHistCanvas: $("rtHistCanvas"),
   rtVizCols: $("rtVizCols"),
+  rtHeatMaskEnabled: $("rtHeatMaskEnabled"),
   rtVizGrid: $("rtVizGrid"),
 
   evoBase: $("evoBase"),
@@ -188,10 +164,19 @@ const ui = {
   evoCemSigmaFloor: $("evoCemSigmaFloor"),
   evoCemMask: $("evoCemMask"),
   evoHuge: $("evoHuge"),
-  evoWAlive: $("evoWAlive"),
-  evoWDiv: $("evoWDiv"),
-  evoWStarv: $("evoWStarv"),
-  evoWDmg: $("evoWDmg"),
+  evoTargetFilter: $("evoTargetFilter"),
+  evoTargetAddGene: $("evoTargetAddGene"),
+  evoTargetAddRna: $("evoTargetAddRna"),
+  evoTargetAddProtein: $("evoTargetAddProtein"),
+  evoTargetAddMolecule: $("evoTargetAddMolecule"),
+  evoTargetClear: $("evoTargetClear"),
+  evoTargetCustomPattern: $("evoTargetCustomPattern"),
+  evoTargetAddCustom: $("evoTargetAddCustom"),
+  evoTargetPatterns: $("evoTargetPatterns"),
+  evoTargetInfo: $("evoTargetInfo"),
+  evoTargetList: $("evoTargetList"),
+  evoMeasList: $("evoMeasList"),
+  evoRefreshMeasBtn: $("evoRefreshMeasBtn"),
   evoStartBtn: $("evoStartBtn"),
   evoStopBtn: $("evoStopBtn"),
   evoStatus: $("evoStatus"),
@@ -204,6 +189,9 @@ const ui = {
   cursorInfo: $("cursorInfo"),
   inspectTable: $("inspectTable"),
   inspectMode: $("inspectMode"),
+  inspectHistMaskLayer: $("inspectHistMaskLayer"),
+  inspectHistMaskOp: $("inspectHistMaskOp"),
+  inspectHistMaskValue: $("inspectHistMaskValue"),
   inspectCursorValue: $("inspectCursorValue"),
   inspectSummaryStats: $("inspectSummaryStats"),
   inspectCanvasHist: $("inspectCanvasHist"),
@@ -225,6 +213,410 @@ if (ui.evoAlgo) {
 }
 
 _evoUpdateAlgoUi();
+
+let evoAvailableMeasurements = [];
+let evoMeasurementWeights = {};
+let evoMeasurementAggs = {};
+
+function _evoResetMeasurementWeights() {
+  evoAvailableMeasurements = [];
+  evoMeasurementWeights = {};
+  evoMeasurementAggs = {};
+  if (ui.evoMeasList) ui.evoMeasList.innerHTML = "";
+}
+
+// Target layers for evolution (glob patterns)
+let evoTargetPatterns = ["gene_*", "rna_*", "protein_*"];
+let evoTargetFilterText = "";
+const EVO_TARGET_PATTERNS_KEY = "grid_layer_editor_evo_target_patterns_v1";
+
+function _evoLoadTargetPatterns() {
+  try {
+    const stored = localStorage.getItem(EVO_TARGET_PATTERNS_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed)) {
+        evoTargetPatterns = parsed.filter(p => typeof p === "string" && p.trim());
+      }
+    }
+  } catch {}
+}
+
+function _evoSaveTargetPatterns() {
+  try {
+    localStorage.setItem(EVO_TARGET_PATTERNS_KEY, JSON.stringify(evoTargetPatterns));
+  } catch {}
+}
+
+function _evoAddTargetPattern(pattern) {
+  const p = String(pattern || "").trim();
+  if (!p) return;
+  if (!evoTargetPatterns.includes(p)) {
+    evoTargetPatterns.push(p);
+    _evoSaveTargetPatterns();
+    _evoRenderTargetLayersUI();
+  }
+}
+
+function _evoRemoveTargetPattern(pattern) {
+  const idx = evoTargetPatterns.indexOf(pattern);
+  if (idx >= 0) {
+    evoTargetPatterns.splice(idx, 1);
+    _evoSaveTargetPatterns();
+    _evoRenderTargetLayersUI();
+  }
+}
+
+function _evoClearTargetPatterns() {
+  evoTargetPatterns = [];
+  _evoSaveTargetPatterns();
+  _evoRenderTargetLayersUI();
+}
+
+function _evoMatchesTargetPatterns(layerName) {
+  if (!evoTargetPatterns.length) return false;
+  for (const pat of evoTargetPatterns) {
+    // Simple glob matching: * matches any characters
+    const regex = new RegExp("^" + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + "$");
+    if (regex.test(layerName)) return true;
+  }
+  return false;
+}
+
+function _evoGetMatchingLayers() {
+  if (!state || !Array.isArray(state.layers)) return [];
+  return state.layers.filter(l => _evoMatchesTargetPatterns(l.name)).map(l => l.name);
+}
+
+function _evoRenderTargetLayersUI() {
+  // Render patterns list
+  if (ui.evoTargetPatterns) {
+    if (evoTargetPatterns.length === 0) {
+      ui.evoTargetPatterns.innerHTML = '<span style="color: var(--muted); font-style: italic;">No patterns (defaults to gene_*, rna_*, protein_*)</span>';
+    } else {
+      ui.evoTargetPatterns.innerHTML = "";
+      for (const pat of evoTargetPatterns) {
+        const tag = document.createElement("span");
+        tag.style.cssText = "display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; margin: 2px; background: rgba(10,132,255,0.15); border-radius: 4px; font-size: 12px;";
+        tag.textContent = pat;
+        const removeBtn = document.createElement("button");
+        removeBtn.textContent = "×";
+        removeBtn.style.cssText = "border: none; background: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1;";
+        removeBtn.addEventListener("click", () => _evoRemoveTargetPattern(pat));
+        tag.appendChild(removeBtn);
+        ui.evoTargetPatterns.appendChild(tag);
+      }
+    }
+  }
+
+  // Render matching count
+  const matching = _evoGetMatchingLayers();
+  if (ui.evoTargetInfo) {
+    if (evoTargetPatterns.length === 0) {
+      ui.evoTargetInfo.textContent = "Using defaults: gene_*, rna_*, protein_*";
+    } else {
+      ui.evoTargetInfo.textContent = `${matching.length} layer${matching.length !== 1 ? "s" : ""} will be evolvable`;
+    }
+  }
+
+  // Render layer list
+  if (ui.evoTargetList) {
+    ui.evoTargetList.innerHTML = "";
+    if (!state || !Array.isArray(state.layers) || state.layers.length === 0) {
+      const msg = document.createElement("div");
+      msg.className = "meta";
+      msg.style.padding = "8px";
+      msg.textContent = "No layers available";
+      ui.evoTargetList.appendChild(msg);
+      return;
+    }
+
+    const q = String(evoTargetFilterText || "").trim().toLowerCase();
+    let layers = state.layers;
+    if (q) {
+      layers = layers.filter(l => String(l.name).toLowerCase().includes(q));
+    }
+
+    // Group by prefix
+    const groups = new Map();
+    for (const l of layers) {
+      const prefix = String(l.name).split("_")[0] || "other";
+      if (!groups.has(prefix)) groups.set(prefix, []);
+      groups.get(prefix).push(l);
+    }
+
+    const sortedKeys = [...groups.keys()].sort();
+    for (const prefix of sortedKeys) {
+      const groupLayers = groups.get(prefix);
+      const allMatch = groupLayers.every(l => _evoMatchesTargetPatterns(l.name));
+      const someMatch = groupLayers.some(l => _evoMatchesTargetPatterns(l.name));
+
+      // Group header
+      const header = document.createElement("div");
+      header.style.cssText = "display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: rgba(255,255,255,0.03); border-bottom: 1px solid var(--border); font-weight: 600; font-size: 11px; text-transform: uppercase;";
+      
+      const groupCb = document.createElement("input");
+      groupCb.type = "checkbox";
+      groupCb.checked = allMatch;
+      groupCb.indeterminate = someMatch && !allMatch;
+      groupCb.addEventListener("change", () => {
+        if (groupCb.checked) {
+          _evoAddTargetPattern(prefix + "_*");
+        } else {
+          _evoRemoveTargetPattern(prefix + "_*");
+        }
+      });
+      header.appendChild(groupCb);
+      
+      const headerLabel = document.createElement("span");
+      headerLabel.textContent = `${prefix}_ (${groupLayers.length})`;
+      header.appendChild(headerLabel);
+      
+      ui.evoTargetList.appendChild(header);
+
+      // Layer rows
+      for (const l of groupLayers) {
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 20px; border-bottom: 1px solid rgba(255,255,255,0.03); font-size: 12px;";
+        
+        const isMatch = _evoMatchesTargetPatterns(l.name);
+        if (isMatch) {
+          row.style.background = "rgba(10,132,255,0.08)";
+        }
+        
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = isMatch;
+        cb.addEventListener("change", () => {
+          if (cb.checked) {
+            // Add exact layer name as a pattern
+            _evoAddTargetPattern(l.name);
+          } else {
+            // Try to remove exact match or leave as is (patterns might still match)
+            _evoRemoveTargetPattern(l.name);
+          }
+        });
+        row.appendChild(cb);
+        
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = l.name;
+        nameSpan.style.flex = "1";
+        row.appendChild(nameSpan);
+        
+        const kindSpan = document.createElement("span");
+        kindSpan.textContent = l.kind || "";
+        kindSpan.style.cssText = "color: var(--muted); font-size: 10px;";
+        row.appendChild(kindSpan);
+        
+        ui.evoTargetList.appendChild(row);
+      }
+    }
+  }
+}
+
+function _evoResetTargetPatterns() {
+  evoTargetPatterns = ["gene_*", "rna_*", "protein_*"];
+  evoTargetFilterText = "";
+  _evoSaveTargetPatterns();
+  _evoRenderTargetLayersUI();
+}
+
+// Initialize target patterns
+_evoLoadTargetPatterns();
+
+function _evoUpdateMeasurementsUI() {
+  if (!ui.evoMeasList) return;
+  ui.evoMeasList.innerHTML = "";
+  
+  if (!evoAvailableMeasurements.length) {
+    const msg = document.createElement("div");
+    msg.className = "meta";
+    msg.style.padding = "12px";
+    msg.style.backgroundColor = "rgba(255, 200, 100, 0.1)";
+    msg.style.borderRadius = "4px";
+    msg.style.marginBottom = "8px";
+    msg.innerHTML = "<strong>No measurements found.</strong><br>Add measurements in the Measurements tab, then click Refresh.";
+    ui.evoMeasList.appendChild(msg);
+    return;
+  }
+  
+  for (const meas of evoAvailableMeasurements) {
+    const row = document.createElement("div");
+    row.className = "evoWeightRow";
+    row.style.display = "flex";
+    row.style.alignItems = "center";
+    row.style.gap = "12px";
+    row.style.marginBottom = "10px";
+    row.style.padding = "8px";
+    row.style.backgroundColor = "rgba(255, 255, 255, 0.02)";
+    row.style.borderRadius = "4px";
+    
+    const labelContainer = document.createElement("div");
+    labelContainer.style.flex = "1";
+    labelContainer.style.minWidth = "0";
+    
+    const label = document.createElement("div");
+    label.className = "meta";
+    label.textContent = meas.name;
+    label.style.fontWeight = "500";
+    label.style.marginBottom = "2px";
+    
+    const expr = document.createElement("div");
+    expr.className = "meta";
+    expr.textContent = meas.expr;
+    expr.style.fontSize = "10px";
+    expr.style.opacity = "0.6";
+    expr.style.overflow = "hidden";
+    expr.style.textOverflow = "ellipsis";
+    expr.style.whiteSpace = "nowrap";
+    expr.title = meas.expr;
+    
+    labelContainer.appendChild(label);
+    labelContainer.appendChild(expr);
+    
+    const weightLabel = document.createElement("div");
+    weightLabel.className = "meta";
+    weightLabel.textContent = "Weight";
+    weightLabel.style.fontSize = "10px";
+    weightLabel.style.opacity = "0.6";
+    weightLabel.style.marginRight = "4px";
+    
+    const weightInput = document.createElement("input");
+    weightInput.className = "input input--tiny";
+    weightInput.type = "number";
+    weightInput.step = "any";
+    weightInput.value = "1.0";
+    weightInput.placeholder = "0";
+    weightInput.id = `evoMeas_${meas.name}`;
+    weightInput.style.width = "70px";
+    weightInput.style.minWidth = "60px";
+    weightInput.style.maxWidth = "70px";
+    weightInput.addEventListener("input", () => {
+      const w = parseFloat(weightInput.value);
+      if (!isNaN(w)) {
+        // Store the weight value including 0 (0 means exclude from fitness)
+        evoMeasurementWeights[meas.name] = w;
+      }
+    });
+
+    const aggLabel = document.createElement("div");
+    aggLabel.className = "meta";
+    aggLabel.textContent = "Over run";
+    aggLabel.style.fontSize = "10px";
+    aggLabel.style.opacity = "0.6";
+    aggLabel.style.marginRight = "4px";
+
+    const aggSelect = document.createElement("select");
+    aggSelect.className = "input input--tiny";
+    aggSelect.id = `evoMeasAgg_${meas.name}`;
+    aggSelect.style.width = "110px";
+    aggSelect.style.minWidth = "100px";
+    aggSelect.style.maxWidth = "130px";
+    aggSelect.innerHTML = "";
+    {
+      const optLast = document.createElement("option");
+      optLast.value = "last";
+      optLast.textContent = "Last tick";
+      const optMean = document.createElement("option");
+      optMean.value = "mean";
+      optMean.textContent = "Mean";
+      const optMed = document.createElement("option");
+      optMed.value = "median";
+      optMed.textContent = "Median";
+      aggSelect.appendChild(optLast);
+      aggSelect.appendChild(optMean);
+      aggSelect.appendChild(optMed);
+    }
+    aggSelect.addEventListener("change", () => {
+      const v = String(aggSelect.value || "last");
+      evoMeasurementAggs[meas.name] = v;
+    });
+    
+    // Initialize all measurements with weight 1.0
+    if (!evoMeasurementWeights.hasOwnProperty(meas.name)) {
+      evoMeasurementWeights[meas.name] = 1.0;
+    }
+
+    if (!evoMeasurementAggs.hasOwnProperty(meas.name)) {
+      evoMeasurementAggs[meas.name] = "last";
+    }
+    
+    // Set input value from current weights
+    weightInput.value = evoMeasurementWeights[meas.name];
+
+    aggSelect.value = evoMeasurementAggs[meas.name] || "last";
+    
+    row.appendChild(labelContainer);
+    row.appendChild(weightLabel);
+    row.appendChild(weightInput);
+    row.appendChild(aggLabel);
+    row.appendChild(aggSelect);
+    ui.evoMeasList.appendChild(row);
+  }
+}
+
+async function _evoRefreshMeasurements() {
+  try {
+    const payload = _evoBasePayloadFromUi();
+    const res = await _rtPostJson("/api/evolution/fitness-config", { payload });
+    if (res.ok && Array.isArray(res.measurements)) {
+      evoAvailableMeasurements = res.measurements;
+      _evoUpdateMeasurementsUI();
+    }
+  } catch (err) {
+    console.error("Failed to fetch measurements:", err);
+  }
+}
+
+if (ui.evoRefreshMeasBtn) {
+  ui.evoRefreshMeasBtn.addEventListener("click", () => {
+    _evoRefreshMeasurements();
+  });
+}
+
+// Target layers UI event listeners
+if (ui.evoTargetFilter) {
+  ui.evoTargetFilter.addEventListener("input", () => {
+    evoTargetFilterText = String(ui.evoTargetFilter.value || "");
+    _evoRenderTargetLayersUI();
+  });
+}
+
+if (ui.evoTargetAddGene) {
+  ui.evoTargetAddGene.addEventListener("click", () => _evoAddTargetPattern("gene_*"));
+}
+if (ui.evoTargetAddRna) {
+  ui.evoTargetAddRna.addEventListener("click", () => _evoAddTargetPattern("rna_*"));
+}
+if (ui.evoTargetAddProtein) {
+  ui.evoTargetAddProtein.addEventListener("click", () => _evoAddTargetPattern("protein_*"));
+}
+if (ui.evoTargetAddMolecule) {
+  ui.evoTargetAddMolecule.addEventListener("click", () => _evoAddTargetPattern("molecule_*"));
+}
+if (ui.evoTargetClear) {
+  ui.evoTargetClear.addEventListener("click", () => _evoClearTargetPatterns());
+}
+if (ui.evoTargetAddCustom) {
+  ui.evoTargetAddCustom.addEventListener("click", () => {
+    const pat = String(ui.evoTargetCustomPattern?.value || "").trim();
+    if (pat) {
+      _evoAddTargetPattern(pat);
+      if (ui.evoTargetCustomPattern) ui.evoTargetCustomPattern.value = "";
+    }
+  });
+}
+if (ui.evoTargetCustomPattern) {
+  ui.evoTargetCustomPattern.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const pat = String(ui.evoTargetCustomPattern.value || "").trim();
+      if (pat) {
+        _evoAddTargetPattern(pat);
+        ui.evoTargetCustomPattern.value = "";
+      }
+    }
+  });
+}
 
 function _rtEnsureEventRow(key) {
   if (!ui.rtEventsList) return null;
@@ -311,10 +703,28 @@ const rtEventRows = new Map();
 let rtHistLayer = "";
 let rtHistBins = 60;
 let rtHistLogY = false;
+let rtHistMaskLayer = "";
+let rtHistMaskOp = "==";
+let rtHistMaskValue = 1;
+let rtHeatMaskEnabled = false;
+
+let rtLastSyncedStateTxt = "";
+
+async function _rtEnsureSyncedFromEditor(force = false, sourceLabel = "editor") {
+  const txt = serializeState(state);
+  if (!force && rtLoaded && rtLastSyncedStateTxt === txt) return;
+  const payload = JSON.parse(txt);
+  await _rtResetWithPayload(payload, sourceLabel);
+  rtLastSyncedStateTxt = txt;
+}
 
 const RT_HIST_LAYER_KEY = "rt_hist_layer";
+const RT_HIST_MASK_LAYER_KEY = "rt_hist_mask_layer";
+const RT_HIST_MASK_OP_KEY = "rt_hist_mask_op";
+const RT_HIST_MASK_VALUE_KEY = "rt_hist_mask_value";
 const RT_HIST_BINS_KEY = "rt_hist_bins";
 const RT_HIST_LOGY_KEY = "rt_hist_logy";
+const RT_HEAT_MASK_ENABLED_KEY = "rt_heat_mask_enabled";
 
 const RT_SURV_TOPK_KEY = "rt_surv_topk";
 const RT_SURV_LOG1P_KEY = "rt_surv_log1p";
@@ -752,6 +1162,8 @@ function _rtGetRequestedLayerNames() {
   const out = new Set(_rtGetSelectedLayerNames());
   const hl = String(rtHistLayer || "").trim();
   if (hl) out.add(hl);
+  const hm = String(rtHistMaskLayer || "").trim();
+  if (hm) out.add(hm);
   if (rtMeta && rtMeta.layers && rtMeta.layers.some((m) => String(m?.name || "") === "cell")) out.add("cell");
   return [...out];
 }
@@ -988,6 +1400,25 @@ function _rtPopulateHistLayerSelect() {
   ui.rtHistLayer.value = String(rtHistLayer || "");
 }
 
+function _rtPopulateHistMaskLayerSelect() {
+  if (!ui.rtHistMaskLayer) return;
+  ui.rtHistMaskLayer.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = "(none)";
+  ui.rtHistMaskLayer.appendChild(opt0);
+  if (!rtMeta || !Array.isArray(rtMeta.layers)) return;
+  for (const m of rtMeta.layers) {
+    const nm = String(m?.name || "");
+    if (!nm) continue;
+    const opt = document.createElement("option");
+    opt.value = nm;
+    opt.textContent = nm;
+    ui.rtHistMaskLayer.appendChild(opt);
+  }
+  ui.rtHistMaskLayer.value = String(rtHistMaskLayer || "");
+}
+
 function _rtInitHistogramControls() {
   try {
     rtHistLayer = String(localStorage.getItem(RT_HIST_LAYER_KEY) || "");
@@ -999,12 +1430,55 @@ function _rtInitHistogramControls() {
   try {
     rtHistLogY = (localStorage.getItem(RT_HIST_LOGY_KEY) || "") === "1";
   } catch {}
+  try {
+    rtHistMaskLayer = String(localStorage.getItem(RT_HIST_MASK_LAYER_KEY) || "");
+  } catch {}
+  try {
+    rtHistMaskOp = String(localStorage.getItem(RT_HIST_MASK_OP_KEY) || "==");
+  } catch {}
+  try {
+    const v = Number(localStorage.getItem(RT_HIST_MASK_VALUE_KEY));
+    if (Number.isFinite(v)) rtHistMaskValue = v;
+  } catch {}
+  try {
+    rtHeatMaskEnabled = (localStorage.getItem(RT_HEAT_MASK_ENABLED_KEY) || "") === "1";
+  } catch {}
 
   if (ui.rtHistBins) ui.rtHistBins.value = String(rtHistBins);
   if (ui.rtHistLogY) ui.rtHistLogY.checked = !!rtHistLogY;
+  if (ui.rtHistMaskOp) ui.rtHistMaskOp.value = String(rtHistMaskOp);
+  if (ui.rtHistMaskValue) ui.rtHistMaskValue.value = String(rtHistMaskValue);
+  if (ui.rtHeatMaskEnabled) ui.rtHeatMaskEnabled.checked = !!rtHeatMaskEnabled;
 }
 
-function _rtDrawHistogram(canvas, arr, bins, xLabel, logY) {
+function _rtRenderHeatmaps() {
+  if (!rtMeta) return;
+  const dataH = rtMeta.H;
+  const dataW = rtMeta.W;
+
+  const watchSet = new Set(rtWatch.map((w) => String(w?.name || "")));
+
+  const maskLayerName = rtHeatMaskEnabled ? String(rtHistMaskLayer || "").trim() : "";
+  const maskArr = maskLayerName ? (rtLastArrays.get(maskLayerName) || null) : null;
+
+  let drawn = 0;
+  for (const name of _rtGetSelectedLayerNames()) {
+    if (!watchSet.has(name)) continue;
+    const arr = rtLastArrays.get(name) || null;
+    if (!arr || arr.length !== dataH * dataW) continue;
+    const kind = rtKinds.get(name) || "continuous";
+    const color = rtColors.get(name) || DEFAULT_LAYER_COLOR;
+    const item = _rtEnsureVizItem(name);
+    if (item?.canvas) {
+      _stepsEnsureCanvasSize(item.canvas, dataH, dataW);
+      _stepsDrawHeatmap(item.canvas, arr, dataH, dataW, kind, "value", null, color, maskArr, rtHistMaskOp, rtHistMaskValue);
+      drawn++;
+    }
+  }
+  return drawn;
+}
+
+function _rtDrawHistogram(canvas, arr, bins, xLabel, logY, maskArr, maskOp, maskValue) {
   if (!canvas || !arr || !arr.length) return;
   const p = _stepsPrepPlotCanvas(canvas, 520, 180);
   if (!p) return;
@@ -1017,7 +1491,35 @@ function _rtDrawHistogram(canvas, arr, bins, xLabel, logY) {
   const plotW = Math.max(10, W - padL - padR);
   const plotH = Math.max(10, H - padT - padB);
 
-  const r = _stepsComputeRange(arr);
+  let filteredArr = arr;
+  if (maskArr && maskArr.length === arr.length) {
+    const mv = Number(maskValue);
+    const filtered = [];
+    for (let i = 0; i < arr.length; i++) {
+      const m = maskArr[i];
+      let pass = false;
+      if (maskOp === "==") pass = m === mv;
+      else if (maskOp === "!=") pass = m !== mv;
+      else if (maskOp === ">") pass = m > mv;
+      else if (maskOp === ">=") pass = m >= mv;
+      else if (maskOp === "<") pass = m < mv;
+      else if (maskOp === "<=") pass = m <= mv;
+      if (pass) filtered.push(arr[i]);
+    }
+    filteredArr = filtered;
+  }
+
+  if (!filteredArr.length) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(255,255,255,.06)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(255,255,255,.5)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+    ctx.fillText("no values match mask", 12, 20);
+    return;
+  }
+
+  const r = _stepsComputeRange(filteredArr);
   let lo = r.mn;
   let hi = r.mx;
   if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) {
@@ -1030,8 +1532,8 @@ function _rtDrawHistogram(canvas, arr, bins, xLabel, logY) {
   const denom = hi - lo;
   if (denom <= 0) return;
 
-  for (let i = 0; i < arr.length; i++) {
-    const v = arr[i];
+  for (let i = 0; i < filteredArr.length; i++) {
+    const v = filteredArr[i];
     if (!Number.isFinite(v)) continue;
     const t = (v - lo) / denom;
     if (t < 0 || t > 1) continue;
@@ -1117,7 +1619,11 @@ function _rtRenderHistogram() {
 
   const arr = rtLastArrays.get(nm) || null;
   if (!arr) return;
-  _rtDrawHistogram(ui.rtHistCanvas, arr, rtHistBins, nm, rtHistLogY);
+  
+  const maskLayerName = String(rtHistMaskLayer || "").trim();
+  const maskArr = maskLayerName ? (rtLastArrays.get(maskLayerName) || null) : null;
+  
+  _rtDrawHistogram(ui.rtHistCanvas, arr, rtHistBins, nm, rtHistLogY, maskArr, rtHistMaskOp, rtHistMaskValue);
 }
 
 function _rtScalarWindowN() {
@@ -1295,22 +1801,9 @@ function _rtApplyFrame(frame) {
     const arr = decodeFloat32Base64(entry.b64);
     if (arr.length !== H * W) continue;
     rtLastArrays.set(name, arr);
-
-     // Only draw heatmaps for the watchlist layers.
-    if (!watchSet.has(name)) continue;
-    const kind = rtKinds.get(name) || "continuous";
-    const color = rtColors.get(name) || DEFAULT_LAYER_COLOR;
-    const item = _rtEnsureVizItem(name);
-    if (item?.canvas) {
-      _stepsEnsureCanvasSize(item.canvas, H, W);
-      _stepsDrawHeatmap(item.canvas, arr, H, W, kind, "value", null, color);
-      drawn++;
-      if (!firstDbg) {
-        const r = _stepsComputeRange(arr);
-        firstDbg = { name, mn: r.mn, mx: r.mx, cw: item.canvas.width, ch: item.canvas.height, len: arr.length };
-      }
-    }
   }
+
+  drawn = _rtRenderHeatmaps() || 0;
   _rtRenderOverlay();
   _rtRenderHistogram();
   _rtRenderSurvival();
@@ -1325,7 +1818,7 @@ function _rtApplyFrame(frame) {
   }
 }
 
-async function _rtResetWithPayload(payloadObj) {
+async function _rtResetWithPayload(payloadObj, sourceLabel = "") {
   _rtSetStatus("Resetting…");
   try {
     rtPayloadObj = payloadObj ? JSON.parse(JSON.stringify(payloadObj)) : null;
@@ -1358,8 +1851,10 @@ async function _rtResetWithPayload(payloadObj) {
   _rtClearSurvival();
   rtTick = Number(res.tick || 0);
   rtLoaded = true;
+  // File tracking is now unified - no separate runtime source tracking
   _rtPopulateLayerSelect();
   _rtPopulateHistLayerSelect();
+  _rtPopulateHistMaskLayerSelect();
 
   const avail = new Set(rtMeta.layers.map((m) => String(m.name)));
 
@@ -1421,6 +1916,16 @@ async function _rtStepOnce() {
   _rtApplyFrame(frame);
 }
 
+async function _rtDownloadTick() {
+  if (!rtLoaded) await _rtEnsureSyncedFromEditor(true, "editor");
+  const res = await _rtPostJson("/api/runtime/export", {});
+  const payload = res?.payload;
+  const tick = Number(res?.tick);
+  if (!payload || typeof payload !== "object") throw new Error("export payload missing");
+  const t = Number.isFinite(tick) ? Math.max(0, Math.floor(tick)) : 0;
+  downloadJsonObject(payload, `gridstate.tick.${t}.json`);
+}
+
 function _rtStop() {
   rtRunning = false;
   if (rtTimer) {
@@ -1472,12 +1977,12 @@ function _evoUpdateAlgoUi() {
 
 function _evoConfigFromUi() {
   const algo = String(ui.evoAlgo?.value || "cem_delta");
-  const variants = Math.max(1, Math.floor(Number(ui.evoVariants?.value ?? 200)));
-  const ticks = Math.max(1, Math.floor(Number(ui.evoTicks?.value ?? 50)));
-  const generations = Math.max(1, Math.floor(Number(ui.evoGenerations?.value ?? 30)));
-  const elites = Math.max(1, Math.floor(Number(ui.evoElites?.value ?? 10)));
+  const variants = Math.max(1, Math.floor(Number(ui.evoVariants?.value ?? 75)));
+  const ticks = Math.max(1, Math.floor(Number(ui.evoTicks?.value ?? 100)));
+  const generations = Math.max(1, Math.floor(Number(ui.evoGenerations?.value ?? 50)));
+  const elites = Math.max(1, Math.floor(Number(ui.evoElites?.value ?? 5)));
   const replicates = Math.max(1, Math.floor(Number(ui.evoReplicates?.value ?? 1)));
-  const workers = Math.max(1, Math.floor(Number(ui.evoWorkers?.value ?? 4)));
+  const workers = Math.max(1, Math.floor(Number(ui.evoWorkers?.value ?? 35)));
   const seed = Math.floor(Number(ui.evoSeed?.value ?? 1));
   const mutationRate = Number(ui.evoMutationRate?.value ?? 0.15);
   const sigmaScale = Number(ui.evoSigmaScale?.value ?? 0.25);
@@ -1488,10 +1993,40 @@ function _evoConfigFromUi() {
   const cemMask = String(ui.evoCemMask?.value || "cell");
   const huge = Number(ui.evoHuge?.value ?? 1e9);
 
-  const wAlive = Number(ui.evoWAlive?.value ?? 1);
-  const wDiv = Number(ui.evoWDiv?.value ?? 2);
-  const wStarv = Number(ui.evoWStarv?.value ?? -1);
-  const wDmg = Number(ui.evoWDmg?.value ?? -1);
+  const fitnessWeights = {};
+  
+  // Ensure all available measurements have weights
+  const measurementWeights = {};
+  const measurementAggs = {};
+  
+  if (evoAvailableMeasurements && evoAvailableMeasurements.length > 0) {
+    evoAvailableMeasurements.forEach(meas => {
+      // Use weight from UI if available, otherwise default to 1.0
+      measurementWeights[meas.name] = evoMeasurementWeights[meas.name] !== undefined 
+        ? evoMeasurementWeights[meas.name] 
+        : 1.0;
+
+      const agg = evoMeasurementAggs?.[meas.name];
+      if (agg && agg !== "last") {
+        measurementAggs[meas.name] = String(agg);
+      }
+    });
+  } else if (Object.keys(evoMeasurementWeights).length > 0) {
+    // No measurements retrieved yet, but we have weights
+    Object.assign(measurementWeights, evoMeasurementWeights);
+
+    // Include any non-default aggregations we already have.
+    for (const [k, v] of Object.entries(evoMeasurementAggs || {})) {
+      if (v && String(v) !== "last") {
+        measurementAggs[String(k)] = String(v);
+      }
+    }
+  }
+  
+  fitnessWeights.measurements = measurementWeights;
+  if (Object.keys(measurementAggs).length > 0) {
+    fitnessWeights.measurement_aggs = measurementAggs;
+  }
 
   const out = {
     algo,
@@ -1503,12 +2038,7 @@ function _evoConfigFromUi() {
     workers,
     seed: Number.isFinite(seed) ? seed : 1,
     huge: Number.isFinite(huge) && huge > 0 ? huge : 1e9,
-    fitness_weights: {
-      alive: Number.isFinite(wAlive) ? wAlive : 1,
-      divisions: Number.isFinite(wDiv) ? wDiv : 2,
-      starvation_deaths: Number.isFinite(wStarv) ? wStarv : -1,
-      damage_deaths: Number.isFinite(wDmg) ? wDmg : -1,
-    },
+    fitness_weights: fitnessWeights,
   };
 
   if (algo === "affine") {
@@ -1522,17 +2052,40 @@ function _evoConfigFromUi() {
     out.cem_sigma_floor = Number.isFinite(cemSigmaFloor) ? cemSigmaFloor : 0.05;
     out.cem_mask = cemMask;
   }
+  
+  // Include target layers patterns (if specified)
+  if (evoTargetPatterns && evoTargetPatterns.length > 0) {
+    out.target_layers = [...evoTargetPatterns];
+  }
+  
   return out;
 }
 
 function _evoBasePayloadFromUi() {
-  const src = String(ui.evoBase?.value || "runtime");
-  if (src === "runtime") {
-    if (!rtPayloadObj) throw new Error("Load a gridstate in Runtime first (or pick 'Current editor state')");
-    return rtPayloadObj;
-  }
   const txt = serializeState(state);
   return JSON.parse(txt);
+}
+
+function _applyPayloadToEditor(payloadObj, sourceLabel) {
+  try {
+    const text = JSON.stringify(payloadObj);
+    const parsed = JSON.parse(text);
+    state = parseState(text);
+    ui.HInput.value = String(state.H);
+    ui.WInput.value = String(state.W);
+    selectedLayer = state.layers[0]?.name || "";
+
+    // Apply embedded functions from payload (if present)
+    _tryApplyEmbeddedMeasurementsConfig(parsed);
+    _tryApplyEmbeddedLayerOpsConfig(parsed);
+
+    applyAutoFitZoom();
+    syncLayerSelect();
+    _setCurrentFile(sourceLabel || "loaded");
+    saveToLocalStorage();
+  } catch (e) {
+    alert(String(e?.message || e));
+  }
 }
 
 function _evoStopLocal() {
@@ -1546,6 +2099,11 @@ function _evoStopLocal() {
 async function _evoStart() {
   const payload = _evoBasePayloadFromUi();
   const config = _evoConfigFromUi();
+  
+  // Debug: log the weights being sent to backend
+  console.log("DEBUG: Starting evolution with config:", config);
+  console.log("DEBUG: Measurement weights being sent:", config.fitness_weights?.measurements);
+  
   _evoSetStatus("Starting…");
   const res = await _rtPostJson("/api/evolution/start", { payload, config });
   evoJobId = String(res.job_id || "");
@@ -1736,6 +2294,36 @@ function _evoDrawPlot(st) {
 function _evoRenderTop(top) {
   if (!ui.evoTopList) return;
   const rows = Array.isArray(top) ? top : [];
+
+  // Use all available measurements for table columns, not just ones with weights
+  // First collect all available measurement names
+  let allMeasNames = new Set();
+  
+  // Add names from available measurements list
+  if (evoAvailableMeasurements && evoAvailableMeasurements.length > 0) {
+    evoAvailableMeasurements.forEach(m => allMeasNames.add(m.name));
+  }
+  
+  // Add names from weight configuration
+  const measWeights = evoMeasurementWeights || {};
+  Object.keys(measWeights).forEach(name => allMeasNames.add(name));
+  
+  // Add names from candidate metrics if any
+  rows.forEach(r => {
+    const mm = r?.metrics?.measurements;
+    if (mm && typeof mm === "object") {
+      Object.keys(mm).forEach(name => allMeasNames.add(name));
+    }
+  });
+  
+  // Convert to array of measurement column objects with weights
+  const measCols = Array.from(allMeasNames)
+    .map(name => ({
+      name,
+      w: measWeights[name] || 1.0 // Default weight 1.0 if not specified
+    }))
+    .sort((a, b) => Math.abs(b.w) - Math.abs(a.w)); // Sort by absolute weight value
+
   const body = rows
     .map((r, idx) => {
       const id = String(r?.id || "");
@@ -1745,22 +2333,32 @@ function _evoRenderTop(top) {
       const div = m?.divisions;
       const sd = m?.starvation_deaths;
       const dd = m?.damage_deaths;
+      const mm = m?.measurements && typeof m.measurements === "object" ? m.measurements : null;
       const gen = r?.gen;
+
+      const measTds = measCols
+        .map((c) => {
+          const v = mm && Object.prototype.hasOwnProperty.call(mm, c.name) ? mm[c.name] : null;
+          const vv = typeof v === "number" && Number.isFinite(v) ? v : null;
+          return `<td>${vv == null ? "–" : _stepsFmt(Number(vv))}</td>`;
+        })
+        .join("");
       return `<tr>
         <td>${idx + 1}</td>
         <td class="mono">${id.slice(0, 8)}</td>
         <td>${gen == null ? "–" : String(gen)}</td>
         <td>${fit == null ? "–" : _stepsFmt(Number(fit))}</td>
-        <td>${alive == null ? "–" : String(alive)}</td>
-        <td>${div == null ? "–" : _stepsFmt(Number(div))}</td>
-        <td>${sd == null ? "–" : _stepsFmt(Number(sd))}</td>
-        <td>${dd == null ? "–" : _stepsFmt(Number(dd))}</td>
+        ${measTds}
         <td style="text-align:right; white-space:nowrap;">
           <button class="btn btn--secondary btn--tiny" data-evo-act="load" data-evo-id="${id}">Load</button>
           <button class="btn btn--secondary btn--tiny" data-evo-act="download" data-evo-id="${id}">Download</button>
         </td>
       </tr>`;
     })
+    .join("");
+
+  const measTh = measCols
+    .map((c) => `<th title="w=${String(c.w)}">${c.name}</th>`)
     .join("");
   ui.evoTopList.innerHTML = `
     <table>
@@ -1770,10 +2368,7 @@ function _evoRenderTop(top) {
           <th>id</th>
           <th>gen</th>
           <th>fitness</th>
-          <th>alive</th>
-          <th>div</th>
-          <th>starv</th>
-          <th>dmg</th>
+          ${measTh}
           <th></th>
         </tr>
       </thead>
@@ -1794,6 +2389,16 @@ function _evoApplyStatus(st) {
   const baseFit = Number(st?.baseline?.fitness);
   const curBest = Number(st?.series?.best?.[st?.series?.best?.length - 1] ?? st?.history?.best?.[st?.history?.best?.length - 1] ?? NaN);
   const pct = total ? Math.max(0, Math.min(100, (100 * Number(done || 0)) / Number(total))) : 0;
+  
+  // Debug log for baseline and top candidate fitness
+  if (st?.baseline) {
+    console.log("Baseline fitness:", baseFit);
+    console.log("Baseline metrics:", st.baseline.metrics);
+  }
+  if (st?.top && st.top.length > 0) {
+    console.log("Top candidate fitness:", st.top[0].fitness);
+    console.log("Top candidate metrics:", st.top[0].metrics);
+  }
   const baseTxt = Number.isFinite(baseFit) ? `  base=${_stepsFmt(baseFit)}` : "";
   const bestTxt = Number.isFinite(curBest) ? `  best=${_stepsFmt(curBest)}` : "";
   const msg = err
@@ -1823,7 +2428,7 @@ function _evoRenderNow() {
     _evoApplyStatus(evoLastStatus);
     return;
   }
-  _evoSetStatus(rtPayloadObj ? "ready" : "Load a gridstate in Runtime (or select 'Current editor state')");
+  _evoSetStatus("ready");
   _evoDrawPlot({});
   _evoRenderTop([]);
 }
@@ -1833,6 +2438,7 @@ function _rtRenderNow() {
   _rtRenderWatchList();
   _rtEnsureCanvasSizes();
   _rtRenderOverlay();
+  _rtRenderHeatmaps();
   _rtRenderHistogram();
 }
 
@@ -1879,8 +2485,70 @@ const OPS_GROUPS_COLLAPSED_KEY = "grid_layer_editor_ops_groups_collapsed_v1";
 const RT_VIZ_COLS_KEY = "grid_layer_editor_rt_viz_cols_v1";
 let dirtySinceLastSave = false;
 
+let currentFileName = "";
+
+function _setCurrentFile(label) {
+  currentFileName = String(label || "");
+  _updateCurrentFileInfo();
+}
+
+function _updateCurrentFileInfo() {
+  if (!ui.currentFileInfo) return;
+  const name = currentFileName || "untitled";
+  const star = dirtySinceLastSave ? " *" : "";
+  ui.currentFileInfo.textContent = `${name}${star}`;
+}
+
+function _resetAllForNewFile() {
+  // Stop any running processes
+  _rtStop();
+  _evoStopLocal();
+  
+  // Reset runtime state
+  rtLoaded = false;
+  rtTick = 0;
+  rtMeta = null;
+  rtPayloadObj = null;
+  rtLastSyncedStateTxt = "";
+  rtKinds.clear();
+  rtColors.clear();
+  rtWatch = [];
+  rtCanvases.clear();
+  rtLastArrays.clear();
+  rtBaseline = null;
+  _rtClearEvents();
+  _rtClearMeasurements();
+  _rtClearScalarHistory();
+  rtScalarRows.clear();
+  if (ui.rtScalarsList) ui.rtScalarsList.innerHTML = "";
+  _rtClearSurvival();
+  if (ui.rtVizGrid) ui.rtVizGrid.innerHTML = "";
+  if (ui.rtWatchList) ui.rtWatchList.innerHTML = "";
+  if (ui.rtStatus) ui.rtStatus.textContent = "";
+  
+  // Reset evolution state
+  evoRunning = false;
+  evoJobId = "";
+  evoLastStatus = null;
+  if (ui.evoStatus) ui.evoStatus.textContent = "";
+  if (ui.evoTopList) ui.evoTopList.innerHTML = "";
+  if (ui.evoCanvas) {
+    const ctx = ui.evoCanvas.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, ui.evoCanvas.width, ui.evoCanvas.height);
+  }
+  _evoResetMeasurementWeights();
+}
+
 let inspectSummaryLastLayer = "";
 let inspectSummaryDirty = true;
+
+let inspectHistMaskLayer = "";
+let inspectHistMaskOp = "==";
+let inspectHistMaskValue = 1;
+
+const INSPECT_HIST_MASK_LAYER_KEY = "grid_layer_editor_inspect_hist_mask_layer_v1";
+const INSPECT_HIST_MASK_OP_KEY = "grid_layer_editor_inspect_hist_mask_op_v1";
+const INSPECT_HIST_MASK_VALUE_KEY = "grid_layer_editor_inspect_hist_mask_value_v1";
 
 const bulkSelectedLayers = new Set();
 
@@ -1901,6 +2569,19 @@ let fnLastFocusedExprInput = null;
 
 let layerOps = DEFAULT_LAYER_OPS.map((x) => ({ ...x }));
 let opsLastFocusedExprInput = null;
+let opsLastFocusedRowIndex = -1;
+
+function _opsInsertAtFocused(newOp) {
+  if (opsLastFocusedRowIndex >= 0 && opsLastFocusedRowIndex < layerOps.length) {
+    // Insert after the focused row
+    layerOps.splice(opsLastFocusedRowIndex + 1, 0, newOp);
+    opsLastFocusedRowIndex = opsLastFocusedRowIndex + 1;
+  } else {
+    // No focus, add at the end
+    layerOps.push(newOp);
+    opsLastFocusedRowIndex = layerOps.length - 1;
+  }
+}
 
 const FN_INSERTER_FUNCS = [
   { value: "mean", snippet: "mean(LAYER)" },
@@ -1949,7 +2630,9 @@ function loadFunctionsCfg() {
           .filter((x) => x && typeof x === "object")
           .map((x) => {
             const rawType = String(x.type || "op").trim();
-            const type = rawType === "let" ? "let" : rawType === "foreach" ? "foreach" : "op";
+            const knownTypes = ["let", "foreach", "transport", "diffusion", "divide_cells", "pathway"];
+            const type = knownTypes.includes(rawType) ? rawType : "op";
+            
             if (type === "foreach") {
               const steps = Array.isArray(x.steps) ? x.steps : [];
               const stepsTextRaw = typeof x.stepsText === "string" ? x.stepsText : "";
@@ -1967,6 +2650,62 @@ function loadFunctionsCfg() {
                 stepsText,
               };
             }
+            
+            if (type === "transport" || type === "diffusion") {
+              return {
+                type,
+                name: String(x.name || ""),
+                group: String(x.group || ""),
+                enabled: x.enabled !== false,
+                molecules: x.molecules || "molecule_*",
+                molecule_prefix: x.molecule_prefix || "molecule_",
+                protein_prefix: x.protein_prefix || "protein_",
+                cell_layer: x.cell_layer || "cell",
+                cell_mode: x.cell_mode || "eq",
+                cell_value: x.cell_value ?? 1,
+                dirs: Array.isArray(x.dirs) ? x.dirs : ["north", "south", "east", "west"],
+                per_pair_rate: x.per_pair_rate ?? 1.0,
+                rate: x.rate ?? 0.2,
+                rate_layer: x.rate_layer || null,
+                seed: x.seed ?? 0,
+              };
+            }
+            
+            if (type === "divide_cells") {
+              return {
+                type,
+                name: String(x.name || ""),
+                group: String(x.group || ""),
+                enabled: x.enabled !== false,
+                cell_layer: x.cell_layer || "cell",
+                cell_value: x.cell_value ?? 1,
+                empty_value: x.empty_value ?? 0,
+                trigger_layer: x.trigger_layer || "protein_divider",
+                threshold: x.threshold ?? 50,
+                split_fraction: x.split_fraction ?? 0.5,
+                max_radius: x.max_radius ?? null,
+                layer_prefixes: Array.isArray(x.layer_prefixes) ? x.layer_prefixes : ["molecule", "protein", "rna", "damage", "gene"],
+                seed: x.seed ?? 0,
+              };
+            }
+            
+            if (type === "pathway") {
+              return {
+                type,
+                name: String(x.name || ""),
+                group: String(x.group || ""),
+                enabled: x.enabled !== false,
+                pathway_name: String(x.pathway_name || x.name || ""),
+                inputs: Array.isArray(x.inputs) ? x.inputs : [],
+                outputs: Array.isArray(x.outputs) ? x.outputs : [],
+                num_enzymes: x.num_enzymes ?? 3,
+                cell_layer: x.cell_layer || "cell",
+                cell_value: x.cell_value ?? 1,
+                efficiency: x.efficiency ?? 1.0,
+                seed: x.seed ?? 0,
+              };
+            }
+            
             const out = {
               type,
               name: String(x.name || ""),
@@ -1979,6 +2718,9 @@ function loadFunctionsCfg() {
           })
           .filter((x) => {
             if (x.type === "foreach") return x.match && Array.isArray(x.steps);
+            if (x.type === "transport" || x.type === "diffusion") return true;
+            if (x.type === "divide_cells") return true;
+            if (x.type === "pathway") return x.pathway_name && Array.isArray(x.inputs) && x.inputs.length > 0;
             return x.expr && (x.type === "let" ? x.var : x.target);
           });
       }
@@ -2142,6 +2884,23 @@ function buildLayerOpsConfigJson() {
             seed: seed,
           };
         }
+        if (rawType === "pathway") {
+          const seed = x.seed == null || String(x.seed).trim() === "" ? null : Math.floor(Number(x.seed));
+          return {
+            type: "pathway",
+            name: String(x.name || "").trim(),
+            group: String(x.group || "").trim(),
+            enabled: x.enabled !== false,
+            pathway_name: String(x.pathway_name || x.name || "").trim(),
+            inputs: Array.isArray(x.inputs) ? x.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [],
+            outputs: Array.isArray(x.outputs) ? x.outputs.map((s) => String(s || "").trim()).filter((s) => s) : [],
+            num_enzymes: Number(x.num_enzymes ?? 3),
+            cell_layer: String(x.cell_layer ?? "cell"),
+            cell_value: Number(x.cell_value ?? 1),
+            efficiency: Number(x.efficiency ?? 1.0),
+            seed: seed,
+          };
+        }
         const base = {
           type,
           name: String(x.name || "").trim(),
@@ -2157,6 +2916,7 @@ function buildLayerOpsConfigJson() {
         if (x.type === "transport") return !!x.molecules;
         if (x.type === "diffusion") return !!x.molecules && (x.rate != null || x.rate_layer);
         if (x.type === "divide_cells") return !!x.cell_layer && !!x.trigger_layer;
+        if (x.type === "pathway") return !!x.pathway_name && Array.isArray(x.inputs) && x.inputs.length > 0;
         return x.expr && (x.type === "let" ? x.var : x.target);
       }),
   };
@@ -2187,18 +2947,8 @@ function _parseLayerOpsConfigObject(o) {
       .filter((x) => x && typeof x === "object")
       .map((x) => {
         const rawType = String(x.type || "op").trim();
-        const type =
-          rawType === "let"
-            ? "let"
-            : rawType === "foreach"
-              ? "foreach"
-              : rawType === "transport"
-                ? "transport"
-                : rawType === "diffusion"
-                  ? "diffusion"
-                  : rawType === "divide_cells"
-                    ? "divide_cells"
-                    : "op";
+        const knownTypes = ["let", "foreach", "transport", "diffusion", "divide_cells", "pathway"];
+        const type = knownTypes.includes(rawType) ? rawType : "op";
         if (type === "foreach") {
           const steps = Array.isArray(x.steps) ? x.steps : [];
           return {
@@ -2266,6 +3016,22 @@ function _parseLayerOpsConfigObject(o) {
             seed: x.seed == null ? null : Math.floor(Number(x.seed)),
           };
         }
+        if (type === "pathway") {
+          return {
+            type,
+            name: String(x.name || "").trim(),
+            group: String(x.group || "").trim(),
+            enabled: x.enabled !== false,
+            pathway_name: String(x.pathway_name || x.name || "").trim(),
+            inputs: Array.isArray(x.inputs) ? x.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [],
+            outputs: Array.isArray(x.outputs) ? x.outputs.map((s) => String(s || "").trim()).filter((s) => s) : [],
+            num_enzymes: Number(x.num_enzymes ?? 3),
+            cell_layer: String(x.cell_layer ?? "cell"),
+            cell_value: Number(x.cell_value ?? 1),
+            efficiency: Number(x.efficiency ?? 1.0),
+            seed: x.seed == null ? null : Math.floor(Number(x.seed)),
+          };
+        }
         const base = {
           type,
           name: String(x.name || "").trim(),
@@ -2281,6 +3047,7 @@ function _parseLayerOpsConfigObject(o) {
         if (x.type === "transport") return !!x.molecules;
         if (x.type === "diffusion") return !!x.molecules;
         if (x.type === "divide_cells") return !!x.cell_layer && !!x.trigger_layer;
+        if (x.type === "pathway") return !!x.pathway_name && Array.isArray(x.inputs) && x.inputs.length > 0;
         return x.expr && (x.type === "let" ? x.var : x.target);
       });
     return next;
@@ -2353,7 +3120,7 @@ if (ui.opsAddDivisionBtn) {
     const layerList = Array.isArray(state?.layers) ? state.layers : [];
     const defaultCellLayer = layerList.some((l) => l?.name === "cell") ? "cell" : layerList[0]?.name || "cell";
     const defaultTriggerLayer = layerList.some((l) => l?.name === "protein_divider") ? "protein_divider" : layerList[0]?.name || "protein_divider";
-    layerOps.push({
+    _opsInsertAtFocused({
       type: "divide_cells",
       enabled: true,
       name: "",
@@ -2567,6 +3334,38 @@ function validateLayerOpStep(step, knownVars) {
     }
 
     return { ok: true, text: "OK" };
+  }
+
+  if (rawType === "pathway") {
+    const pathwayName = String(step?.pathway_name || "").trim();
+    if (!pathwayName) return { ok: false, text: "pathway: Missing pathway_name" };
+
+    const inputs = step?.inputs;
+    if (!Array.isArray(inputs) || inputs.length === 0) {
+      return { ok: false, text: "pathway: Missing inputs" };
+    }
+
+    const outputs = step?.outputs;
+    if (!Array.isArray(outputs) || outputs.length === 0) {
+      return { ok: false, text: "pathway: Missing outputs" };
+    }
+
+    const cellLayer = String(step?.cell_layer || "cell").trim();
+    if (!cellLayer) return { ok: false, text: "pathway: Missing cell_layer" };
+    const meta = layerList.find((l) => l.name === cellLayer);
+    if (!meta) return { ok: false, text: `pathway: Unknown cell_layer: ${cellLayer}` };
+
+    const numEnzymes = Number(step?.num_enzymes ?? 3);
+    if (!Number.isFinite(numEnzymes) || numEnzymes < 1) {
+      return { ok: false, text: "pathway: num_enzymes must be >= 1" };
+    }
+
+    const efficiency = Number(step?.efficiency ?? 1.0);
+    if (!Number.isFinite(efficiency) || efficiency < 0) {
+      return { ok: false, text: "pathway: efficiency must be >= 0" };
+    }
+
+    return { ok: true, text: `OK (${inputs.length} in → ${outputs.length} out, ${numEnzymes} enzymes)` };
   }
 
   const e = String(step?.expr || "").trim();
@@ -3736,6 +4535,12 @@ function renderLayerOpsTable() {
     }
 
     const tr = document.createElement("tr");
+    
+    // Track focus on this row
+    const rowIndex = i;
+    tr.addEventListener("focusin", () => {
+      opsLastFocusedRowIndex = rowIndex;
+    });
 
     const tdOn = document.createElement("td");
     const on = document.createElement("input");
@@ -3753,7 +4558,7 @@ function renderLayerOpsTable() {
     const tdType = document.createElement("td");
     const typeSel = document.createElement("select");
     typeSel.className = "input input--tiny";
-    for (const k of ["op", "let", "foreach", "transport", "diffusion", "divide_cells"]) {
+    for (const k of ["op", "let", "foreach", "transport", "diffusion", "divide_cells", "pathway"]) {
       const opt = document.createElement("option");
       opt.value = k;
       opt.textContent = k === "divide_cells" ? "divide" : k;
@@ -3770,7 +4575,9 @@ function renderLayerOpsTable() {
               ? "diffusion"
               : op.type === "divide_cells"
                 ? "divide_cells"
-              : "op";
+                : op.type === "pathway"
+                  ? "pathway"
+                : "op";
     typeSel.addEventListener("change", () => {
       const nextType =
         typeSel.value === "let"
@@ -3783,6 +4590,8 @@ function renderLayerOpsTable() {
                 ? "diffusion"
                 : typeSel.value === "divide_cells"
                   ? "divide_cells"
+                  : typeSel.value === "pathway"
+                    ? "pathway"
                 : "op";
       layerOps[i].type = nextType;
       if (nextType === "op") {
@@ -3966,10 +4775,15 @@ function renderLayerOpsTable() {
     const isTransport = op.type === "transport";
     const isDiffusion = op.type === "diffusion";
     const isDivide = op.type === "divide_cells";
+    const isPathway = op.type === "pathway";
     const varInput = document.createElement("input");
     varInput.className = "input input--tiny";
     varInput.placeholder = "atp_generated";
     varInput.value = String(op.var || "");
+    let varInputOldName = String(op.var || "");
+    varInput.addEventListener("focus", () => {
+      varInputOldName = String(layerOps[i]?.var || "");
+    });
     varInput.addEventListener("input", () => {
       layerOps[i].var = varInput.value;
       saveFunctionsCfg();
@@ -3978,6 +4792,22 @@ function renderLayerOpsTable() {
       updateStatus();
     });
     varInput.addEventListener("blur", () => {
+      const newName = String(varInput.value || "").trim();
+      // For 'let' operations, rename the actual layer if it exists
+      if (isLet && varInputOldName && newName && varInputOldName !== newName) {
+        const oldLayerExists = state.layers.some((l) => l.name === varInputOldName);
+        const newLayerExists = state.layers.some((l) => l.name === newName);
+        if (oldLayerExists && !newLayerExists) {
+          try {
+            renameLayer(state, varInputOldName, newName);
+            if (selectedLayer === varInputOldName) selectedLayer = newName;
+            markDirty();
+            saveToLocalStorage();
+          } catch (e) {
+            console.error("Failed to rename layer:", e);
+          }
+        }
+      }
       syncLayerSelect();
     });
 
@@ -4031,11 +4861,19 @@ function renderLayerOpsTable() {
       fx.className = "meta";
       fx.textContent = "cell division";
       tdTarget.appendChild(fx);
+    } else if (isPathway) {
+      const fx = document.createElement("div");
+      fx.className = "meta";
+      fx.style.fontSize = "10px";
+      const inputs = Array.isArray(op.inputs) ? op.inputs.join(", ") : "";
+      const outputs = Array.isArray(op.outputs) ? op.outputs.join(", ") : "";
+      fx.innerHTML = `<strong>${op.pathway_name || "pathway"}</strong><br>${inputs} → ${outputs}<br>${op.num_enzymes || 1} enzymes`;
+      tdTarget.appendChild(fx);
     } else tdTarget.appendChild(target);
 
     const tdExpr = document.createElement("td");
-    const expr = isTransport || isDiffusion || isDivide ? null : document.createElement("textarea");
-    if (!(isTransport || isDiffusion || isDivide)) {
+    const expr = isTransport || isDiffusion || isDivide || isPathway ? null : document.createElement("textarea");
+    if (!(isTransport || isDiffusion || isDivide || isPathway)) {
       expr.className = "input input--tiny input--formula";
       expr.value = op.type === "foreach" ? String(op.stepsText || "") : String(op.expr || "");
       expr.placeholder =
@@ -4411,6 +5249,94 @@ function renderLayerOpsTable() {
       form.appendChild(mkField("Seed", seed));
 
       tdExpr.appendChild(form);
+    } else if (isPathway) {
+      const form = document.createElement("div");
+      form.className = "opsTransport";
+
+      const hint = document.createElement("div");
+      hint.className = "opsTransportHint";
+      hint.innerHTML = `<strong>Pathway:</strong> Converts inputs to outputs through enzyme chain. Each enzyme modulates throughput.`;
+      form.appendChild(hint);
+
+      const mkField = (labelText, controlEl) => {
+        const row = document.createElement("div");
+        row.className = "opsTransportField";
+        const lab = document.createElement("div");
+        lab.className = "label";
+        lab.textContent = labelText;
+        row.appendChild(lab);
+        row.appendChild(controlEl);
+        return row;
+      };
+
+      const cellSel = document.createElement("select");
+      cellSel.className = "input input--tiny";
+      cellSel.title = "Layer that defines cell vs non-cell. Pathway only operates in cells.";
+      for (const l of state.layers) {
+        const opt = document.createElement("option");
+        opt.value = l.name;
+        opt.textContent = l.name;
+        cellSel.appendChild(opt);
+      }
+      cellSel.value = String(op.cell_layer || "cell");
+      cellSel.addEventListener("change", () => {
+        layerOps[i].cell_layer = cellSel.value;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Cell layer", cellSel));
+
+      const cellValue = document.createElement("input");
+      cellValue.className = "input input--tiny";
+      cellValue.type = "number";
+      cellValue.step = "1";
+      cellValue.value = String(op.cell_value ?? 1);
+      cellValue.title = "Value in Cell layer that means 'cell' (usually 1).";
+      cellValue.addEventListener("input", () => {
+        layerOps[i].cell_value = Number(cellValue.value);
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Cell value", cellValue));
+
+      const efficiency = document.createElement("input");
+      efficiency.className = "input input--tiny";
+      efficiency.type = "number";
+      efficiency.step = "0.1";
+      efficiency.min = "0";
+      efficiency.max = "10";
+      efficiency.value = String(op.efficiency ?? 1.0);
+      efficiency.title = "Base efficiency multiplier for the pathway (1.0 = normal).";
+      efficiency.addEventListener("input", () => {
+        layerOps[i].efficiency = Number(efficiency.value);
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Efficiency", efficiency));
+
+      const seed = document.createElement("input");
+      seed.className = "input input--tiny";
+      seed.type = "number";
+      seed.step = "1";
+      seed.placeholder = "(none)";
+      seed.value = op.seed == null ? "" : String(op.seed);
+      seed.addEventListener("input", () => {
+        const v = String(seed.value || "").trim();
+        layerOps[i].seed = v ? Math.floor(Number(v)) : null;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Seed", seed));
+
+      tdExpr.appendChild(form);
     } else {
       const form = document.createElement("div");
       form.className = "opsTransport";
@@ -4584,6 +5510,18 @@ function renderLayerOpsTable() {
                   layer_prefixes: baseStep.layer_prefixes,
                   seed: baseStep.seed,
                 }
+              : baseStep.type === "pathway"
+                ? {
+                    type: "pathway",
+                    pathway_name: baseStep.pathway_name,
+                    inputs: baseStep.inputs,
+                    outputs: baseStep.outputs,
+                    num_enzymes: baseStep.num_enzymes,
+                    cell_layer: baseStep.cell_layer,
+                    cell_value: baseStep.cell_value,
+                    efficiency: baseStep.efficiency,
+                    seed: baseStep.seed,
+                  }
             : {
                 type: baseStep.type,
                 var: baseStep.var,
@@ -4610,7 +5548,7 @@ function renderLayerOpsTable() {
     updateStatus();
     tdStatus.appendChild(st);
 
-    if (!(isTransport || isDiffusion || isDivide) && expr) {
+    if (!(isTransport || isDiffusion || isDivide || isPathway) && expr) {
       expr.addEventListener("input", () => {
         if (layerOps[i].type === "foreach") {
           layerOps[i].stepsText = expr.value;
@@ -4675,11 +5613,27 @@ function renderLayerOpsTable() {
     del.className = "btn btn--danger btn--tiny";
     del.textContent = "Remove";
     del.addEventListener("click", () => {
+      // For 'let' operations, also delete the corresponding layer
+      if (op.type === "let" && op.var) {
+        const layerName = String(op.var).trim();
+        if (layerName && state.layers.some((l) => l.name === layerName)) {
+          try {
+            removeLayer(state, layerName);
+            if (selectedLayer === layerName) {
+              selectedLayer = state.layers[0]?.name || "";
+            }
+            bulkSelectedLayers.delete(layerName);
+          } catch (e) {
+            console.error("Failed to remove layer:", e);
+          }
+        }
+      }
       layerOps.splice(i, 1);
       saveFunctionsCfg();
       markDirty();
       saveToLocalStorage();
       renderLayerOpsTable();
+      syncLayerSelect();
     });
     tdDel.appendChild(del);
 
@@ -4961,13 +5915,6 @@ function computeBatchTargets() {
 
   for (const nm of opTargetsSelected) names.add(nm);
 
-  const prefix = String(ui.opTargetPrefix?.value || "").trim();
-  if (prefix) {
-    for (const l of state.layers) {
-      if (String(l.name).startsWith(prefix)) names.add(l.name);
-    }
-  }
-
   const targets = [];
   const isRandom = isRandomAssignOpType(ui.opType?.value);
   for (const nm of names) {
@@ -4985,8 +5932,33 @@ function renderOpTargetsList() {
 
   pruneOpTargetsSelected();
   const isRandom = isRandomAssignOpType(ui.opType?.value);
-  const q = String(ui.opTargetFilter?.value || "").trim().toLowerCase();
-  const layers = q ? state.layers.filter((l) => String(l.name).toLowerCase().includes(q)) : state.layers;
+  const q = String(ui.opTargetFilter?.value || "").trim();
+  
+  // Get all layers that match the search filter
+  let filteredLayers = [];
+  if (q) {
+    // Convert wildcard pattern to regex
+    const pattern = q.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    const regex = new RegExp(pattern, 'i'); // Removed ^ and $ to allow partial matches
+    filteredLayers = state.layers.filter((l) => regex.test(String(l.name)));
+  } else {
+    filteredLayers = [...state.layers];
+  }
+  
+  // Add any selected layers that didn't match the filter
+  const selectedLayerNames = new Set(opTargetsSelected);
+  const filteredLayerNames = new Set(filteredLayers.map(l => l.name));
+  
+  // Find selected layers that aren't already in the filtered list
+  const missingSelectedLayers = state.layers.filter(l => 
+    selectedLayerNames.has(l.name) && !filteredLayerNames.has(l.name)
+  );
+  
+  // Combine filtered layers with missing selected layers
+  const layers = [...filteredLayers, ...missingSelectedLayers];
+  
+  // Sort alphabetically for consistent display
+  layers.sort((a, b) => a.name.localeCompare(b.name));
 
   ui.opTargetsList.innerHTML = "";
   for (const l of layers) {
@@ -5034,6 +6006,7 @@ function saveToLocalStorage() {
   try {
     localStorage.setItem(STORAGE_KEY, serializeState(state));
     dirtySinceLastSave = false;
+    _updateCurrentFileInfo();
   } catch {
     // ignore
   }
@@ -5042,6 +6015,7 @@ function saveToLocalStorage() {
 function markDirty() {
   dirtySinceLastSave = true;
   inspectSummaryDirty = true;
+  _updateCurrentFileInfo();
 }
 
 function _syncInspectModeUi() {
@@ -5094,11 +6068,28 @@ function bulkDeleteSelected() {
   pruneBulkSelectedLayers();
   const names = [...bulkSelectedLayers];
   if (!names.length) return;
-  const sample = names.slice(0, 8).join(", ");
-  const more = names.length > 8 ? ` (+${names.length - 8} more)` : "";
-  if (!confirm(`Delete ${names.length} layer(s)?\n${sample}${more}`)) return;
+  
+  // Filter out layers linked to 'let' operations
+  const letLayerNames = new Set(
+    layerOps.filter((op) => op.type === "let" && op.var).map((op) => op.var)
+  );
+  const deletable = names.filter((nm) => !letLayerNames.has(nm));
+  const skipped = names.filter((nm) => letLayerNames.has(nm));
+  
+  if (!deletable.length) {
+    alert(`Cannot delete: all ${skipped.length} selected layer(s) are linked to Layer Ops.\nRemove them from Layer Ops first.`);
+    return;
+  }
+  
+  const sample = deletable.slice(0, 8).join(", ");
+  const more = deletable.length > 8 ? ` (+${deletable.length - 8} more)` : "";
+  let msg = `Delete ${deletable.length} layer(s)?\n${sample}${more}`;
+  if (skipped.length > 0) {
+    msg += `\n\n(Skipping ${skipped.length} layer(s) linked to Layer Ops)`;
+  }
+  if (!confirm(msg)) return;
 
-  for (const nm of names) removeLayer(state, nm);
+  for (const nm of deletable) removeLayer(state, nm);
   bulkSelectedLayers.clear();
   if (!state.layers.some((l) => l.name === selectedLayer)) selectedLayer = state.layers[0]?.name || "";
   syncLayerSelect();
@@ -5383,9 +6374,9 @@ function makeDemoState(H, W, seed = 0) {
   const s = makeEmptyState(H, W);
 
   addLayer(s, { name: "cell_type", kind: "categorical", init: "zeros", value: 0, seed });
-  addLayer(s, { name: "mol_nutrient", kind: "continuous", init: "zeros", value: 0, seed });
-  addLayer(s, { name: "mol_toxin", kind: "continuous", init: "zeros", value: 0, seed });
-  addLayer(s, { name: "prot_tight_junction", kind: "continuous", init: "zeros", value: 0, seed });
+  addLayer(s, { name: "mol_nutrient", kind: "counts", init: "zeros", value: 0, seed });
+  addLayer(s, { name: "mol_toxin", kind: "counts", init: "zeros", value: 0, seed });
+  addLayer(s, { name: "prot_tight_junction", kind: "counts", init: "zeros", value: 0, seed });
 
   const cell = s.data.cell_type;
   const nutrient = s.data.mol_nutrient;
@@ -5676,14 +6667,16 @@ function renderInspectSummary(state, layerName) {
     const extra = items.length > 10 ? ` (+${items.length - 10} more)` : "";
     ui.inspectSummaryStats.textContent = `layer=${layerName} kind=${kind} unique=${items.length}${extra}  ${top}`;
 
-    const p = _stepsPrepPlotCanvas(ui.inspectCanvasHist, 640, 200);
+    const p = _stepsPrepPlotCanvas(ui.inspectCanvasHist, 520, 180);
     if (p) {
       const { ctx, W, H } = p;
-      ctx.fillStyle = "rgba(255,255,255,.04)";
+      ctx.fillStyle = "rgba(255,255,255,.02)";
       ctx.fillRect(0, 0, W, H);
       ctx.fillStyle = "rgba(255,255,255,.65)";
       ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
-      ctx.fillText("categorical (no histogram)", 10, 20);
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "center";
+      ctx.fillText("categorical (no histogram)", W / 2, H / 2);
     }
     return;
   }
@@ -5707,7 +6700,181 @@ function renderInspectSummary(state, layerName) {
   const nzPct = (100 * nz) / Math.max(1, n);
   ui.inspectSummaryStats.textContent = `layer=${layerName} kind=${kind}  min=${_stepsFmt(mn)}  max=${_stepsFmt(mx)}  mean=${_stepsFmt(mean)}  std=${_stepsFmt(std)}  nonzero=${_stepsFmt(nzPct)}%`;
 
-  _stepsDrawHistogramFixed(ui.inspectCanvasHist, a, mn, mx, 60, "value");
+  const maskName = String(inspectHistMaskLayer || "").trim();
+  const maskArr = maskName ? (state.data?.[maskName] || null) : null;
+  _drawInspectHistogram(ui.inspectCanvasHist, a, mn, mx, maskName, maskArr, inspectHistMaskOp, inspectHistMaskValue);
+}
+
+function _drawInspectHistogram(canvas, values, mn, mx, maskLayerName, maskArr, maskOp, maskValue) {
+  if (!canvas || !values || !values.length) return;
+  const p = _stepsPrepPlotCanvas(canvas, 520, 180);
+  if (!p) return;
+  const { ctx, W, H } = p;
+
+  ctx.fillStyle = "rgba(255,255,255,.02)";
+  ctx.fillRect(0, 0, W, H);
+
+  let lo = mn;
+  let hi = mx;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) {
+    lo = 0;
+    hi = 1;
+  }
+
+  const useMask = !!(maskArr && maskArr.length === values.length && String(maskLayerName || "").trim());
+  const mv = Number(maskValue);
+
+  if (useMask) {
+    let mn2 = Infinity;
+    let mx2 = -Infinity;
+    let nPass = 0;
+    for (let i = 0; i < values.length; i++) {
+      const m = maskArr[i];
+      let pass = false;
+      if (maskOp === "==") pass = m === mv;
+      else if (maskOp === "!=") pass = m !== mv;
+      else if (maskOp === ">") pass = m > mv;
+      else if (maskOp === ">=") pass = m >= mv;
+      else if (maskOp === "<") pass = m < mv;
+      else if (maskOp === "<=") pass = m <= mv;
+      if (!pass) continue;
+      const v = values[i];
+      if (!Number.isFinite(v)) continue;
+      if (v < mn2) mn2 = v;
+      if (v > mx2) mx2 = v;
+      nPass++;
+    }
+    if (!nPass) {
+      ctx.fillStyle = "rgba(255,255,255,.02)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "rgba(255,255,255,.65)";
+      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "center";
+      ctx.fillText("no values match mask", W / 2, H / 2);
+      return;
+    }
+    if (Number.isFinite(mn2) && Number.isFinite(mx2) && mn2 !== mx2) {
+      lo = mn2;
+      hi = mx2;
+    }
+  }
+
+  const fontPx = 11;
+  ctx.font = `${fontPx}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace`;
+
+  const xLo = _stepsFmt(lo);
+  const xHi = _stepsFmt(hi);
+  const yLabel = "count";
+  const xLabel = "value";
+
+  // Dynamic padding so labels are never clipped.
+  const yLabelW = ctx.measureText(yLabel).width;
+  const yTickW = ctx.measureText("999999").width;
+  const padL = Math.ceil(Math.max(34, yLabelW + yTickW + 18));
+  const padR = 10;
+  const padT = 10;
+  const padB = Math.ceil(Math.max(28, fontPx * 2.6));
+
+  const plotW = Math.max(10, W - padL - padR);
+  const plotH = Math.max(10, H - padT - padB);
+
+  const bins = Math.min(80, Math.max(20, Math.floor(plotW / 7)));
+  const counts = new Array(bins).fill(0);
+  const denom = hi - lo;
+  if (!(denom > 0)) return;
+  for (let i = 0; i < values.length; i++) {
+    if (useMask) {
+      const m = maskArr[i];
+      let pass = false;
+      if (maskOp === "==") pass = m === mv;
+      else if (maskOp === "!=") pass = m !== mv;
+      else if (maskOp === ">") pass = m > mv;
+      else if (maskOp === ">=") pass = m >= mv;
+      else if (maskOp === "<") pass = m < mv;
+      else if (maskOp === "<=") pass = m <= mv;
+      if (!pass) continue;
+    }
+
+    const v = values[i];
+    if (!Number.isFinite(v)) continue;
+    const t = (v - lo) / denom;
+    if (t < 0 || t > 1) continue;
+    const bi = Math.max(0, Math.min(bins - 1, Math.floor(t * bins)));
+    counts[bi]++;
+  }
+
+  let maxC = 1;
+  for (const c of counts) if (c > maxC) maxC = c;
+
+  // Grid lines
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.lineWidth = 1;
+  for (let k = 1; k <= 3; k++) {
+    const yy = padT + (plotH * k) / 4;
+    ctx.beginPath();
+    ctx.moveTo(padL, yy + 0.5);
+    ctx.lineTo(padL + plotW, yy + 0.5);
+    ctx.stroke();
+  }
+
+  // Axes
+  ctx.strokeStyle = "rgba(255,255,255,.18)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL + 0.5, padT + 0.5);
+  ctx.lineTo(padL + 0.5, padT + plotH + 0.5);
+  ctx.lineTo(padL + plotW + 0.5, padT + plotH + 0.5);
+  ctx.stroke();
+
+  // Bars
+  const barW = plotW / bins;
+  const gradient = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  gradient.addColorStop(0, "rgba(10, 132, 255, 0.70)");
+  gradient.addColorStop(1, "rgba(10, 132, 255, 0.22)");
+  ctx.fillStyle = gradient;
+  for (let i = 0; i < bins; i++) {
+    const h = (counts[i] / maxC) * plotH;
+    const x = padL + i * barW;
+    const y = padT + plotH - h;
+    ctx.fillRect(x, y, Math.max(1, barW - 1), h);
+  }
+
+  // Optional smooth outline
+  ctx.strokeStyle = "rgba(10, 132, 255, 0.85)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < bins; i++) {
+    const h = (counts[i] / maxC) * plotH;
+    const x = padL + (i + 0.5) * barW;
+    const y = padT + plotH - h;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = "rgba(255,255,255,.78)";
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "right";
+  ctx.fillText(String(maxC), padL - 8, padT + 8);
+  ctx.fillText("0", padL - 8, padT + plotH);
+
+  ctx.textBaseline = "top";
+  ctx.textAlign = "center";
+  ctx.fillText(xLo, padL, padT + plotH + 6);
+  ctx.fillText(xHi, padL + plotW, padT + plotH + 6);
+
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.fillText(xLabel, padL + plotW / 2, H - fontPx - 2);
+
+  ctx.save();
+  ctx.translate(fontPx + 2, padT + plotH / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(yLabel, 0, 0);
+  ctx.restore();
 }
 
 function paintCircle(state, layerName, cy, cx, radius, value) {
@@ -5744,6 +6911,44 @@ function fillRect(state, layerName, y0, x0, y1, x1, value) {
 
 let state = makeDemoState(64, 96, 0);
 let selectedLayer = "cell_type";
+
+function _inspectPopulateHistMaskLayerSelect() {
+  if (!ui.inspectHistMaskLayer) return;
+  ui.inspectHistMaskLayer.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = "(none)";
+  ui.inspectHistMaskLayer.appendChild(opt0);
+
+  for (const l of state.layers) {
+    const nm = String(l?.name || "");
+    if (!nm) continue;
+    const opt = document.createElement("option");
+    opt.value = nm;
+    opt.textContent = nm;
+    ui.inspectHistMaskLayer.appendChild(opt);
+  }
+
+  const avail = new Set(state.layers.map((l) => String(l?.name || "")));
+  if (inspectHistMaskLayer && !avail.has(String(inspectHistMaskLayer))) inspectHistMaskLayer = "";
+  ui.inspectHistMaskLayer.value = String(inspectHistMaskLayer || "");
+}
+
+function _inspectInitHistMaskControls() {
+  try {
+    inspectHistMaskLayer = String(localStorage.getItem(INSPECT_HIST_MASK_LAYER_KEY) || "");
+  } catch {}
+  try {
+    inspectHistMaskOp = String(localStorage.getItem(INSPECT_HIST_MASK_OP_KEY) || "==");
+  } catch {}
+  try {
+    const v = Number(localStorage.getItem(INSPECT_HIST_MASK_VALUE_KEY));
+    if (Number.isFinite(v)) inspectHistMaskValue = v;
+  } catch {}
+
+  if (ui.inspectHistMaskOp) ui.inspectHistMaskOp.value = String(inspectHistMaskOp || "==");
+  if (ui.inspectHistMaskValue) ui.inspectHistMaskValue.value = String(inspectHistMaskValue);
+}
 
 function syncLayerSelect() {
   pruneBulkSelectedLayers();
@@ -5836,6 +7041,8 @@ function syncLayerSelect() {
 
   if (!state.layers.some((l) => l.name === selectedLayer)) selectedLayer = state.layers[0]?.name || "";
   ui.layerSelect.value = selectedLayer;
+
+  _inspectPopulateHistMaskLayerSelect();
 
   if (!state.layers.some((l) => l.name === ui.maskLayer.value)) {
     ui.maskLayer.value = state.layers[0]?.name || "";
@@ -6009,7 +7216,25 @@ function renderLayersTable() {
     tr.appendChild(tdName);
 
     const tdKind = document.createElement("td");
-    tdKind.textContent = l.kind;
+    const kindSelect = document.createElement("select");
+    kindSelect.className = "input input--tiny";
+    for (const k of ["continuous", "categorical", "counts"]) {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = k;
+      if (k === l.kind) opt.selected = true;
+      kindSelect.appendChild(opt);
+    }
+    kindSelect.addEventListener("change", () => {
+      const newKind = kindSelect.value;
+      if (newKind !== l.kind) {
+        l.kind = newKind;
+        markDirty();
+        saveToLocalStorage();
+        updatePanels();
+      }
+    });
+    tdKind.appendChild(kindSelect);
     tr.appendChild(tdKind);
 
     const tdColor = document.createElement("td");
@@ -6038,18 +7263,28 @@ function renderLayersTable() {
       renderLayersTable();
     });
 
+    // Check if this layer is linked to a 'let' operation
+    const isLetLayer = layerOps.some((op) => op.type === "let" && op.var === l.name);
+
     const btnDel = document.createElement("button");
     btnDel.className = "btn btn--danger btn--tiny";
     btnDel.textContent = "Del";
-    btnDel.addEventListener("click", () => {
-      if (!confirm(`Remove layer '${l.name}'?`)) return;
-      removeLayer(state, l.name);
-      bulkSelectedLayers.delete(l.name);
-      if (selectedLayer === l.name) selectedLayer = state.layers[0]?.name || "";
-      syncLayerSelect();
-      markDirty();
-      saveToLocalStorage();
-    });
+    if (isLetLayer) {
+      btnDel.disabled = true;
+      btnDel.title = "Remove from Layer Ops to delete";
+      btnDel.style.opacity = "0.4";
+      btnDel.style.cursor = "not-allowed";
+    } else {
+      btnDel.addEventListener("click", () => {
+        if (!confirm(`Remove layer '${l.name}'?`)) return;
+        removeLayer(state, l.name);
+        bulkSelectedLayers.delete(l.name);
+        if (selectedLayer === l.name) selectedLayer = state.layers[0]?.name || "";
+        syncLayerSelect();
+        markDirty();
+        saveToLocalStorage();
+      });
+    }
 
     act.appendChild(btnSel);
     act.appendChild(btnDel);
@@ -6763,14 +7998,54 @@ function _stepsDrawHeatmap(canvas, arr, H, W, kind, mode, fixedRange = null, tin
     }
     if (maxAbs === 0) maxAbs = 1e-9;
   } else if (kind !== "categorical") {
+    const maskArr = arguments.length >= 9 ? arguments[8] : null;
+    const maskOp = arguments.length >= 10 ? arguments[9] : "==";
+    const maskValue = arguments.length >= 11 ? arguments[10] : 1;
+    const useMask = maskArr && maskArr.length === arr.length;
+    const mv = Number(maskValue);
+
     if (fixedRange && Number.isFinite(fixedRange.mn) && Number.isFinite(fixedRange.mx)) {
       mn = fixedRange.mn;
       mx = fixedRange.mx;
     } else {
-      for (let i = 0; i < arr.length; i++) {
-        const v = kind === "counts" ? clampCounts(arr[i]) : arr[i];
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
+      // If masking is active, only use pixels that pass the mask to calculate the range
+      if (useMask) {
+        let validPixelCount = 0;
+        for (let i = 0; i < arr.length; i++) {
+          const m = maskArr[i];
+          let pass = false;
+          if (maskOp === "==") pass = m === mv;
+          else if (maskOp === "!=") pass = m !== mv;
+          else if (maskOp === ">") pass = m > mv;
+          else if (maskOp === ">=") pass = m >= mv;
+          else if (maskOp === "<") pass = m < mv;
+          else if (maskOp === "<=") pass = m <= mv;
+          
+          if (pass) {
+            const v = kind === "counts" ? clampCounts(arr[i]) : arr[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            validPixelCount++;
+          }
+        }
+        
+        // If no pixels passed the mask, fall back to full range
+        if (validPixelCount === 0) {
+          mn = Infinity;
+          mx = -Infinity;
+          for (let i = 0; i < arr.length; i++) {
+            const v = kind === "counts" ? clampCounts(arr[i]) : arr[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+          }
+        }
+      } else {
+        // No mask, use all pixels
+        for (let i = 0; i < arr.length; i++) {
+          const v = kind === "counts" ? clampCounts(arr[i]) : arr[i];
+          if (v < mn) mn = v;
+          if (v > mx) mx = v;
+        }
       }
     }
     if (!Number.isFinite(mn) || !Number.isFinite(mx) || mn === mx) {
@@ -6781,11 +8056,38 @@ function _stepsDrawHeatmap(canvas, arr, H, W, kind, mode, fixedRange = null, tin
 
   const tint = tintHex ? hexToRgb(tintHex) : null;
 
+  // These are now defined earlier for range calculation
+  const maskArr = arguments.length >= 9 ? arguments[8] : null;
+  const maskOp = arguments.length >= 10 ? arguments[9] : "==";
+  const maskValue = arguments.length >= 11 ? arguments[10] : 1;
+  const useMask = maskArr && maskArr.length === arr.length;
+  const mv = Number(maskValue);
+
   for (let y = 0; y < ch; y++) {
     for (let x = 0; x < cw; x++) {
       const srcY = Math.min(H - 1, Math.floor(y * sy));
       const srcX = Math.min(W - 1, Math.floor(x * sx));
-      const v0 = arr[srcY * W + srcX];
+      const si = srcY * W + srcX;
+      if (useMask) {
+        const m = maskArr[si];
+        let pass = false;
+        if (maskOp === "==") pass = m === mv;
+        else if (maskOp === "!=") pass = m !== mv;
+        else if (maskOp === ">") pass = m > mv;
+        else if (maskOp === ">=") pass = m >= mv;
+        else if (maskOp === "<") pass = m < mv;
+        else if (maskOp === "<=") pass = m <= mv;
+        if (!pass) {
+          const i = (y * cw + x) * 4;
+          px[i + 0] = 0;
+          px[i + 1] = 0;
+          px[i + 2] = 0;
+          px[i + 3] = 0;
+          continue;
+        }
+      }
+
+      const v0 = arr[si];
       const v = kind === "counts" ? clampCounts(v0) : v0;
 
       let r = 0,
@@ -7215,6 +8517,12 @@ function setActiveScreen(name) {
   for (const p of document.querySelectorAll(".screenPanel")) {
     p.classList.toggle("screenPanel--active", p.dataset.screen === name);
   }
+
+  if (name === "runtime") {
+    if (!rtRunning && !rtLoaded) {
+      void _rtEnsureSyncedFromEditor(false, "editor").catch((e) => _rtSetStatus(String(e?.message || e)));
+    }
+  }
   if (name === "workspace") {
     applyAutoFitZoom();
     return;
@@ -7238,6 +8546,7 @@ function setActiveScreen(name) {
   }
 
   if (name === "evolution") {
+    _evoRenderTargetLayersUI();
     setTimeout(() => _evoRenderNow(), 0);
   }
 }
@@ -7255,8 +8564,6 @@ for (const screenPanel of document.querySelectorAll(".screenPanel")) {
   for (const b of btns) {
     b.addEventListener("click", () => {
       setActiveTab(screenPanel, b.dataset.tab);
-      if (b.dataset.tab === "steps") setTimeout(() => _stepsRenderSelectedLayer(), 0);
-      if (b.dataset.tab === "runtime") setTimeout(() => _rtRenderNow(), 0);
     });
   }
 }
@@ -7264,6 +8571,42 @@ for (const screenPanel of document.querySelectorAll(".screenPanel")) {
 if (ui.inspectMode) {
   ui.inspectMode.addEventListener("change", () => {
     _syncInspectModeUi();
+  });
+}
+
+if (ui.inspectHistMaskLayer) {
+  ui.inspectHistMaskLayer.addEventListener("change", () => {
+    inspectHistMaskLayer = String(ui.inspectHistMaskLayer.value || "").trim();
+    try {
+      localStorage.setItem(INSPECT_HIST_MASK_LAYER_KEY, String(inspectHistMaskLayer || ""));
+    } catch {}
+    inspectSummaryDirty = true;
+    _ensureInspectSummaryUpToDate();
+  });
+}
+
+if (ui.inspectHistMaskOp) {
+  ui.inspectHistMaskOp.addEventListener("change", () => {
+    inspectHistMaskOp = String(ui.inspectHistMaskOp.value || "==");
+    try {
+      localStorage.setItem(INSPECT_HIST_MASK_OP_KEY, String(inspectHistMaskOp));
+    } catch {}
+    inspectSummaryDirty = true;
+    _ensureInspectSummaryUpToDate();
+  });
+}
+
+if (ui.inspectHistMaskValue) {
+  ui.inspectHistMaskValue.addEventListener("input", () => {
+    const v = Number(ui.inspectHistMaskValue.value);
+    if (Number.isFinite(v)) {
+      inspectHistMaskValue = v;
+      try {
+        localStorage.setItem(INSPECT_HIST_MASK_VALUE_KEY, String(v));
+      } catch {}
+      inspectSummaryDirty = true;
+      _ensureInspectSummaryUpToDate();
+    }
   });
 }
 
@@ -7314,97 +8657,7 @@ if (ui.opsHelpBtn) {
   });
 }
 
-if (ui.stepsBeforeFile) {
-  ui.stepsBeforeFile.addEventListener("change", () => {
-    if (ui.stepsBeforeFile?.files?.length && ui.stepsAfterFile?.files?.length) _stepsTryLoad("both");
-  });
-}
-if (ui.stepsAfterFile) {
-  ui.stepsAfterFile.addEventListener("change", () => {
-    if (ui.stepsBeforeFile?.files?.length && ui.stepsAfterFile?.files?.length) _stepsTryLoad("both");
-  });
-}
-if (ui.stepsLayerSelect) {
-  ui.stepsLayerSelect.addEventListener("change", () => {
-    stepsSelectedLayer = ui.stepsLayerSelect.value;
-    _stepsRenderSelectedLayer();
-    _stepsRenderDiffTable();
-  });
-}
-
-if (ui.stepsShowLetLayers) {
-  ui.stepsShowLetLayers.addEventListener("change", () => {
-    stepsShowLetLayers = ui.stepsShowLetLayers.checked;
-    _stepsRenderLayerSelect();
-    _stepsRenderMaskSelect();
-    _stepsRenderScatterSelects();
-    _stepsRenderDiffTable();
-    _stepsRenderSelectedLayer();
-  });
-  ui.stepsShowLetLayers.checked = stepsShowLetLayers;
-}
-
-if (ui.stepsMaskLayerSelect) {
-  ui.stepsMaskLayerSelect.addEventListener("change", () => {
-    stepsMaskLayer = ui.stepsMaskLayerSelect.value;
-    _stepsRenderSelectedLayer();
-  });
-}
-if (ui.stepsMaskMode) {
-  ui.stepsMaskMode.addEventListener("change", () => {
-    stepsMaskMode = ui.stepsMaskMode.value;
-    _stepsRenderSelectedLayer();
-  });
-}
-if (ui.stepsMaskValue) {
-  ui.stepsMaskValue.addEventListener("input", () => {
-    const v = Number(ui.stepsMaskValue.value);
-    stepsMaskValue = Number.isFinite(v) ? v : 0;
-    _stepsRenderSelectedLayer();
-  });
-}
-
-if (ui.stepsScatterEnabled) {
-  ui.stepsScatterEnabled.addEventListener("change", () => {
-    stepsScatterEnabled = ui.stepsScatterEnabled.checked;
-    _stepsRenderScatter();
-  });
-}
-if (ui.stepsScatterSource) {
-  ui.stepsScatterSource.addEventListener("change", () => {
-    stepsScatterSource = ui.stepsScatterSource.value;
-    _stepsRenderScatter();
-  });
-}
-if (ui.stepsScatterX) {
-  ui.stepsScatterX.addEventListener("change", () => {
-    stepsScatterX = ui.stepsScatterX.value;
-    _stepsRenderScatter();
-  });
-}
-if (ui.stepsScatterY) {
-  ui.stepsScatterY.addEventListener("change", () => {
-    stepsScatterY = ui.stepsScatterY.value;
-    _stepsRenderScatter();
-  });
-}
-
 // Runtime wiring
-if (ui.rtFile) {
-  ui.rtFile.addEventListener("change", async () => {
-    const f = ui.rtFile?.files?.[0] || null;
-    if (!f) return;
-    try {
-      _rtStop();
-      const txt = await f.text();
-      const payload = JSON.parse(txt);
-      await _rtResetWithPayload(payload);
-    } catch (e) {
-      _rtSetStatus(String(e?.message || e));
-    }
-  });
-}
-
 if (ui.evoStartBtn) {
   ui.evoStartBtn.addEventListener("click", async () => {
     try {
@@ -7444,10 +8697,9 @@ if (ui.evoTopList) {
         return;
       }
       if (act === "load") {
-        setActiveScreen("functions");
-        const fnPanel = document.querySelector('.screenPanel[data-screen="functions"]');
-        if (fnPanel) setActiveTab(fnPanel, "runtime");
-        await _rtResetWithPayload(payload);
+        setActiveScreen("runtime");
+        _applyPayloadToEditor(payload, `evo:${id.slice(0, 8)}`);
+        await _rtEnsureSyncedFromEditor(true, `evo:${id.slice(0, 8)}`);
         setTimeout(() => _rtRenderNow(), 0);
       }
     } catch (err) {
@@ -7456,7 +8708,15 @@ if (ui.evoTopList) {
   });
 }
 
-if (ui.rtStartStopBtn) ui.rtStartStopBtn.addEventListener("click", () => _rtToggleRun());
+if (ui.rtStartStopBtn)
+  ui.rtStartStopBtn.addEventListener("click", async () => {
+    try {
+      if (!rtRunning && !rtLoaded) await _rtEnsureSyncedFromEditor(true, "editor");
+      _rtToggleRun();
+    } catch (e) {
+      _rtSetStatus(String(e?.message || e));
+    }
+  });
 
 _rtInitVizCols();
 
@@ -7467,6 +8727,16 @@ _rtInitSurvivalControls();
 if (ui.rtVizCols) {
   ui.rtVizCols.addEventListener("change", () => {
     _rtSetVizCols(ui.rtVizCols.value);
+  });
+}
+
+if (ui.rtHeatMaskEnabled) {
+  ui.rtHeatMaskEnabled.addEventListener("change", () => {
+    rtHeatMaskEnabled = !!ui.rtHeatMaskEnabled.checked;
+    try {
+      localStorage.setItem(RT_HEAT_MASK_ENABLED_KEY, rtHeatMaskEnabled ? "1" : "0");
+    } catch {}
+    _rtRenderHeatmaps();
   });
 }
 
@@ -7510,6 +8780,50 @@ if (ui.rtHistLogY) {
   });
 }
 
+if (ui.rtHistMaskLayer) {
+  ui.rtHistMaskLayer.addEventListener("change", async () => {
+    rtHistMaskLayer = String(ui.rtHistMaskLayer.value || "").trim();
+    try {
+      localStorage.setItem(RT_HIST_MASK_LAYER_KEY, String(rtHistMaskLayer || ""));
+    } catch {}
+    if (!rtLoaded) {
+      _rtRenderHistogram();
+      return;
+    }
+    try {
+      const layers = _rtGetRequestedLayerNames();
+      await _rtStep(0, layers);
+    } catch (e) {
+      console.error("rtHistMaskLayer change error:", e);
+    }
+  });
+}
+
+if (ui.rtHistMaskOp) {
+  ui.rtHistMaskOp.addEventListener("change", () => {
+    rtHistMaskOp = String(ui.rtHistMaskOp.value || "==");
+    try {
+      localStorage.setItem(RT_HIST_MASK_OP_KEY, String(rtHistMaskOp));
+    } catch {}
+    _rtRenderHistogram();
+    if (rtHeatMaskEnabled) _rtRenderHeatmaps();
+  });
+}
+
+if (ui.rtHistMaskValue) {
+  ui.rtHistMaskValue.addEventListener("input", () => {
+    const v = Number(ui.rtHistMaskValue.value);
+    if (Number.isFinite(v)) {
+      rtHistMaskValue = v;
+      try {
+        localStorage.setItem(RT_HIST_MASK_VALUE_KEY, String(v));
+      } catch {}
+      _rtRenderHistogram();
+      if (rtHeatMaskEnabled) _rtRenderHeatmaps();
+    }
+  });
+}
+
 if (ui.rtSurvTopK) {
   ui.rtSurvTopK.addEventListener("input", () => {
     const n = Math.floor(Number(ui.rtSurvTopK.value || "12"));
@@ -7545,6 +8859,7 @@ if (ui.rtStepBtn) {
   ui.rtStepBtn.addEventListener("click", async () => {
     try {
       _rtStop();
+      if (!rtLoaded) await _rtEnsureSyncedFromEditor(true, "editor");
       await _rtStepOnce();
     } catch (e) {
       _rtSetStatus(String(e?.message || e));
@@ -7556,15 +8871,18 @@ if (ui.rtResetBtn) {
   ui.rtResetBtn.addEventListener("click", async () => {
     try {
       _rtStop();
-      // Re-upload file to reset, since we don't keep a local copy here.
-      const f = ui.rtFile?.files?.[0] || null;
-      if (!f) {
-        _rtSetStatus("Pick a gridstate file to reset");
-        return;
-      }
-      const txt = await f.text();
-      const payload = JSON.parse(txt);
-      await _rtResetWithPayload(payload);
+      await _rtEnsureSyncedFromEditor(true, "editor");
+      setTimeout(() => _rtRenderNow(), 0);
+    } catch (e) {
+      _rtSetStatus(String(e?.message || e));
+    }
+  });
+}
+
+if (ui.rtDownloadBtn) {
+  ui.rtDownloadBtn.addEventListener("click", async () => {
+    try {
+      await _rtDownloadTick();
     } catch (e) {
       _rtSetStatus(String(e?.message || e));
     }
@@ -7608,6 +8926,38 @@ if (ui.groupByPrefix) {
     renderLayersTable();
   });
   layersGroupByPrefix = ui.groupByPrefix.checked;
+}
+
+if (ui.collapseAllBtn) {
+  ui.collapseAllBtn.addEventListener("click", () => {
+    // Get all current group keys and add them to collapsed set
+    const query = String(layersFilterText || "").trim().toLowerCase();
+    const layers = query
+      ? state.layers.filter((l) => String(l.name).toLowerCase().includes(query))
+      : state.layers;
+    
+    const groups = new Map();
+    for (const l of layers) {
+      const key = layersGroupByPrefix ? String(l.name).split("_")[0] : "all";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(l);
+    }
+    
+    const groupKeys = [...groups.keys()];
+    for (const key of groupKeys) {
+      collapsedGroups.add(key);
+    }
+    
+    renderLayersTable();
+  });
+}
+
+if (ui.expandAllBtn) {
+  ui.expandAllBtn.addEventListener("click", () => {
+    // Clear all collapsed groups
+    collapsedGroups.clear();
+    renderLayersTable();
+  });
 }
 
 // Masked ops preview
@@ -7693,7 +9043,7 @@ if (ui.fnResetBtn) {
 if (ui.opsAddRowBtn) {
   ui.opsAddRowBtn.addEventListener("click", () => {
     const target = state.layers[0]?.name || "layer";
-    layerOps.push({ type: "op", enabled: true, name: "", target, expr: target });
+    _opsInsertAtFocused({ type: "op", enabled: true, name: "", target, expr: target });
     saveFunctionsCfg();
     markDirty();
     saveToLocalStorage();
@@ -7703,11 +9053,35 @@ if (ui.opsAddRowBtn) {
 
 if (ui.opsAddVarBtn) {
   ui.opsAddVarBtn.addEventListener("click", () => {
-    layerOps.push({ type: "let", enabled: true, name: "", var: "tmp", expr: "0" });
+    // Find a unique name for the new layer
+    let varName = "computed_1";
+    let counter = 1;
+    while (state.layers.some((l) => l.name === varName)) {
+      counter++;
+      varName = `computed_${counter}`;
+    }
+    
+    // Create the actual layer
+    try {
+      addLayer(state, {
+        name: varName,
+        kind: "continuous",
+        init: "zeros",
+        value: 0,
+        seed: 0,
+        color: "#8B5CF6",
+      });
+    } catch (e) {
+      console.error("Failed to create layer for let:", e);
+    }
+    
+    // Add the let operation pointing to this layer
+    _opsInsertAtFocused({ type: "let", enabled: true, name: "", var: varName, expr: "0" });
     saveFunctionsCfg();
     markDirty();
     saveToLocalStorage();
     renderLayerOpsTable();
+    syncLayerSelect();
   });
 }
 
@@ -7718,7 +9092,7 @@ if (ui.opsAddForEachBtn) {
     const stepsText = `for (i in "${defaultLayer}") {\n  {i} <- {i}\n}`;
     const layerNames = state?.layers ? state.layers.map((l) => l.name) : [];
     const c = _compileForEachR(stepsText, layerNames);
-    layerOps.push({
+    _opsInsertAtFocused({
       type: "foreach",
       enabled: true,
       name: "",
@@ -7738,7 +9112,7 @@ if (ui.opsAddForEachBtn) {
 if (ui.opsAddTransportBtn) {
   ui.opsAddTransportBtn.addEventListener("click", () => {
     const defaultCellLayer = state?.layers?.some((l) => l.name === "cell") ? "cell" : state.layers[0]?.name || "cell";
-    layerOps.push({
+    _opsInsertAtFocused({
       type: "transport",
       enabled: true,
       name: "",
@@ -7763,7 +9137,7 @@ if (ui.opsAddTransportBtn) {
 if (ui.opsAddDiffusionBtn) {
   ui.opsAddDiffusionBtn.addEventListener("click", () => {
     const defaultCellLayer = state?.layers?.some((l) => l.name === "cell") ? "cell" : state.layers[0]?.name || "cell";
-    layerOps.push({
+    _opsInsertAtFocused({
       type: "diffusion",
       enabled: true,
       name: "",
@@ -7780,6 +9154,146 @@ if (ui.opsAddDiffusionBtn) {
     markDirty();
     saveToLocalStorage();
     renderLayerOpsTable();
+  });
+}
+
+if (ui.opsAddPathwayBtn) {
+  ui.opsAddPathwayBtn.addEventListener("click", () => {
+    // Prompt for pathway name
+    const pathwayName = prompt("Enter pathway name (e.g., glycolysis):", "glycolysis");
+    if (!pathwayName || !pathwayName.trim()) return;
+    const name = pathwayName.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    
+    // Prompt for inputs
+    const inputsStr = prompt("Enter input layer names (comma-separated, e.g., glucose):", "glucose");
+    if (!inputsStr) return;
+    const inputs = inputsStr.split(",").map(s => s.trim()).filter(s => s);
+    if (!inputs.length) {
+      alert("At least one input is required");
+      return;
+    }
+    
+    // Prompt for outputs
+    const outputsStr = prompt("Enter output layer names (comma-separated, e.g., atp):", "atp");
+    if (!outputsStr) return;
+    const outputs = outputsStr.split(",").map(s => s.trim()).filter(s => s);
+    if (!outputs.length) {
+      alert("At least one output is required");
+      return;
+    }
+    
+    // Prompt for number of enzymes
+    const numEnzymesStr = prompt("Enter number of enzyme steps (1-10):", "3");
+    const numEnzymes = Math.max(1, Math.min(10, parseInt(numEnzymesStr) || 3));
+    
+    const defaultCellLayer = state?.layers?.some((l) => l.name === "cell")
+      ? "cell"
+      : state?.layers?.some((l) => l.name === "cell_type")
+        ? "cell_type"
+        : state.layers[0]?.name || "cell";
+
+    const resolveMolName = (nm) => {
+      const s = String(nm || "").trim();
+      if (!s) return "";
+      if (state.layers.some((l) => l.name === s)) return s;
+      const cand1 = `molecule_${s}`;
+      if (state.layers.some((l) => l.name === cand1)) return cand1;
+      const cand2 = `mol_${s}`;
+      if (state.layers.some((l) => l.name === cand2)) return cand2;
+      return s;
+    };
+
+    const resolvedInputs = Array.from(new Set(inputs.map(resolveMolName).filter((s) => s)));
+    const resolvedOutputs = Array.from(new Set(outputs.map(resolveMolName).filter((s) => s)));
+    
+    // Create the enzyme layers (protein, rna, gene triplets)
+    const createdLayers = [];
+    for (let e = 1; e <= numEnzymes; e++) {
+      const proteinName = `protein_${name}_enzyme_${e}`;
+      const rnaName = `rna_${name}_enzyme_${e}`;
+      const geneName = `gene_${name}_enzyme_${e}`;
+      
+      for (const layerName of [proteinName, rnaName, geneName]) {
+        if (!state.layers.some(l => l.name === layerName)) {
+          try {
+            addLayer(state, {
+              name: layerName,
+              kind: "counts",
+              init: layerName.startsWith("gene_") ? "ones" : "zeros",
+              value: layerName.startsWith("gene_") ? 1 : 0,
+              seed: 0,
+              color: layerName.startsWith("protein_") ? "#10B981" : 
+                     layerName.startsWith("rna_") ? "#F59E0B" : "#6366F1",
+            });
+            createdLayers.push(layerName);
+          } catch (e) {
+            console.error(`Failed to create layer ${layerName}:`, e);
+          }
+        }
+      }
+    }
+    
+    // Create input/output layers if they don't exist
+    for (const inputName of resolvedInputs) {
+      if (!state.layers.some(l => l.name === inputName)) {
+        try {
+          addLayer(state, {
+            name: inputName,
+            kind: "counts",
+            init: "zeros",
+            value: 0,
+            seed: 0,
+            color: "#3B82F6",
+          });
+          createdLayers.push(inputName);
+        } catch (e) {
+          console.error(`Failed to create input layer ${inputName}:`, e);
+        }
+      }
+    }
+    
+    for (const outputName of resolvedOutputs) {
+      if (!state.layers.some(l => l.name === outputName)) {
+        try {
+          addLayer(state, {
+            name: outputName,
+            kind: "counts",
+            init: "zeros",
+            value: 0,
+            seed: 0,
+            color: "#EF4444",
+          });
+          createdLayers.push(outputName);
+        } catch (e) {
+          console.error(`Failed to create output layer ${outputName}:`, e);
+        }
+      }
+    }
+    
+    _opsInsertAtFocused({
+      type: "pathway",
+      enabled: true,
+      name: name,
+      group: "",
+      pathway_name: name,
+      inputs: resolvedInputs,
+      outputs: resolvedOutputs,
+      num_enzymes: numEnzymes,
+      cell_layer: defaultCellLayer,
+      cell_value: 1,
+      efficiency: 1.0,
+      seed: 0,
+    });
+    
+    saveFunctionsCfg();
+    markDirty();
+    saveToLocalStorage();
+    renderLayerOpsTable();
+    syncLayerSelect();
+    
+    if (createdLayers.length > 0) {
+      alert(`Created ${createdLayers.length} new layers for pathway "${name}":\n${createdLayers.slice(0, 10).join(", ")}${createdLayers.length > 10 ? "..." : ""}`);
+    }
   });
 }
 
@@ -7972,13 +9486,12 @@ ui.opApplyBtn.addEventListener("click", () => {
   }
 });
 
-for (const el of [ui.opTargetFilter, ui.opTargetPrefix]) {
-  if (!el) continue;
-  el.addEventListener("input", () => {
+if (ui.opTargetFilter) {
+  ui.opTargetFilter.addEventListener("input", () => {
     renderOpTargetsList();
     updateMaskedOpsPreview();
   });
-  el.addEventListener("change", () => {
+  ui.opTargetFilter.addEventListener("change", () => {
     renderOpTargetsList();
     updateMaskedOpsPreview();
   });
@@ -7986,8 +9499,14 @@ for (const el of [ui.opTargetFilter, ui.opTargetPrefix]) {
 
 if (ui.opTargetsSelectAll) {
   ui.opTargetsSelectAll.addEventListener("click", () => {
-    const q = String(ui.opTargetFilter?.value || "").trim().toLowerCase();
-    const layers = q ? state.layers.filter((l) => String(l.name).toLowerCase().includes(q)) : state.layers;
+    const q = String(ui.opTargetFilter?.value || "").trim();
+    
+    let layers = state.layers;
+    if (q) {
+      const pattern = q.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+      const regex = new RegExp(`^${pattern}$`, 'i');
+      layers = state.layers.filter((l) => regex.test(String(l.name)));
+    }
     const isRandom = isRandomAssignOpType(ui.opType?.value);
     for (const l of layers) {
       if (isRandom && l.kind === "categorical") continue;
@@ -8056,14 +9575,29 @@ if (ui.bulkDeleteBtn) {
 ui.saveBtn.addEventListener("click", () => {
   const text = serializeState(state);
   download("gridstate.json", text);
+  dirtySinceLastSave = false;
+  _updateCurrentFileInfo();
   saveToLocalStorage();
 });
 
 ui.demoBtn.addEventListener("click", () => {
   const H = Number(ui.HInput.value);
   const W = Number(ui.WInput.value);
+  
+  // Reset all state for new file
+  _resetAllForNewFile();
+  
   state = makeDemoState(H, W, 0);
   selectedLayer = "cell_type";
+  _setCurrentFile("demo");
+  
+  // Reset functions to defaults
+  fnMeasurements = [];
+  layerOps = [];
+  saveFunctionsCfg();
+  renderFunctionsSpecsTable();
+  renderLayerOpsTable();
+  
   applyAutoFitZoom();
   syncLayerSelect();
   markDirty();
@@ -8074,9 +9608,22 @@ ui.newBtn.addEventListener("click", () => {
   const H = Number(ui.HInput.value);
   const W = Number(ui.WInput.value);
   if (!confirm("Create a new blank grid? This will replace the current in-memory state.")) return;
+  
+  // Reset all state for new file
+  _resetAllForNewFile();
+  
   state = makeEmptyState(H, W);
-  addLayer(state, { name: "cell_type", kind: "categorical", init: "zeros", value: 0, seed: 0 });
+  addLayer(state, { name: "cell_type", kind: "counts", init: "zeros", value: 0, seed: 0 });
   selectedLayer = "cell_type";
+  _setCurrentFile("new");
+  
+  // Reset functions to defaults
+  fnMeasurements = [];
+  layerOps = [];
+  saveFunctionsCfg();
+  renderFunctionsSpecsTable();
+  renderLayerOpsTable();
+  
   applyAutoFitZoom();
   syncLayerSelect();
   markDirty();
@@ -8088,12 +9635,25 @@ ui.fileInput.addEventListener("change", async () => {
   if (!f) return;
   const text = await f.text();
   try {
+    // Reset all state for new file
+    _resetAllForNewFile();
+    
+    const parsed = JSON.parse(text);
     state = parseState(text);
     ui.HInput.value = String(state.H);
     ui.WInput.value = String(state.W);
     selectedLayer = state.layers[0]?.name || "";
+    
+    // Apply embedded functions from file
+    _tryApplyEmbeddedMeasurementsConfig(parsed);
+    _tryApplyEmbeddedLayerOpsConfig(parsed);
+    
+    // Sync let ops with layers (create missing layers or remove orphaned ops)
+    _syncLetOpsWithLayers();
+    
     applyAutoFitZoom();
     syncLayerSelect();
+    _setCurrentFile(f.name || "loaded");
     markDirty();
     saveToLocalStorage();
   } catch (e) {
@@ -8238,6 +9798,48 @@ ui.canvas.addEventListener("pointerleave", () => {
   ui.cursorInfo.textContent = `(y,x): –`;
 });
 
+// Sync let ops with actual layers - create missing layers or remove orphaned ops
+function _syncLetOpsWithLayers() {
+  const existingLayers = new Set(state.layers.map((l) => l.name));
+  const letOpsToRemove = [];
+  
+  for (let i = 0; i < layerOps.length; i++) {
+    const op = layerOps[i];
+    if (op.type !== "let" || !op.var) continue;
+    
+    const varName = String(op.var).trim();
+    if (!varName) continue;
+    
+    if (!existingLayers.has(varName)) {
+      // Layer doesn't exist - create it
+      try {
+        addLayer(state, {
+          name: varName,
+          kind: "continuous",
+          init: "zeros",
+          value: 0,
+          seed: 0,
+          color: "#8B5CF6",
+        });
+        existingLayers.add(varName);
+      } catch (e) {
+        // If we can't create it, mark for removal
+        console.warn(`Removing orphaned let op for '${varName}':`, e);
+        letOpsToRemove.push(i);
+      }
+    }
+  }
+  
+  // Remove orphaned ops (in reverse order to preserve indices)
+  for (let i = letOpsToRemove.length - 1; i >= 0; i--) {
+    layerOps.splice(letOpsToRemove[i], 1);
+  }
+  
+  if (letOpsToRemove.length > 0) {
+    saveFunctionsCfg();
+  }
+}
+
 // init
 {
   const loaded = tryLoadFromLocalStorage();
@@ -8245,6 +9847,9 @@ ui.canvas.addEventListener("pointerleave", () => {
     state = loaded;
     selectedLayer = state.layers[0]?.name || "";
   }
+  _syncLetOpsWithLayers();
+  _setCurrentFile(loaded ? "localStorage" : "demo");
+  _inspectInitHistMaskControls();
   syncLayerSelect();
   ui.HInput.value = String(state.H);
   ui.WInput.value = String(state.W);
@@ -8264,4 +9869,22 @@ requestAnimationFrame(tick);
   } else {
     window.addEventListener("resize", () => applyAutoFitZoom());
   }
+}
+
+{
+  const hist = ui.inspectCanvasHist;
+  let raf = 0;
+  const schedule = () => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      inspectSummaryDirty = true;
+      _ensureInspectSummaryUpToDate();
+    });
+  };
+  if (hist && typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => schedule());
+    ro.observe(hist);
+  }
+  window.addEventListener("resize", () => schedule());
 }

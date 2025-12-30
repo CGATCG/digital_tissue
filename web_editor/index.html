@@ -9,7 +9,10 @@
   <body>
     <div class="app">
       <header class="topbar">
-        <div class="topbar__title">Grid Layer Editor</div>
+        <div class="topbar__titleWrap">
+          <div class="topbar__title">Grid Layer Editor</div>
+          <div id="currentFileInfo" class="topbar__fileInfo"></div>
+        </div>
         <div class="topbar__actions">
           <button id="newBtn" class="btn btn--secondary">New</button>
           <label class="btn btn--secondary">
@@ -28,6 +31,7 @@
             <button class="screenBtn" data-screen="manage">Manage</button>
             <button class="screenBtn" data-screen="assign">Assign values</button>
             <button class="screenBtn" data-screen="functions">Functions</button>
+            <button class="screenBtn" data-screen="runtime">Runtime</button>
             <button class="screenBtn" data-screen="evolution">Evolution</button>
           </div>
 
@@ -51,14 +55,8 @@
             </main>
 
             <aside class="toolsDock">
-              <div class="tabs">
-                <button class="tabBtn tabBtn--active" data-tab="paint">Paint</button>
-                <button class="tabBtn" data-tab="inspect">Inspect</button>
-                <button class="tabBtn" data-tab="grid">Grid</button>
-              </div>
-
               <div class="toolsBody">
-                <div class="tabPanel tabPanel--active" data-tab="paint">
+                <div class="workspaceToolsStack">
                   <section class="panel">
                     <div class="panel__title">Paint (categorical)</div>
                     <div class="row">
@@ -80,37 +78,60 @@
                       <label class="checkbox"><input id="toggleEraser" type="checkbox" /> Eraser (set 0)</label>
                     </div>
                   </section>
-                </div>
 
-                <div class="tabPanel" data-tab="inspect">
                   <section class="panel">
                     <div class="panel__title">Inspect</div>
                     <div class="row row--inline">
                       <div id="cursorInfo" class="meta">(y,x): –</div>
                     </div>
-                    <div class="row">
-                      <label class="label">Mode</label>
-                      <select id="inspectMode" class="input">
-                        <option value="summary" selected>Layer summary</option>
-                        <option value="cursor">Cursor table (all layers)</option>
-                      </select>
-                    </div>
-                    <div class="row row--inline">
-                      <div id="inspectCursorValue" class="meta"></div>
-                    </div>
-                    <div class="row row--inline">
-                      <div id="inspectSummaryStats" class="meta"></div>
-                    </div>
-                    <div class="row row--inline">
-                      <canvas id="inspectCanvasHist" class="stepsCanvas stepsCanvas--hist"></canvas>
-                    </div>
-                    <div class="row row--inline">
-                      <div id="inspectTable" class="table"></div>
+
+                    <div class="inspectLayout">
+                      <div class="inspectLayout__left">
+                        <div class="row">
+                          <label class="label">Mode</label>
+                          <select id="inspectMode" class="input">
+                            <option value="summary" selected>Layer summary</option>
+                            <option value="cursor">Cursor table (all layers)</option>
+                          </select>
+                        </div>
+
+                        <div class="row row--inline">
+                          <div class="runtimeBlock__controls">
+                            <label class="meta">Mask</label>
+                            <select id="inspectHistMaskLayer" class="input input--tiny">
+                              <option value="">(none)</option>
+                            </select>
+                            <select id="inspectHistMaskOp" class="input input--tiny">
+                              <option value="==">==</option>
+                              <option value="!=">!=</option>
+                              <option value=">">></option>
+                              <option value=">=">>=</option>
+                              <option value="<"><</option>
+                              <option value="<="><=</option>
+                            </select>
+                            <input id="inspectHistMaskValue" class="input input--tiny" type="number" step="any" value="1" />
+                          </div>
+                        </div>
+
+                        <div class="row row--inline">
+                          <div id="inspectCursorValue" class="meta"></div>
+                        </div>
+                        <div class="row row--inline">
+                          <div id="inspectTable" class="table"></div>
+                        </div>
+                      </div>
+
+                      <div class="inspectLayout__right">
+                        <div class="row row--inline">
+                          <div id="inspectSummaryStats" class="meta" style="font-size: 11px; line-height: 1.4;"></div>
+                        </div>
+                        <div class="row row--inline">
+                          <canvas id="inspectCanvasHist" class="inspectHistCanvas"></canvas>
+                        </div>
+                      </div>
                     </div>
                   </section>
-                </div>
 
-                <div class="tabPanel" data-tab="grid">
                   <section class="panel">
                     <div class="panel__title">Grid</div>
                     <div class="row">
@@ -146,11 +167,15 @@
                     <label class="label">Search</label>
                     <input id="layerSearchInput" class="input" placeholder="filter layers…" />
                   </div>
-                  <div class="row row--inline">
+                  <div class="row row--inlineFlex">
                     <label class="checkbox"><input id="groupByPrefix" type="checkbox" checked /> Group by prefix</label>
+                    <div class="spacer"></div>
+                    <button id="collapseAllBtn" class="btn btn--secondary btn--tiny">Collapse</button>
+                    <button id="expandAllBtn" class="btn btn--secondary btn--tiny">Expand</button>
                   </div>
-                  <div class="row row--inline">
-                    <button id="bulkDeleteBtn" class="btn btn--danger btn--full">Delete selected</button>
+                  <div class="row row--inlineFlex">
+                    <button id="bulkDeleteBtn" class="btn btn--danger btn--tiny">Delete selected</button>
+                    <div class="spacer"></div>
                     <div id="bulkDeleteInfo" class="meta"></div>
                   </div>
                   <div class="row row--inline">
@@ -201,9 +226,9 @@
                     <div class="row">
                       <label class="label">Kind</label>
                       <select id="bulkKind" class="input">
+                        <option value="counts">counts</option>
                         <option value="continuous">continuous</option>
                         <option value="categorical">categorical</option>
-                        <option value="counts">counts</option>
                       </select>
                     </div>
                     <div class="row">
@@ -322,11 +347,7 @@
                   <div class="help">Pick layers to change.</div>
                   <div class="row">
                     <label class="label">Search</label>
-                    <input id="opTargetFilter" class="input" placeholder="filter targets…" />
-                  </div>
-                  <div class="row">
-                    <label class="label">+ Prefix</label>
-                    <input id="opTargetPrefix" class="input" placeholder="e.g. gene_" />
+                    <input id="opTargetFilter" class="input" placeholder="filter targets… (use * as wildcard)" />
                   </div>
                   <div class="row row--inline">
                     <div class="two">
@@ -411,8 +432,6 @@
                 <div class="tabs">
                   <button class="tabBtn tabBtn--active" data-tab="measurements">Measurements</button>
                   <button class="tabBtn" data-tab="layerOps">Layer Ops</button>
-                  <button class="tabBtn" data-tab="steps">Steps</button>
-                  <button class="tabBtn" data-tab="runtime">Runtime</button>
                 </div>
 
                 <div class="toolsBody">
@@ -492,6 +511,7 @@
                           <button id="opsAddTransportBtn" class="btn btn--secondary">Add transport</button>
                           <button id="opsAddDiffusionBtn" class="btn btn--secondary">Add diffusion</button>
                           <button id="opsAddDivisionBtn" class="btn btn--secondary">Add division</button>
+                          <button id="opsAddPathwayBtn" class="btn btn--secondary">Add pathway</button>
                         </div>
                       </div>
 
@@ -516,285 +536,157 @@
                       </div>
                     </section>
                   </div>
-
-                  <div class="tabPanel" data-tab="steps">
-                    <section class="panel">
-                      <div class="panel__title">Steps</div>
-                      <div class="help">
-                        Compare two gridstate JSON snapshots (before/after) and visualize what changed.
-                      </div>
-
-                      <div class="row">
-                        <label class="label">Before</label>
-                        <input id="stepsBeforeFile" class="input" type="file" accept="application/json,.json" />
-                      </div>
-
-                      <div class="row">
-                        <label class="label">After</label>
-                        <input id="stepsAfterFile" class="input" type="file" accept="application/json,.json" />
-                      </div>
-
-                      <div class="row row--inline">
-                        <div id="stepsStatus" class="meta"></div>
-                      </div>
-
-                      <div class="hr"></div>
-
-                      <div class="row row--inline">
-                        <label class="meta" style="display:flex;align-items:center;gap:8px;">
-                          <input id="stepsShowLetLayers" type="checkbox" />
-                          show let variables (__let__*)
-                        </label>
-                      </div>
-
-                      <div class="row">
-                        <label class="label">Layer</label>
-                        <select id="stepsLayerSelect" class="input"></select>
-                      </div>
-
-                      <div class="row">
-                        <label class="label">Mask</label>
-                        <div class="stepsMaskRow">
-                          <select id="stepsMaskLayerSelect" class="input"></select>
-                          <select id="stepsMaskMode" class="input input--tiny">
-                            <option value="nonzero">nonzero</option>
-                            <option value="gte">&gt;=</option>
-                            <option value="eq">==</option>
-                          </select>
-                          <input id="stepsMaskValue" class="input input--tiny" type="number" step="any" value="0" />
-                        </div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div id="stepsLayerStats" class="meta"></div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div id="stepsAxes" class="meta"></div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div id="stepsDiffTable" class="table"></div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div class="stepsViz3">
-                          <div>
-                            <div class="meta">before</div>
-                            <div class="stepsCanvasWrap">
-                              <canvas id="stepsCanvasBefore" class="stepsCanvas"></canvas>
-                              <div class="stepsOverlay">
-                                <div class="stepsLegendTitle">range</div>
-                                <div id="stepsLegendBeforeText" class="stepsLegendText"></div>
-                                <div id="stepsLegendBeforeBar" class="stepsLegendBar"></div>
-                              </div>
-                            </div>
-                          </div>
-                          <div>
-                            <div class="meta">after</div>
-                            <div class="stepsCanvasWrap">
-                              <canvas id="stepsCanvasAfter" class="stepsCanvas"></canvas>
-                              <div class="stepsOverlay">
-                                <div class="stepsLegendTitle">range</div>
-                                <div id="stepsLegendAfterText" class="stepsLegendText"></div>
-                                <div id="stepsLegendAfterBar" class="stepsLegendBar"></div>
-                              </div>
-                            </div>
-                          </div>
-                          <div>
-                            <div class="meta">diff</div>
-                            <div class="stepsCanvasWrap">
-                              <canvas id="stepsCanvasDiff" class="stepsCanvas"></canvas>
-                              <div class="stepsOverlay">
-                                <div class="stepsLegendTitle">scale</div>
-                                <div id="stepsLegendDiffText" class="stepsLegendText"></div>
-                                <div id="stepsLegendDiffBar" class="stepsLegendBar"></div>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div>
-                          <div class="meta">histograms</div>
-                          <div class="stepsViz3">
-                            <div>
-                              <div class="meta">before</div>
-                              <canvas id="stepsCanvasHistBefore" class="stepsCanvas stepsCanvas--hist"></canvas>
-                            </div>
-                            <div>
-                              <div class="meta">after</div>
-                              <canvas id="stepsCanvasHistAfter" class="stepsCanvas stepsCanvas--hist"></canvas>
-                            </div>
-                            <div>
-                              <div class="meta">diff</div>
-                              <canvas id="stepsCanvasHistDiff" class="stepsCanvas stepsCanvas--hist"></canvas>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div class="hr"></div>
-
-                      <div class="row">
-                        <label class="label">Scatter</label>
-                        <div class="stepsMaskRow">
-                          <label class="meta" style="display:flex;align-items:center;gap:8px;">
-                            <input id="stepsScatterEnabled" type="checkbox" />
-                            enabled
-                          </label>
-                          <select id="stepsScatterSource" class="input input--tiny">
-                            <option value="after">after</option>
-                            <option value="before">before</option>
-                            <option value="diff">diff</option>
-                          </select>
-                          <select id="stepsScatterX" class="input"></select>
-                          <select id="stepsScatterY" class="input"></select>
-                        </div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <canvas id="stepsCanvasScatter" class="stepsCanvas stepsCanvas--scatter"></canvas>
-                      </div>
-                    </section>
-                  </div>
-
-                  <div class="tabPanel" data-tab="runtime">
-                    <section class="panel">
-                      <div class="panel__title">Runtime</div>
-                      <div class="help">
-                        Load a gridstate.json, then repeatedly apply Layer Ops (one step per tick) and visualize selected layers as live heatmaps.
-                        This requires running the local runtime server.
-                      </div>
-
-                      <div class="row">
-                        <label class="label">Gridstate</label>
-                        <input id="rtFile" class="input" type="file" accept="application/json,.json" />
-                      </div>
-
-                      <div class="row">
-                        <label class="label">Tick interval (ms)</label>
-                        <div class="two two--btn">
-                          <input id="rtIntervalMs" class="input" type="number" min="50" step="50" value="500" />
-                          <button id="rtStartStopBtn" class="btn btn--secondary">Start</button>
-                        </div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div class="two two--btn">
-                          <button id="rtStepBtn" class="btn btn--secondary">Step once</button>
-                          <button id="rtResetBtn" class="btn btn--secondary">Reset</button>
-                        </div>
-                      </div>
-
-                      <div class="row row--inline">
-                        <div id="rtStatus" class="meta"></div>
-                      </div>
-
-                      <div class="hr"></div>
-
-                      <div class="runtimeDash">
-                        <div class="runtimeDash__left">
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Events</div>
-                            <div id="rtEventsList" class="runtimeEventsList"></div>
-                          </div>
-
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Layer scalars</div>
-                            <div class="runtimeBlock__controls">
-                              <label class="meta">Window (ticks)</label>
-                              <input id="rtScalarsWindow" class="input input--tiny" type="number" min="10" step="10" value="200" />
-                              <label class="checkbox"><input id="rtScalarsLog" type="checkbox" /> Log</label>
-                            </div>
-                            <div id="rtScalarsList" class="runtimeScalarsList"></div>
-                          </div>
-
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Measurements</div>
-                            <div class="runtimeBlock__controls">
-                              <label class="meta">Window (ticks)</label>
-                              <input id="rtMeasWindow" class="input input--tiny" type="number" min="10" step="10" value="300" />
-                              <label class="checkbox"><input id="rtMeasNormalize" type="checkbox" checked /> Normalize</label>
-                              <label class="checkbox"><input id="rtMeasLog" type="checkbox" /> Log</label>
-                            </div>
-                            <div class="runtimeMeasWrap">
-                              <canvas id="rtMeasCanvas" class="runtimeMeasCanvas"></canvas>
-                            </div>
-                            <div id="rtMeasList" class="runtimeMeasList"></div>
-                          </div>
-
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Survival @ t=0</div>
-                            <div class="runtimeBlock__controls">
-                              <label class="meta">Focus</label>
-                              <select id="rtSurvFocus" class="input input--tiny">
-                                <option value="gene">gene_*</option>
-                                <option value="protein">protein_*</option>
-                                <option value="rna">rna_*</option>
-                                <option value="molecule">molecule_*</option>
-                                <option value="damage">damage*</option>
-                                <option value="all">all</option>
-                              </select>
-                              <label class="meta">Top</label>
-                              <input id="rtSurvTopK" class="input input--tiny" type="number" min="5" step="5" value="12" />
-                              <label class="checkbox"><input id="rtSurvLog1p" type="checkbox" checked /> log1p</label>
-                            </div>
-                            <div id="rtSurvList" class="runtimeSurvList"></div>
-                          </div>
-                        </div>
-
-                        <div class="runtimeDash__right">
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Watch layers</div>
-                            <div class="runtimeBlock__controls">
-                              <select id="rtAddLayerSelect" class="input"></select>
-                              <button id="rtAddLayerBtn" class="btn btn--secondary btn--tiny">Add</button>
-                            </div>
-                            <div id="rtWatchList" class="runtimeWatchList"></div>
-                          </div>
-
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Overlay</div>
-                            <div class="runtimeOverlayWrap">
-                              <canvas id="rtOverlayCanvas" class="stepsCanvas"></canvas>
-                            </div>
-                          </div>
-
-                          <div class="runtimeBlock">
-                            <div class="runtimeBlock__title">Heatmaps</div>
-                            <div class="runtimeBlock__controls">
-                              <label class="meta">Columns</label>
-                              <select id="rtVizCols" class="input input--tiny">
-                                <option value="2">2</option>
-                                <option value="3">3</option>
-                                <option value="4">4</option>
-                              </select>
-                            </div>
-                            <div class="runtimeHeatmapsWrap">
-                              <div class="runtimeHeatmapsWrap__left">
-                                <div class="runtimeHistControls">
-                                  <label class="meta">Layer</label>
-                                  <select id="rtHistLayer" class="input input--tiny"></select>
-                                  <label class="meta">Bins</label>
-                                  <input id="rtHistBins" class="input input--tiny" type="number" min="10" step="10" value="60" />
-                                  <label class="checkbox"><input id="rtHistLogY" type="checkbox" /> Log Y</label>
-                                </div>
-                                <div class="runtimeHistWrap">
-                                  <canvas id="rtHistCanvas" class="runtimeHistCanvas"></canvas>
-                                </div>
-                              </div>
-                              <div class="runtimeHeatmapsWrap__right">
-                                <div id="rtVizGrid" class="runtimeVizGrid"></div>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </section>
-                  </div>
                 </div>
+              </aside>
+            </div>
+          </div>
+
+          <div class="screenPanel" data-screen="runtime">
+            <div class="functionsLayout">
+              <aside class="toolsDock toolsDock--full">
+                <section class="panel">
+                  <div class="panel__title">Runtime</div>
+                  <div class="help">
+                    Runtime always runs the current editor gridstate (auto-synced). Repeatedly apply Layer Ops (one step per tick) and visualize selected layers as live heatmaps.
+                    This requires running the local runtime server.
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Tick interval (ms)</label>
+                    <div class="two two--btn">
+                      <input id="rtIntervalMs" class="input" type="number" min="50" step="50" value="500" />
+                      <button id="rtStartStopBtn" class="btn btn--secondary">Start</button>
+                    </div>
+                  </div>
+
+                  <div class="row row--inline">
+                    <div class="three">
+                      <button id="rtStepBtn" class="btn btn--secondary btn--tiny">Step once</button>
+                      <button id="rtResetBtn" class="btn btn--secondary btn--tiny">Reset</button>
+                      <button id="rtDownloadBtn" class="btn btn--secondary btn--tiny">Download tick</button>
+                    </div>
+                  </div>
+
+                  <div class="row row--inline">
+                    <div id="rtStatus" class="meta"></div>
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="runtimeDash">
+                    <div class="runtimeDash__left">
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Events</div>
+                        <div id="rtEventsList" class="runtimeEventsList"></div>
+                      </div>
+
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Layer scalars</div>
+                        <div class="runtimeBlock__controls">
+                          <label class="meta">Window (ticks)</label>
+                          <input id="rtScalarsWindow" class="input input--tiny" type="number" min="10" step="10" value="200" />
+                          <label class="checkbox"><input id="rtScalarsLog" type="checkbox" /> Log</label>
+                        </div>
+                        <div id="rtScalarsList" class="runtimeScalarsList"></div>
+                      </div>
+
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Measurements</div>
+                        <div class="runtimeBlock__controls">
+                          <label class="meta">Window (ticks)</label>
+                          <input id="rtMeasWindow" class="input input--tiny" type="number" min="10" step="10" value="300" />
+                          <label class="checkbox"><input id="rtMeasNormalize" type="checkbox" checked /> Normalize</label>
+                          <label class="checkbox"><input id="rtMeasLog" type="checkbox" /> Log</label>
+                        </div>
+                        <div class="runtimeMeasWrap">
+                          <canvas id="rtMeasCanvas" class="runtimeMeasCanvas"></canvas>
+                        </div>
+                        <div id="rtMeasList" class="runtimeMeasList"></div>
+                      </div>
+
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Survival @ t=0</div>
+                        <div class="runtimeBlock__controls">
+                          <label class="meta">Focus</label>
+                          <select id="rtSurvFocus" class="input input--tiny">
+                            <option value="gene">gene_*</option>
+                            <option value="protein">protein_*</option>
+                            <option value="rna">rna_*</option>
+                            <option value="molecule">molecule_*</option>
+                            <option value="damage">damage*</option>
+                            <option value="all">all</option>
+                          </select>
+                          <label class="meta">Top</label>
+                          <input id="rtSurvTopK" class="input input--tiny" type="number" min="5" step="5" value="12" />
+                          <label class="checkbox"><input id="rtSurvLog1p" type="checkbox" checked /> log1p</label>
+                        </div>
+                        <div id="rtSurvList" class="runtimeSurvList"></div>
+                      </div>
+                    </div>
+
+                    <div class="runtimeDash__right">
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Watch layers</div>
+                        <div class="runtimeBlock__controls">
+                          <select id="rtAddLayerSelect" class="input"></select>
+                          <button id="rtAddLayerBtn" class="btn btn--secondary btn--tiny">Add</button>
+                        </div>
+                        <div id="rtWatchList" class="runtimeWatchList"></div>
+                      </div>
+
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Overlay</div>
+                        <div class="runtimeOverlayWrap">
+                          <canvas id="rtOverlayCanvas" class="stepsCanvas"></canvas>
+                        </div>
+                      </div>
+
+                      <div class="runtimeBlock">
+                        <div class="runtimeBlock__title">Heatmaps</div>
+                        <div class="runtimeBlock__controls">
+                          <label class="meta">Columns</label>
+                          <select id="rtVizCols" class="input input--tiny">
+                            <option value="2">2</option>
+                            <option value="3">3</option>
+                            <option value="4">4</option>
+                          </select>
+                          <label class="checkbox"><input id="rtHeatMaskEnabled" type="checkbox" /> Mask heatmaps</label>
+                        </div>
+                        <div class="runtimeHeatmapsWrap">
+                          <div class="runtimeHeatmapsWrap__left">
+                            <div class="runtimeHistControls">
+                              <label class="meta">Layer</label>
+                              <select id="rtHistLayer" class="input input--tiny"></select>
+                              <label class="meta">Bins</label>
+                              <input id="rtHistBins" class="input input--tiny" type="number" min="10" step="10" value="60" />
+                              <label class="checkbox"><input id="rtHistLogY" type="checkbox" /> Log Y</label>
+                              <div class="hr" style="margin: 8px 0;"></div>
+                              <label class="meta">Mask</label>
+                              <select id="rtHistMaskLayer" class="input input--tiny">
+                                <option value="">(none)</option>
+                              </select>
+                              <select id="rtHistMaskOp" class="input input--tiny">
+                                <option value="==">==</option>
+                                <option value="!=">!=</option>
+                                <option value=">">></option>
+                                <option value=">=">>=</option>
+                                <option value="<"><</option>
+                                <option value="<="><=</option>
+                              </select>
+                              <input id="rtHistMaskValue" class="input input--tiny" type="number" step="any" value="1" />
+                            </div>
+                            <div class="runtimeHistWrap">
+                              <canvas id="rtHistCanvas" class="runtimeHistCanvas"></canvas>
+                            </div>
+                          </div>
+                          <div class="runtimeHeatmapsWrap__right">
+                            <div id="rtVizGrid" class="runtimeVizGrid"></div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
               </aside>
             </div>
           </div>
@@ -809,15 +701,7 @@
                   </div>
 
                   <div class="row">
-                    <label class="label">Base payload</label>
-                    <select id="evoBase" class="input">
-                      <option value="runtime">Runtime file (if loaded)</option>
-                      <option value="editor">Current editor state</option>
-                    </select>
-                  </div>
-
-                  <div class="row">
-                    <label class="label">Algorithm</label>
+                    <label class="label" title="Which search method to use.\n\nCEM delta-field: samples additive deltas and learns where good solutions are. Good default.\nAffine GA: mutates scale/bias per layer (simpler, sometimes less expressive).">Algorithm</label>
                     <select id="evoAlgo" class="input">
                       <option value="cem_delta" selected>CEM delta-field</option>
                       <option value="affine">Affine GA (scale/bias)</option>
@@ -825,34 +709,34 @@
                   </div>
 
                   <div class="row">
-                    <label class="label">Variants per generation</label>
-                    <input id="evoVariants" class="input" type="number" min="1" step="1" value="200" />
+                    <label class="label" title="How many candidate solutions are evaluated each generation.\nHigher = more exploration and usually better results, but slower.\nTypical: 50–300.">Variants per generation</label>
+                    <input id="evoVariants" class="input" type="number" min="1" step="1" value="75" />
                   </div>
                   <div class="row">
-                    <label class="label">Ticks per evaluation</label>
-                    <input id="evoTicks" class="input" type="number" min="1" step="1" value="50" />
+                    <label class="label" title="How long each candidate is simulated (number of ticks).\nHigher = more accurate/less noisy fitness, but slower.\nTypical: 30–200.">Ticks per evaluation</label>
+                    <input id="evoTicks" class="input" type="number" min="1" step="1" value="100" />
                   </div>
                   <div class="row">
-                    <label class="label">Generations</label>
-                    <input id="evoGenerations" class="input" type="number" min="1" step="1" value="30" />
+                    <label class="label" title="How many rounds of evolution to run.\nMore generations gives the optimizer more chances to improve, but costs time.\nTypical: 10–100.">Generations</label>
+                    <input id="evoGenerations" class="input" type="number" min="1" step="1" value="50" />
                   </div>
 
                   <div class="row">
-                    <label class="label">Elites</label>
-                    <input id="evoElites" class="input" type="number" min="1" step="1" value="10" />
+                    <label class="label" title="How many top candidates influence the next generation.\nSmaller = more greedy (can converge faster but risk getting stuck).\nLarger = more diverse (more stable, slower).\nTypical: 5–20.">Elites</label>
+                    <input id="evoElites" class="input" type="number" min="1" step="1" value="5" />
                   </div>
                   <div class="row">
-                    <label class="label">Replicates</label>
+                    <label class="label" title="How many times to re-run each candidate and average the result.\nHigher = less random noise in fitness, but slower.\nTypical: 1–3.">Replicates</label>
                     <input id="evoReplicates" class="input" type="number" min="1" step="1" value="1" />
                   </div>
 
                   <div class="row">
-                    <label class="label">Workers</label>
-                    <input id="evoWorkers" class="input" type="number" min="1" step="1" value="4" />
+                    <label class="label" title="How many candidates to evaluate in parallel.\nSet close to your CPU core count for speed. Too high can slow things down due to contention.\nTypical: 4–32 (machine dependent).">Workers</label>
+                    <input id="evoWorkers" class="input" type="number" min="1" step="1" value="35" />
                   </div>
 
                   <div class="row">
-                    <label class="label">Seed</label>
+                    <label class="label" title="Random seed for evolution. Change to get a different search trajectory when you rerun.">Seed</label>
                     <input id="evoSeed" class="input" type="number" step="1" value="1" />
                   </div>
 
@@ -860,34 +744,34 @@
 
                   <div id="evoAffineParams">
                     <div class="row">
-                      <label class="label">Mutation rate</label>
+                      <label class="label" title="(Affine GA) Probability of mutating each layer's parameters per generation.\nHigher = explores more but can destabilize.\nTypical: 0.05–0.30.">Mutation rate</label>
                       <input id="evoMutationRate" class="input" type="number" min="0" max="1" step="0.01" value="0.15" />
                     </div>
                     <div class="row">
-                      <label class="label">Scale sigma</label>
+                      <label class="label" title="(Affine GA) Randomness of multiplicative scale mutations.\nHigher = bigger multiplicative jumps.\nTypical: 0.05–0.50. If fitness is erratic, reduce.">Scale sigma</label>
                       <input id="evoSigmaScale" class="input" type="number" min="0" step="0.01" value="0.25" />
                     </div>
                     <div class="row">
-                      <label class="label">Bias sigma</label>
+                      <label class="label" title="(Affine GA) Randomness of additive bias mutations.\nHigher = bigger additive jumps.\nTypical: 0.05–0.50. If candidates crash early, reduce.">Bias sigma</label>
                       <input id="evoSigmaBias" class="input" type="number" min="0" step="0.01" value="0.25" />
                     </div>
                   </div>
 
                   <div id="evoCemParams">
                     <div class="row">
-                      <label class="label">CEM delta sigma (init)</label>
+                      <label class="label" title="(CEM) Initial search step size (how big random deltas are at the start).\nHigher = explores farther but can destroy good starting behavior.\nTypical: 0.05–0.50. If you see a huge early fitness drop, reduce.">CEM delta sigma (init)</label>
                       <input id="evoCemSigma" class="input" type="number" min="0" step="0.01" value="0.50" />
                     </div>
                     <div class="row">
-                      <label class="label">CEM alpha</label>
+                      <label class="label" title="(CEM) Learning rate for updating the search distribution (mu/sigma).\nHigher = adapts faster but can be unstable.\nTypical: 0.3–0.8.">CEM alpha</label>
                       <input id="evoCemAlpha" class="input" type="number" min="0" max="1" step="0.01" value="0.70" />
                     </div>
                     <div class="row">
-                      <label class="label">CEM sigma floor</label>
+                      <label class="label" title="(CEM) Minimum allowed sigma (step size).\nPrevents the search from collapsing too early.\nHigher = keeps exploring; lower = can converge tightly.\nTypical: 0.01–0.10.">CEM sigma floor</label>
                       <input id="evoCemSigmaFloor" class="input" type="number" min="0" step="0.01" value="0.05" />
                     </div>
                     <div class="row">
-                      <label class="label">CEM delta mask</label>
+                      <label class="label" title="(CEM) Where mutations are allowed.\nOnly initial cells: edits only the starting organism footprint (safer).\nAll grid cells: can change the whole field (more powerful, riskier).">CEM delta mask</label>
                       <select id="evoCemMask" class="input">
                         <option value="cell" selected>Only initial cells</option>
                         <option value="all">All grid cells</option>
@@ -895,31 +779,48 @@
                     </div>
                   </div>
                   <div class="row">
-                    <label class="label">Huge (upper bound)</label>
+                    <label class="label" title="Clamps all evolved float layers into [0, Huge] to avoid infinities/blow-ups.\nLeave large unless you want stricter caps. Smaller values can prevent runaway growth but may also limit behavior.">Huge (upper bound)</label>
                     <input id="evoHuge" class="input" type="number" min="1" step="1" value="1000000000" />
                   </div>
 
                   <div class="hr"></div>
 
+                  <details class="details" open>
+                    <summary class="details__summary">Target Layers (evolvable)</summary>
+                    <div class="meta" style="margin: 8px 0; line-height: 1.4;">
+                      Select which layers can be mutated during evolution. Use wildcards (e.g., <code>gene_*</code>) or select individual layers.
+                    </div>
+                    <div class="row row--inlineFlex" style="margin: 6px 0;">
+                      <input id="evoTargetFilter" class="input input--tiny" placeholder="Search layers…" style="flex: 1;" />
+                    </div>
+                    <div class="row row--inlineFlex" style="margin: 6px 0; flex-wrap: wrap; gap: 4px;">
+                      <button id="evoTargetAddGene" class="btn btn--secondary btn--tiny">+ gene_*</button>
+                      <button id="evoTargetAddRna" class="btn btn--secondary btn--tiny">+ rna_*</button>
+                      <button id="evoTargetAddProtein" class="btn btn--secondary btn--tiny">+ protein_*</button>
+                      <button id="evoTargetAddMolecule" class="btn btn--secondary btn--tiny">+ molecule_*</button>
+                      <button id="evoTargetClear" class="btn btn--danger btn--tiny">Clear</button>
+                    </div>
+                    <div class="row row--inlineFlex" style="margin: 6px 0;">
+                      <input id="evoTargetCustomPattern" class="input input--tiny" placeholder="Custom pattern (e.g. damage_*)" style="flex: 1;" />
+                      <button id="evoTargetAddCustom" class="btn btn--secondary btn--tiny">Add</button>
+                    </div>
+                    <div id="evoTargetPatterns" class="meta" style="margin: 6px 0; padding: 6px; background: rgba(255,255,255,0.03); border-radius: 6px; min-height: 24px;"></div>
+                    <div id="evoTargetInfo" class="meta" style="margin: 6px 0;"></div>
+                    <div id="evoTargetList" class="evoTargetList" style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 6px;"></div>
+                  </details>
+
+                  <div class="hr"></div>
+
                   <div class="row">
-                    <label class="label">Fitness weights</label>
-                    <div class="evoWeights">
-                      <div class="evoWeightRow">
-                        <div class="meta">alive</div>
-                        <input id="evoWAlive" class="input input--tiny" type="number" step="0.1" value="1" />
+                    <label class="label" title="Fitness is a weighted sum of your measurements.\nSet a weight to 0 to ignore that measurement.\nPositive weights reward higher values; negative weights penalize them.">Fitness objectives</label>
+                    <div>
+                      <div class="meta" style="margin-bottom: 12px; line-height: 1.4;">
+                        Evolution maximizes fitness by combining your measurements with weights.<br>
+                        <strong>Formula:</strong> fitness = (weight₁ × measurement₁) + (weight₂ × measurement₂) + ...<br>
+                        <strong>Positive weights</strong> reward higher values, <strong>negative weights</strong> penalize them.
                       </div>
-                      <div class="evoWeightRow">
-                        <div class="meta">divisions</div>
-                        <input id="evoWDiv" class="input input--tiny" type="number" step="0.1" value="2" />
-                      </div>
-                      <div class="evoWeightRow">
-                        <div class="meta">starvation deaths</div>
-                        <input id="evoWStarv" class="input input--tiny" type="number" step="0.1" value="-1" />
-                      </div>
-                      <div class="evoWeightRow">
-                        <div class="meta">damage deaths</div>
-                        <input id="evoWDmg" class="input input--tiny" type="number" step="0.1" value="-1" />
-                      </div>
+                      <div id="evoMeasList" class="evoWeights"></div>
+                      <button id="evoRefreshMeasBtn" class="btn btn--secondary btn--tiny" style="margin-top: 8px;">Refresh measurements</button>
                     </div>
                   </div>
 
@@ -962,12 +863,6 @@
           <div id="helpModalBody" class="modal__body"></div>
         </div>
       </div>
-
-      <footer class="footer">
-        <div class="hint">
-          Load/Save uses a single JSON file containing grid dimensions, metadata, and base64 Float32 layer buffers.
-        </div>
-      </footer>
     </div>
 
     <script type="module" src="app.js?v=div2"></script>
