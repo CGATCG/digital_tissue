@@ -383,6 +383,15 @@ input[type="color"].input.input--tiny{min-height: var(--control-h-tiny); height:
 
 .opsDupGroup{display:grid; grid-template-columns: 1fr 1fr auto; gap:8px; align-items:center;}
 
+.pathwayForm{display:flex; flex-direction:column; gap:18px;}
+.pathwayForm__field{display:flex; flex-direction:column; gap:6px;}
+.pathwayForm__multiSelect{display:flex; flex-direction:column; gap:8px;}
+.pathwayForm__selectedItems{display:flex; flex-wrap:wrap; gap:6px; min-height:32px; padding:6px; border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.02);}
+.pathwayForm__selectedItem{display:inline-flex; align-items:center; gap:6px; padding:4px 8px 4px 10px; background:rgba(79,70,229,.2); border:1px solid rgba(79,70,229,.4); border-radius:6px; font-size:12px; font-weight:600; color:rgba(245,246,247,.95);}
+.pathwayForm__selectedItem button{padding:2px 4px; margin:-2px -4px -2px 2px; border:none; background:transparent; color:rgba(245,246,247,.6); cursor:pointer; font-size:14px; line-height:1; transition:color .15s ease;}
+.pathwayForm__selectedItem button:hover{color:rgba(245,246,247,1);}
+.pathwayForm__actions{display:flex; gap:10px; justify-content:flex-end; margin-top:8px; padding-top:12px; border-top:1px solid var(--border);}
+
 /* Keep Layer Ops header help button consistent and compact */
 #opsHelpBtn{min-width: var(--control-h-tiny); padding: 5px 8px;}
 

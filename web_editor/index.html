@@ -863,6 +863,72 @@
           <div id="helpModalBody" class="modal__body"></div>
         </div>
       </div>
+
+      <div id="pathwayModal" class="modal" aria-hidden="true">
+        <div id="pathwayModalOverlay" class="modal__overlay"></div>
+        <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="pathwayModalTitle" style="max-width: 640px;">
+          <div class="modal__header">
+            <div id="pathwayModalTitle" class="modal__title">Create Pathway</div>
+            <button id="pathwayModalClose" class="btn btn--secondary btn--tiny" type="button">Cancel</button>
+          </div>
+          <div class="modal__body">
+            <div class="pathwayForm">
+              <div class="pathwayForm__field">
+                <label class="label" for="pathwayName">Pathway Name</label>
+                <input id="pathwayName" class="input" type="text" placeholder="e.g., glycolysis" value="glycolysis" />
+                <div class="help">A unique identifier for this metabolic pathway</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="label" for="pathwayNumEnzymes">Number of Enzyme Steps</label>
+                <input id="pathwayNumEnzymes" class="input" type="number" min="1" max="10" value="3" />
+                <div class="help">Each enzyme can process signals from inputs or previous enzymes</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="label">Input Layers (consumed)</label>
+                <div id="pathwayInputsContainer" class="pathwayForm__multiSelect">
+                  <div class="pathwayForm__selectedItems" id="pathwayInputsSelected"></div>
+                  <div id="pathwayInputsDropdown"></div>
+                </div>
+                <div class="help">Layers that will be consumed by this pathway</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="label">Output Layers (produced)</label>
+                <div id="pathwayOutputsContainer" class="pathwayForm__multiSelect">
+                  <div class="pathwayForm__selectedItems" id="pathwayOutputsSelected"></div>
+                  <div id="pathwayOutputsDropdown"></div>
+                </div>
+                <div class="help">Layers that will be produced by this pathway</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="label" for="pathwayCellLayer">Cell Layer</label>
+                <div id="pathwayCellLayer"></div>
+                <div class="help">Pathway only operates where this layer equals the cell value</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="label" for="pathwayCellValue">Cell Value</label>
+                <input id="pathwayCellValue" class="input" type="number" value="1" />
+                <div class="help">Value that indicates a cell is present</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="label" for="pathwayEfficiency">Efficiency</label>
+                <input id="pathwayEfficiency" class="input" type="number" min="0" step="0.1" value="1.0" />
+                <div class="help">Multiplicative gain applied to output signal (higher = more production)</div>
+              </div>
+
+              <div class="pathwayForm__actions">
+                <button id="pathwayModalCreate" class="btn btn--primary">Create Pathway</button>
+                <button id="pathwayModalCancel" class="btn btn--secondary">Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="app.js?v=div2"></script>

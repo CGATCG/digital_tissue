@@ -111,6 +111,21 @@ const ui = {
   helpModalTitle: $("helpModalTitle"),
   helpModalBody: $("helpModalBody"),
 
+  pathwayModal: $("pathwayModal"),
+  pathwayModalOverlay: $("pathwayModalOverlay"),
+  pathwayModalClose: $("pathwayModalClose"),
+  pathwayModalCreate: $("pathwayModalCreate"),
+  pathwayModalCancel: $("pathwayModalCancel"),
+  pathwayName: $("pathwayName"),
+  pathwayNumEnzymes: $("pathwayNumEnzymes"),
+  pathwayInputsDropdown: $("pathwayInputsDropdown"),
+  pathwayInputsSelected: $("pathwayInputsSelected"),
+  pathwayOutputsDropdown: $("pathwayOutputsDropdown"),
+  pathwayOutputsSelected: $("pathwayOutputsSelected"),
+  pathwayCellLayer: $("pathwayCellLayer"),
+  pathwayCellValue: $("pathwayCellValue"),
+  pathwayEfficiency: $("pathwayEfficiency"),
+
   rtIntervalMs: $("rtIntervalMs"),
   rtStartStopBtn: $("rtStartStopBtn"),
   rtStepBtn: $("rtStepBtn"),
@@ -678,6 +693,42 @@ function _openHelpModal(title, html) {
   ui.helpModal.setAttribute("aria-hidden", "false");
 }
 
+let _datalistCounter = 0;
+
+function makeSearchableSelect(options, currentValue = "", placeholder = "Select...", onChange = null) {
+  const id = `searchable_${_datalistCounter++}`;
+  const wrapper = document.createElement("div");
+  wrapper.style.position = "relative";
+  
+  const input = document.createElement("input");
+  input.className = "input";
+  input.type = "text";
+  input.placeholder = placeholder;
+  input.value = currentValue;
+  input.setAttribute("list", id);
+  input.autocomplete = "off";
+  
+  const datalist = document.createElement("datalist");
+  datalist.id = id;
+  
+  for (const opt of options) {
+    const option = document.createElement("option");
+    option.value = typeof opt === "string" ? opt : opt.value;
+    if (opt.label) option.label = opt.label;
+    datalist.appendChild(option);
+  }
+  
+  if (onChange) {
+    input.addEventListener("input", () => onChange(input.value));
+    input.addEventListener("change", () => onChange(input.value));
+  }
+  
+  wrapper.appendChild(input);
+  wrapper.appendChild(datalist);
+  
+  return { wrapper, input, datalist };
+}
+
 // Runtime (local server)
 let rtLoaded = false;
 let rtRunning = false;
@@ -946,19 +997,14 @@ async function _rtPostJson(path, bodyObj) {
 }
 
 function _rtPopulateLayerSelect() {
-  if (!ui.rtAddLayerSelect) return;
-  ui.rtAddLayerSelect.innerHTML = "";
-  const opt0 = document.createElement("option");
-  opt0.value = "";
-  opt0.textContent = "(pick layer)";
-  ui.rtAddLayerSelect.appendChild(opt0);
+  if (!ui.rtAddLayerSelect || !ui.rtAddLayerSelect.parentNode) return;
   const names = rtMeta?.layers ? rtMeta.layers.map((x) => x.name) : [];
-  for (const nm of names) {
-    const opt = document.createElement("option");
-    opt.value = nm;
-    opt.textContent = nm;
-    ui.rtAddLayerSelect.appendChild(opt);
-  }
+  if (!names.length) return;
+  
+  const searchable = makeSearchableSelect(names, "", "(pick layer)");
+  searchable.input.className = "input";
+  ui.rtAddLayerSelect.replaceWith(searchable.wrapper);
+  ui.rtAddLayerSelect = searchable.input;
 }
 
 function _rtEnsureVizItem(layerName) {
@@ -1382,41 +1428,25 @@ function _rtRenderSurvival() {
 }
 
 function _rtPopulateHistLayerSelect() {
-  if (!ui.rtHistLayer) return;
-  ui.rtHistLayer.innerHTML = "";
-  const opt0 = document.createElement("option");
-  opt0.value = "";
-  opt0.textContent = "(none)";
-  ui.rtHistLayer.appendChild(opt0);
+  if (!ui.rtHistLayer || !ui.rtHistLayer.parentNode) return;
   if (!rtMeta || !Array.isArray(rtMeta.layers)) return;
-  for (const m of rtMeta.layers) {
-    const nm = String(m?.name || "");
-    if (!nm) continue;
-    const opt = document.createElement("option");
-    opt.value = nm;
-    opt.textContent = nm;
-    ui.rtHistLayer.appendChild(opt);
-  }
-  ui.rtHistLayer.value = String(rtHistLayer || "");
+  
+  const names = rtMeta.layers.map(m => String(m?.name || "")).filter(nm => nm);
+  const searchable = makeSearchableSelect(names, rtHistLayer || "", "(none)");
+  searchable.input.className = "input input--tiny";
+  ui.rtHistLayer.replaceWith(searchable.wrapper);
+  ui.rtHistLayer = searchable.input;
 }
 
 function _rtPopulateHistMaskLayerSelect() {
-  if (!ui.rtHistMaskLayer) return;
-  ui.rtHistMaskLayer.innerHTML = "";
-  const opt0 = document.createElement("option");
-  opt0.value = "";
-  opt0.textContent = "(none)";
-  ui.rtHistMaskLayer.appendChild(opt0);
+  if (!ui.rtHistMaskLayer || !ui.rtHistMaskLayer.parentNode) return;
   if (!rtMeta || !Array.isArray(rtMeta.layers)) return;
-  for (const m of rtMeta.layers) {
-    const nm = String(m?.name || "");
-    if (!nm) continue;
-    const opt = document.createElement("option");
-    opt.value = nm;
-    opt.textContent = nm;
-    ui.rtHistMaskLayer.appendChild(opt);
-  }
-  ui.rtHistMaskLayer.value = String(rtHistMaskLayer || "");
+  
+  const names = rtMeta.layers.map(m => String(m?.name || "")).filter(nm => nm);
+  const searchable = makeSearchableSelect(names, rtHistMaskLayer || "", "(none)");
+  searchable.input.className = "input input--tiny";
+  ui.rtHistMaskLayer.replaceWith(searchable.wrapper);
+  ui.rtHistMaskLayer = searchable.input;
 }
 
 function _rtInitHistogramControls() {
@@ -2464,6 +2494,115 @@ function _closeHelpModal() {
   if (!ui.helpModal) return;
   ui.helpModal.classList.remove("modal--open");
   ui.helpModal.setAttribute("aria-hidden", "true");
+}
+
+let pathwayModalInputs = [];
+let pathwayModalOutputs = [];
+
+function _openPathwayModal() {
+  if (!ui.pathwayModal) return;
+  
+  pathwayModalInputs = [];
+  pathwayModalOutputs = [];
+  
+  if (ui.pathwayName) ui.pathwayName.value = "glycolysis";
+  if (ui.pathwayNumEnzymes) ui.pathwayNumEnzymes.value = "3";
+  if (ui.pathwayCellValue) ui.pathwayCellValue.value = "1";
+  if (ui.pathwayEfficiency) ui.pathwayEfficiency.value = "1.0";
+  
+  _populatePathwayLayerDropdowns();
+  _updatePathwaySelectedItems();
+  
+  ui.pathwayModal.classList.add("modal--open");
+  ui.pathwayModal.setAttribute("aria-hidden", "false");
+}
+
+function _closePathwayModal() {
+  if (!ui.pathwayModal) return;
+  ui.pathwayModal.classList.remove("modal--open");
+  ui.pathwayModal.setAttribute("aria-hidden", "true");
+}
+
+let pathwayInputsSearchable = null;
+let pathwayOutputsSearchable = null;
+let pathwayCellLayerSearchable = null;
+
+function _populatePathwayLayerDropdowns() {
+  if (!state || !state.layers) return;
+  
+  const layers = state.layers.map(l => l.name).sort();
+  
+  const defaultCellLayer = state?.layers?.some((l) => l.name === "cell")
+    ? "cell"
+    : state?.layers?.some((l) => l.name === "cell_type")
+      ? "cell_type"
+      : layers[0] || "cell";
+  
+  if (ui.pathwayInputsDropdown) {
+    ui.pathwayInputsDropdown.innerHTML = "";
+    pathwayInputsSearchable = makeSearchableSelect(
+      layers,
+      "",
+      "+ Add input layer...",
+      (val) => {
+        if (val && layers.includes(val) && !pathwayModalInputs.includes(val)) {
+          pathwayModalInputs.push(val);
+          _updatePathwaySelectedItems();
+          if (pathwayInputsSearchable) pathwayInputsSearchable.input.value = "";
+        }
+      }
+    );
+    ui.pathwayInputsDropdown.appendChild(pathwayInputsSearchable.wrapper);
+  }
+  
+  if (ui.pathwayOutputsDropdown) {
+    ui.pathwayOutputsDropdown.innerHTML = "";
+    pathwayOutputsSearchable = makeSearchableSelect(
+      layers,
+      "",
+      "+ Add output layer...",
+      (val) => {
+        if (val && layers.includes(val) && !pathwayModalOutputs.includes(val)) {
+          pathwayModalOutputs.push(val);
+          _updatePathwaySelectedItems();
+          if (pathwayOutputsSearchable) pathwayOutputsSearchable.input.value = "";
+        }
+      }
+    );
+    ui.pathwayOutputsDropdown.appendChild(pathwayOutputsSearchable.wrapper);
+  }
+  
+  if (ui.pathwayCellLayer) {
+    ui.pathwayCellLayer.innerHTML = "";
+    pathwayCellLayerSearchable = makeSearchableSelect(
+      layers,
+      defaultCellLayer,
+      "Select cell layer..."
+    );
+    ui.pathwayCellLayer.appendChild(pathwayCellLayerSearchable.wrapper);
+  }
+}
+
+function _updatePathwaySelectedItems() {
+  if (ui.pathwayInputsSelected) {
+    ui.pathwayInputsSelected.innerHTML = "";
+    pathwayModalInputs.forEach((name, idx) => {
+      const item = document.createElement("div");
+      item.className = "pathwayForm__selectedItem";
+      item.innerHTML = `${name}<button type="button" data-idx="${idx}" data-type="input">×</button>`;
+      ui.pathwayInputsSelected.appendChild(item);
+    });
+  }
+  
+  if (ui.pathwayOutputsSelected) {
+    ui.pathwayOutputsSelected.innerHTML = "";
+    pathwayModalOutputs.forEach((name, idx) => {
+      const item = document.createElement("div");
+      item.className = "pathwayForm__selectedItem";
+      item.innerHTML = `${name}<button type="button" data-idx="${idx}" data-type="output">×</button>`;
+      ui.pathwayOutputsSelected.appendChild(item);
+    });
+  }
 }
 
 const palette = [
@@ -6913,25 +7052,16 @@ let state = makeDemoState(64, 96, 0);
 let selectedLayer = "cell_type";
 
 function _inspectPopulateHistMaskLayerSelect() {
-  if (!ui.inspectHistMaskLayer) return;
-  ui.inspectHistMaskLayer.innerHTML = "";
-  const opt0 = document.createElement("option");
-  opt0.value = "";
-  opt0.textContent = "(none)";
-  ui.inspectHistMaskLayer.appendChild(opt0);
-
-  for (const l of state.layers) {
-    const nm = String(l?.name || "");
-    if (!nm) continue;
-    const opt = document.createElement("option");
-    opt.value = nm;
-    opt.textContent = nm;
-    ui.inspectHistMaskLayer.appendChild(opt);
-  }
-
-  const avail = new Set(state.layers.map((l) => String(l?.name || "")));
+  if (!ui.inspectHistMaskLayer || !ui.inspectHistMaskLayer.parentNode) return;
+  
+  const layerNames = state.layers.map(l => String(l?.name || "")).filter(nm => nm);
+  const avail = new Set(layerNames);
   if (inspectHistMaskLayer && !avail.has(String(inspectHistMaskLayer))) inspectHistMaskLayer = "";
-  ui.inspectHistMaskLayer.value = String(inspectHistMaskLayer || "");
+  
+  const searchable = makeSearchableSelect(layerNames, inspectHistMaskLayer || "", "(none)");
+  searchable.input.className = "input input--tiny";
+  ui.inspectHistMaskLayer.replaceWith(searchable.wrapper);
+  ui.inspectHistMaskLayer = searchable.input;
 }
 
 function _inspectInitHistMaskControls() {
@@ -6953,50 +7083,52 @@ function _inspectInitHistMaskControls() {
 function syncLayerSelect() {
   pruneBulkSelectedLayers();
   pruneOpTargetsSelected();
-  ui.layerSelect.innerHTML = "";
-  for (const l of state.layers) {
-    const opt = document.createElement("option");
-    opt.value = l.name;
-    opt.textContent = l.name;
-    ui.layerSelect.appendChild(opt);
+  
+  const layerNames = state.layers.map(l => l.name);
+  const currentLayer = ui.layerSelect?.value || selectedLayer;
+  
+  // Replace select with searchable input
+  if (ui.layerSelect && ui.layerSelect.parentNode) {
+    const searchable = makeSearchableSelect(
+      layerNames,
+      currentLayer,
+      "Select layer...",
+      (val) => {
+        selectedLayer = val;
+        switchLayer(val);
+      }
+    );
+    searchable.input.className = "input input--tiny";
+    ui.layerSelect.replaceWith(searchable.wrapper);
+    ui.layerSelect = searchable.input;
   }
 
-  ui.maskLayer.innerHTML = "";
-  for (const l of state.layers) {
-    const opt = document.createElement("option");
-    opt.value = l.name;
-    opt.textContent = l.name;
-    ui.maskLayer.appendChild(opt);
+  // Bulk operations mask layer
+  if (ui.maskLayer && ui.maskLayer.parentNode) {
+    const searchable = makeSearchableSelect(layerNames, ui.maskLayer.value || "", "Select mask layer...");
+    ui.maskLayer.replaceWith(searchable.wrapper);
+    ui.maskLayer = searchable.input;
   }
 
-  if (ui.opTargetLayer) {
-    ui.opTargetLayer.innerHTML = "";
-    for (const l of state.layers) {
-      const opt = document.createElement("option");
-      opt.value = l.name;
-      opt.textContent = l.name;
-      ui.opTargetLayer.appendChild(opt);
-    }
+  // Single operation target layer
+  if (ui.opTargetLayer && ui.opTargetLayer.parentNode) {
+    const searchable = makeSearchableSelect(layerNames, ui.opTargetLayer.value || "", "Select target...");
+    ui.opTargetLayer.replaceWith(searchable.wrapper);
+    ui.opTargetLayer = searchable.input;
   }
 
-  if (ui.opMaskLayer) {
-    ui.opMaskLayer.innerHTML = "";
-    for (const l of state.layers) {
-      const opt = document.createElement("option");
-      opt.value = l.name;
-      opt.textContent = l.name;
-      ui.opMaskLayer.appendChild(opt);
-    }
+  // Single operation mask layer
+  if (ui.opMaskLayer && ui.opMaskLayer.parentNode) {
+    const searchable = makeSearchableSelect(layerNames, ui.opMaskLayer.value || "", "Select mask layer...");
+    ui.opMaskLayer.replaceWith(searchable.wrapper);
+    ui.opMaskLayer = searchable.input;
   }
 
-  if (ui.fnInsertLayer) {
-    ui.fnInsertLayer.innerHTML = "";
-    for (const l of state.layers) {
-      const opt = document.createElement("option");
-      opt.value = l.name;
-      opt.textContent = l.name;
-      ui.fnInsertLayer.appendChild(opt);
-    }
+  // Functions insert layer
+  if (ui.fnInsertLayer && ui.fnInsertLayer.parentNode) {
+    const searchable = makeSearchableSelect(layerNames, "", "Select layer...");
+    ui.fnInsertLayer.replaceWith(searchable.wrapper);
+    ui.fnInsertLayer = searchable.input;
   }
 
   if (ui.fnInsertFn) {
@@ -7009,24 +7141,16 @@ function syncLayerSelect() {
     }
   }
 
-  if (ui.opsInsertLayer) {
-    ui.opsInsertLayer.innerHTML = "";
-    for (const l of state.layers) {
-      const opt = document.createElement("option");
-      opt.value = l.name;
-      opt.textContent = l.name;
-      ui.opsInsertLayer.appendChild(opt);
-    }
+  // Layer ops insert layer (includes let variables)
+  if (ui.opsInsertLayer && ui.opsInsertLayer.parentNode) {
     const vars = layerOps
       .filter((s) => s && s.enabled !== false && s.type === "let")
       .map((s) => String(s.var || "").trim())
       .filter((nm) => _isValidIdentifier(nm));
-    for (const v of vars) {
-      const opt = document.createElement("option");
-      opt.value = v;
-      opt.textContent = v;
-      ui.opsInsertLayer.appendChild(opt);
-    }
+    const allOptions = [...layerNames, ...vars];
+    const searchable = makeSearchableSelect(allOptions, "", "Select layer or variable...");
+    ui.opsInsertLayer.replaceWith(searchable.wrapper);
+    ui.opsInsertLayer = searchable.input;
   }
 
   if (ui.opsInsertFn) {
@@ -7507,6 +7631,11 @@ if (ui.activeLayerColor) {
     meta.color = ui.activeLayerColor.value;
     markDirty();
     saveToLocalStorage();
+  });
+  ui.activeLayerColor.addEventListener("input", () => {
+    const meta = state.layers.find((l) => l.name === selectedLayer);
+    if (!meta) return;
+    meta.color = ui.activeLayerColor.value;
   });
 }
 
@@ -9159,39 +9288,67 @@ if (ui.opsAddDiffusionBtn) {
 
 if (ui.opsAddPathwayBtn) {
   ui.opsAddPathwayBtn.addEventListener("click", () => {
-    // Prompt for pathway name
-    const pathwayName = prompt("Enter pathway name (e.g., glycolysis):", "glycolysis");
-    if (!pathwayName || !pathwayName.trim()) return;
-    const name = pathwayName.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    _openPathwayModal();
+  });
+}
+
+if (ui.pathwayModalClose) {
+  ui.pathwayModalClose.addEventListener("click", () => _closePathwayModal());
+}
+if (ui.pathwayModalCancel) {
+  ui.pathwayModalCancel.addEventListener("click", () => _closePathwayModal());
+}
+if (ui.pathwayModalOverlay) {
+  ui.pathwayModalOverlay.addEventListener("click", () => _closePathwayModal());
+}
+
+
+if (ui.pathwayInputsSelected) {
+  ui.pathwayInputsSelected.addEventListener("click", (e) => {
+    if (e.target.tagName === "BUTTON" && e.target.dataset.type === "input") {
+      const idx = parseInt(e.target.dataset.idx);
+      pathwayModalInputs.splice(idx, 1);
+      _updatePathwaySelectedItems();
+    }
+  });
+}
+
+if (ui.pathwayOutputsSelected) {
+  ui.pathwayOutputsSelected.addEventListener("click", (e) => {
+    if (e.target.tagName === "BUTTON" && e.target.dataset.type === "output") {
+      const idx = parseInt(e.target.dataset.idx);
+      pathwayModalOutputs.splice(idx, 1);
+      _updatePathwaySelectedItems();
+    }
+  });
+}
+
+if (ui.pathwayModalCreate) {
+  ui.pathwayModalCreate.addEventListener("click", () => {
+    const pathwayName = ui.pathwayName?.value?.trim() || "";
+    if (!pathwayName) {
+      alert("Pathway name is required");
+      return;
+    }
+    const name = pathwayName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
     
-    // Prompt for inputs
-    const inputsStr = prompt("Enter input layer names (comma-separated, e.g., glucose):", "glucose");
-    if (!inputsStr) return;
-    const inputs = inputsStr.split(",").map(s => s.trim()).filter(s => s);
+    const inputs = [...pathwayModalInputs];
+    const outputs = [...pathwayModalOutputs];
+    
     if (!inputs.length) {
       alert("At least one input is required");
       return;
     }
-    
-    // Prompt for outputs
-    const outputsStr = prompt("Enter output layer names (comma-separated, e.g., atp):", "atp");
-    if (!outputsStr) return;
-    const outputs = outputsStr.split(",").map(s => s.trim()).filter(s => s);
     if (!outputs.length) {
       alert("At least one output is required");
       return;
     }
     
-    // Prompt for number of enzymes
-    const numEnzymesStr = prompt("Enter number of enzyme steps (1-10):", "3");
-    const numEnzymes = Math.max(1, Math.min(10, parseInt(numEnzymesStr) || 3));
+    const numEnzymes = Math.max(1, Math.min(10, parseInt(ui.pathwayNumEnzymes?.value) || 3));
+    const cellLayer = pathwayCellLayerSearchable?.input?.value?.trim() || "cell";
+    const cellValue = parseInt(ui.pathwayCellValue?.value) || 1;
+    const efficiency = parseFloat(ui.pathwayEfficiency?.value) || 1.0;
     
-    const defaultCellLayer = state?.layers?.some((l) => l.name === "cell")
-      ? "cell"
-      : state?.layers?.some((l) => l.name === "cell_type")
-        ? "cell_type"
-        : state.layers[0]?.name || "cell";
-
     const resolveMolName = (nm) => {
       const s = String(nm || "").trim();
       if (!s) return "";
@@ -9279,12 +9436,13 @@ if (ui.opsAddPathwayBtn) {
       inputs: resolvedInputs,
       outputs: resolvedOutputs,
       num_enzymes: numEnzymes,
-      cell_layer: defaultCellLayer,
-      cell_value: 1,
-      efficiency: 1.0,
+      cell_layer: cellLayer,
+      cell_value: cellValue,
+      efficiency: efficiency,
       seed: 0,
     });
     
+    _closePathwayModal();
     saveFunctionsCfg();
     markDirty();
     saveToLocalStorage();
