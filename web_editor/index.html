@@ -15,11 +15,15 @@
         </div>
         <div class="topbar__actions">
           <button id="newBtn" class="btn btn--secondary">New</button>
+          <button id="openBtn" class="btn btn--secondary">Open</button>
+          <button id="deleteBtn" class="btn btn--secondary">Delete</button>
           <label class="btn btn--secondary">
-            Load
+            Import
             <input id="fileInput" type="file" accept="application/json" hidden />
           </label>
           <button id="saveBtn" class="btn btn--primary">Save</button>
+          <button id="saveAsBtn" class="btn btn--secondary">Save As</button>
+          <button id="downloadBtn" class="btn btn--secondary">Download</button>
           <button id="demoBtn" class="btn btn--secondary">Demo</button>
         </div>
       </header>
@@ -60,11 +64,19 @@
                   <section class="panel">
                     <div class="panel__title">Paint (categorical)</div>
                     <div class="row">
+                      <label class="label">Paint layer</label>
+                      <select id="paintLayerSelect" class="input"></select>
+                    </div>
+                    <div class="row">
                       <label class="label">Mode</label>
                       <select id="editMode" class="input">
                         <option value="brush">brush</option>
                         <option value="rectangle">rectangle</option>
+                        <option value="clone">clone (copy pixel)</option>
                       </select>
+                    </div>
+                    <div class="row">
+                      <div id="paintCloneInfo" class="meta"></div>
                     </div>
                     <div class="row">
                       <label class="label">Value</label>
@@ -76,6 +88,15 @@
                     </div>
                     <div class="row row--inline">
                       <label class="checkbox"><input id="toggleEraser" type="checkbox" /> Eraser (set 0)</label>
+                    </div>
+
+                    <div class="hr"></div>
+                    <div class="row row--inline">
+                      <label class="checkbox"><input id="paintOverlayEnabled" type="checkbox" checked /> Show paint layer overlay</label>
+                    </div>
+                    <div class="row">
+                      <label class="label">Overlay opacity</label>
+                      <input id="paintOverlayAlpha" class="input" type="range" min="0" max="1" step="0.05" value="0.45" />
                     </div>
                   </section>
 
@@ -463,8 +484,7 @@
 
                       <div class="row row--inline">
                         <div class="two two--equal">
-                          <button id="fnAddRowBtn" class="btn btn--secondary btn--full">Add measurement</button>
-                          <button id="fnResetBtn" class="btn btn--secondary btn--full">Reset defaults</button>
+                          <button id="fnAddRowBtn" class="btn btn--secondary">Add measurement</button>
                         </div>
                       </div>
 
@@ -705,7 +725,30 @@
                     <select id="evoAlgo" class="input">
                       <option value="cem_delta" selected>CEM delta-field</option>
                       <option value="affine">Affine GA (scale/bias)</option>
+                      <option value="auto_switch">Auto switch (plateau)</option>
                     </select>
+                  </div>
+
+                  <div id="evoAutoParams">
+                    <div class="row">
+                      <label class="label">Auto: start with</label>
+                      <select id="evoAutoFirst" class="input">
+                        <option value="cem_delta" selected>CEM delta-field</option>
+                        <option value="affine">Affine GA (scale/bias)</option>
+                      </select>
+                    </div>
+                    <div class="row">
+                      <label class="label" title="If the best fitness does not improve for this many completed generations, auto-switch to the other algorithm.">Auto: plateau patience (generations)</label>
+                      <input id="evoAutoPatience" class="input" type="number" min="1" step="1" value="5" />
+                    </div>
+                    <div class="row">
+                      <label class="label" title="Minimum % improvement in best fitness over the patience window that counts as progress (e.g. 5 means 5%).">Auto: min improvement (%)</label>
+                      <input id="evoAutoMinDelta" class="input" type="number" step="any" value="0" />
+                    </div>
+                    <div class="row">
+                      <label class="label" title="Maximum number of auto-switches before stopping auto mode.">Auto: max switches</label>
+                      <input id="evoAutoMaxSwitches" class="input" type="number" min="0" step="1" value="20" />
+                    </div>
                   </div>
 
                   <div class="row">
@@ -820,7 +863,6 @@
                         <strong>Positive weights</strong> reward higher values, <strong>negative weights</strong> penalize them.
                       </div>
                       <div id="evoMeasList" class="evoWeights"></div>
-                      <button id="evoRefreshMeasBtn" class="btn btn--secondary btn--tiny" style="margin-top: 8px;">Refresh measurements</button>
                     </div>
                   </div>
 
@@ -842,6 +884,7 @@
                   <div class="panel__title">Progress</div>
                   <div class="evoPlotWrap">
                     <canvas id="evoCanvas" class="evoCanvas"></canvas>
+                    <canvas id="evoImpCanvas" class="evoImpCanvas"></canvas>
                   </div>
                   <div class="hr"></div>
                   <div class="panel__title">Top candidates</div>
@@ -931,6 +974,6 @@
       </div>
     </div>
 
-    <script type="module" src="app.js?v=div2"></script>
+    <script type="module" src="app.js?v=div15"></script>
   </body>
 </html>

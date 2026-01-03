@@ -1,9 +1,18 @@
 import concurrent.futures
+import faulthandler
+import hashlib
 import json
+import logging
+import logging.handlers
+import multiprocessing as mp
 import os
+import signal
+import socket
+import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 from multiprocessing import shared_memory
@@ -15,6 +24,82 @@ import numpy as np
 
 from apply_layer_ops import _decode_float32_b64, _encode_float32_b64, apply_layer_ops_inplace
 from output_calc import _ExprEval
+
+
+_LOG = logging.getLogger("digital_tissue.runtime")
+_FAULT_FH: Optional[Any] = None
+_EVO_DEBUG = bool(int(os.environ.get("DT_EVO_DEBUG", "0") or "0"))
+
+
+def _setup_logging() -> None:
+    if _LOG.handlers:
+        return
+
+    _LOG.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    sh = logging.StreamHandler(stream=sys.stderr)
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(fmt)
+    _LOG.addHandler(sh)
+
+    try:
+        log_path = (Path(__file__).resolve().parent / "runtime_server.log").resolve()
+        fh = logging.handlers.RotatingFileHandler(
+            str(log_path),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+        _LOG.addHandler(fh)
+    except Exception:
+        pass
+
+    global _FAULT_FH
+    try:
+        fault_path = (Path(__file__).resolve().parent / "runtime_server_faulthandler.log").resolve()
+        _FAULT_FH = open(fault_path, "a", encoding="utf-8")
+    except Exception:
+        _FAULT_FH = None
+
+
+def _install_exception_hooks() -> None:
+    def _sys_hook(exc_type, exc, tb):
+        try:
+            _LOG.error("Uncaught exception", exc_info=(exc_type, exc, tb))
+        except Exception:
+            pass
+
+    sys.excepthook = _sys_hook
+
+    def _thread_hook(args):
+        try:
+            _LOG.error(
+                "Uncaught thread exception in %s", str(getattr(args, "thread", None)),
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+        except Exception:
+            pass
+
+    try:
+        threading.excepthook = _thread_hook  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        if _FAULT_FH is not None:
+            faulthandler.enable(file=_FAULT_FH, all_threads=True)
+        else:
+            faulthandler.enable(all_threads=True)
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
 
 
 def _compute_distribution_score(values: list[float], method: str = "entropy") -> float:
@@ -180,6 +265,9 @@ def _compute_selected_measurements_from_layers(
 
 
 _WEB_DIR = Path(__file__).resolve().parent / "web_editor"
+_RUNS_DIR = Path(__file__).resolve().parent / "runs" / "evolution"
+_DOCS_DIR = Path(os.environ.get("DT_DOCS_DIR") or (Path(__file__).resolve().parent / "documents"))
+_WORKSPACE_DIR = Path(os.environ.get("DT_WORKSPACE_DIR") or (Path(__file__).resolve().parent / "workspace"))
 
 
 def _find_cell_layer_name(payload: Dict[str, Any]) -> str:
@@ -195,6 +283,724 @@ def _find_cell_layer_name(payload: Dict[str, Any]) -> str:
 
 def _deepcopy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(payload))
+
+
+def _safe_read_json(path: Path) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _sha256_text(text: str) -> str:
+    h = hashlib.sha256()
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _ensure_dirs() -> None:
+    try:
+        _DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        _WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _docs_safe_path(name: str) -> Path:
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("missing name")
+    if "\x00" in nm:
+        raise ValueError("bad name")
+    if nm.startswith("/") or nm.startswith("\\"):
+        raise ValueError("bad name")
+    if ":" in nm:
+        raise ValueError("bad name")
+    p = Path(nm)
+    if p.is_absolute():
+        raise ValueError("bad name")
+    if any(part in ("..", "") for part in p.parts):
+        raise ValueError("bad name")
+    out = (_DOCS_DIR / p).resolve()
+    base = _DOCS_DIR.resolve()
+    if str(out).startswith(str(base) + os.sep) or out == base:
+        return out
+    raise ValueError("bad name")
+
+
+class _DocWorkspace:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.doc_id = ""
+        self.path = ""
+        self.payload_text = ""
+        self.payload_hash = ""
+        self.last_saved_hash = ""
+        self.last_autosave_ts = 0.0
+        self.last_saved_ts = 0.0
+        self.has_autosave = False
+
+        try:
+            _ensure_dirs()
+        except Exception:
+            pass
+        try:
+            self._load_meta_from_disk()
+        except Exception:
+            pass
+
+    def _load_meta_from_disk(self) -> None:
+        mp = self._meta_path()
+        dd = _safe_read_json(mp)
+        if isinstance(dd, dict):
+            self.doc_id = str(dd.get("doc_id") or "")
+            self.path = str(dd.get("path") or "")
+            self.payload_hash = str(dd.get("payload_hash") or "")
+            self.last_saved_hash = str(dd.get("last_saved_hash") or "")
+            try:
+                self.last_autosave_ts = float(dd.get("last_autosave_ts") or 0.0)
+            except Exception:
+                self.last_autosave_ts = 0.0
+            try:
+                self.last_saved_ts = float(dd.get("last_saved_ts") or 0.0)
+            except Exception:
+                self.last_saved_ts = 0.0
+        # Auto-load autosave payload on startup for seamless restore (Google Docs-like)
+        ap = self._autosave_path()
+        self.has_autosave = ap.exists()
+        if self.has_autosave and not self.payload_text:
+            try:
+                txt = ap.read_text(encoding="utf-8")
+                if txt.strip():
+                    self.payload_text = txt
+                    self.payload_hash = _sha256_text(txt)
+                    if not self.doc_id:
+                        self.doc_id = uuid.uuid4().hex
+            except Exception:
+                pass
+
+    def _meta_path(self) -> Path:
+        return _WORKSPACE_DIR / "doc_meta.json"
+
+    def _autosave_path(self) -> Path:
+        return _WORKSPACE_DIR / "doc_autosave.json"
+
+    def _write_meta(self) -> None:
+        meta = {
+            "doc_id": self.doc_id,
+            "path": self.path,
+            "payload_hash": self.payload_hash,
+            "last_saved_hash": self.last_saved_hash,
+            "last_autosave_ts": self.last_autosave_ts,
+            "last_saved_ts": self.last_saved_ts,
+            "has_autosave": self.has_autosave,
+        }
+        _atomic_write_json(self._meta_path(), meta)
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            dirty = bool(self.payload_hash and self.payload_hash != self.last_saved_hash)
+            has_autosave = bool(self.has_autosave) or bool(self._autosave_path().exists())
+            return {
+                "ok": True,
+                "loaded": bool(self.payload_text),
+                "doc_id": self.doc_id,
+                "path": self.path,
+                "dirty": dirty,
+                "has_autosave": has_autosave,
+                "last_autosave_ts": float(self.last_autosave_ts),
+                "last_saved_ts": float(self.last_saved_ts),
+            }
+
+    def clear_active(self) -> None:
+        with self._lock:
+            self.doc_id = ""
+            self.path = ""
+            self.payload_text = ""
+            self.payload_hash = ""
+            self.last_saved_hash = ""
+            self.last_autosave_ts = 0.0
+            self.last_saved_ts = 0.0
+            ap = self._autosave_path()
+            try:
+                if ap.exists():
+                    ap.unlink()
+            except Exception:
+                pass
+            self.has_autosave = False
+            self._write_meta()
+
+    def set_payload_from_text(self, payload_text: str, path: str = "") -> Dict[str, Any]:
+        txt = str(payload_text or "")
+        if not txt.strip():
+            raise ValueError("missing payload")
+        obj = json.loads(txt)
+        if not isinstance(obj, dict):
+            raise ValueError("payload must be object")
+        h = _sha256_text(txt)
+        with self._lock:
+            if not self.doc_id:
+                self.doc_id = uuid.uuid4().hex
+            self.payload_text = txt
+            self.payload_hash = h
+            if isinstance(path, str) and path.strip():
+                self.path = str(path).strip()
+            self.last_autosave_ts = time.time()
+            self.has_autosave = True
+            _atomic_write_text(self._autosave_path(), txt)
+            self._write_meta()
+            dirty = bool(self.payload_hash and self.payload_hash != self.last_saved_hash)
+            return {"ok": True, "doc_id": self.doc_id, "path": self.path, "dirty": dirty}
+
+    def recover_autosave(self) -> Dict[str, Any]:
+        ap = self._autosave_path()
+        if not ap.exists():
+            raise ValueError("no autosave")
+        try:
+            txt = ap.read_text(encoding="utf-8")
+        except Exception as e:
+            raise ValueError(str(e))
+        self.set_payload_from_text(txt)
+        with self._lock:
+            return {"ok": True, "payload_text": self.payload_text, **self.status()}
+
+    def get_payload_text(self) -> str:
+        with self._lock:
+            return str(self.payload_text or "")
+
+    def open_doc(self, name: str) -> Dict[str, Any]:
+        path = _docs_safe_path(name)
+        if not path.exists():
+            raise ValueError("file not found")
+        try:
+            txt = path.read_text(encoding="utf-8")
+        except Exception as e:
+            raise ValueError(str(e))
+        obj = json.loads(txt)
+        if not isinstance(obj, dict):
+            raise ValueError("file must be json object")
+        h = _sha256_text(txt)
+        with self._lock:
+            self.doc_id = uuid.uuid4().hex
+            self.path = str(Path(name).as_posix())
+            self.payload_text = txt
+            self.payload_hash = h
+            self.last_saved_hash = h
+            self.last_saved_ts = time.time()
+            self.last_autosave_ts = time.time()
+            self.has_autosave = True
+            _atomic_write_text(self._autosave_path(), txt)
+            self._write_meta()
+            return {"ok": True, "payload_text": self.payload_text, **self.status()}
+
+    def save_doc(self, name: Optional[str]) -> Dict[str, Any]:
+        with self._lock:
+            txt = str(self.payload_text or "")
+            if not txt.strip():
+                raise ValueError("no active document")
+            cur_path = str(self.path or "")
+        target_name = (str(name).strip() if isinstance(name, str) else "") or cur_path
+        if not target_name:
+            raise ValueError("missing name")
+        if not target_name.lower().endswith(".json"):
+            target_name = target_name + ".json"
+        path = _docs_safe_path(target_name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _atomic_write_text(path, txt)
+        h = _sha256_text(txt)
+        with self._lock:
+            self.path = str(Path(target_name).as_posix())
+            self.last_saved_hash = h
+            self.last_saved_ts = time.time()
+            self._write_meta()
+            return {"ok": True, "path": self.path, **self.status()}
+
+    def delete_doc(self, name: str) -> Dict[str, Any]:
+        target_name = str(name or "").strip()
+        if not target_name:
+            raise ValueError("missing name")
+        if not target_name.lower().endswith(".json"):
+            target_name = target_name + ".json"
+        path = _docs_safe_path(target_name)
+        if not path.exists():
+            raise ValueError("file not found")
+
+        cur_path = ""
+        with self._lock:
+            cur_path = str(self.path or "")
+
+        try:
+            path.unlink()
+        except Exception as e:
+            raise ValueError(str(e))
+
+        if path.exists():
+            raise ValueError("delete failed")
+
+        if cur_path and cur_path == str(Path(target_name).as_posix()):
+            self.clear_active()
+            return {"ok": True, "deleted": str(Path(target_name).as_posix()), **self.status()}
+        return {"ok": True, "deleted": str(Path(target_name).as_posix())}
+
+    def list_docs(self) -> Dict[str, Any]:
+        base = _DOCS_DIR
+        out = []
+        try:
+            for p in base.rglob("*.json"):
+                try:
+                    rel = p.relative_to(base).as_posix()
+                    st = p.stat()
+                    out.append({"name": rel, "size": int(st.st_size), "mtime": float(st.st_mtime)})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        out.sort(key=lambda x: str(x.get("name") or ""))
+        return {"ok": True, "files": out}
+
+
+_DOC = _DocWorkspace()
+
+
+def _evo_runs_ensure_dir() -> None:
+    try:
+        _RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _evo_state_path() -> Path:
+    return _RUNS_DIR / "state.json"
+
+
+def _evo_cfg_path() -> Path:
+    return _RUNS_DIR / "cfg.json"
+
+
+def _evo_base_payload_path() -> Path:
+    return _RUNS_DIR / "base_payload.json"
+
+
+def _evo_candidates_path() -> Path:
+    return _RUNS_DIR / "candidates.json"
+
+
+def _evo_stop_flag_path() -> Path:
+    return _RUNS_DIR / "stop.flag"
+
+
+def _evo_extract_measurement_defs(payload: Dict[str, Any]) -> list[Dict[str, str]]:
+    measurements_cfg = payload.get("measurements_config")
+    if not isinstance(measurements_cfg, dict) or int(measurements_cfg.get("version") or 0) != 3:
+        return []
+    meas_list = measurements_cfg.get("measurements")
+    if not isinstance(meas_list, list):
+        return []
+    out: list[Dict[str, str]] = []
+    for m in meas_list:
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("name") or "").strip()
+        expr = str(m.get("expr") or "").strip()
+        if not name or not expr:
+            continue
+        out.append({"name": name, "expr": expr})
+    return out
+
+
+def _evo_resolve_target_layers(payload: Dict[str, Any], patterns: list[str]) -> list[str]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    pats = [str(p).strip() for p in (patterns or []) if isinstance(p, str) and str(p).strip()]
+    if not pats:
+        pats = ["gene_*", "rna_*", "protein_*"]
+    import fnmatch
+
+    out: list[str] = []
+    for name, ent in data.items():
+        if not isinstance(name, str) or not name:
+            continue
+        if not any(fnmatch.fnmatch(name, pat) for pat in pats):
+            continue
+        if not isinstance(ent, dict):
+            continue
+        if ent.get("dtype") != "float32" or not isinstance(ent.get("b64"), str):
+            continue
+        out.append(name)
+    out.sort()
+    return out
+
+
+def _evo_start_runner(payload: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    _evo_runs_ensure_dir()
+
+    pid = _evo_runner_pid()
+    if _pid_alive(pid):
+        if not _pid_looks_like_evo_runner(pid):
+            try:
+                _atomic_write_json(_RUNS_DIR / "runner.pid", {"pid": 0, "stale_pid": int(pid), "cleared_at": float(time.time())})
+            except Exception:
+                pass
+        else:
+            try:
+                if _evo_stop_flag_path().exists():
+                    t0 = time.time()
+                    while time.time() - t0 < 2.0:
+                        if not _pid_alive(pid):
+                            break
+                        time.sleep(0.05)
+            except Exception:
+                pass
+            if _pid_alive(pid):
+                raise ValueError("evolution already running")
+
+    try:
+        if _evo_stop_flag_path().exists():
+            _evo_stop_flag_path().unlink()
+    except Exception:
+        pass
+
+    job_id = uuid.uuid4().hex
+    cfg2 = dict(cfg)
+    cfg2["job_id"] = job_id
+
+    meas_defs = _evo_extract_measurement_defs(payload)
+    if meas_defs:
+        cfg2["measurement_defs"] = meas_defs
+
+    tgt = cfg2.get("target_layers")
+    if not isinstance(tgt, list):
+        tgt = ["gene_*", "rna_*", "protein_*"]
+        cfg2["target_layers"] = tgt
+    resolved = _evo_resolve_target_layers(payload, [str(p) for p in tgt if isinstance(p, str)])
+    cfg2["target_layers_resolved"] = resolved
+
+    _atomic_write_json(_evo_cfg_path(), cfg2)
+    _atomic_write_json(_evo_base_payload_path(), payload)
+    try:
+        _atomic_write_json(_evo_candidates_path(), {})
+    except Exception:
+        pass
+
+    state0 = {
+        "ok": True,
+        "job_id": job_id,
+        "running": True,
+        "error": "",
+        "cfg": cfg2,
+        "progress": {},
+        "history": {"best": [], "mean": [], "median": [], "p10": [], "p90": []},
+        "baseline": {},
+        "series": {"offset": 0, "fitness": [], "best": [], "mean": [], "median": []},
+        "perf": {},
+        "top": [],
+    }
+    try:
+        _atomic_write_json(_evo_state_path(), state0)
+    except Exception:
+        pass
+
+    runner_path = (Path(__file__).resolve().parent / "evolution_runner.py").resolve()
+    if not runner_path.exists():
+        raise ValueError("missing evolution_runner.py")
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    try:
+        subprocess.Popen(
+            [sys.executable, str(runner_path), "--dir", str(_RUNS_DIR)],
+            cwd=str(Path(__file__).resolve().parent),
+            env=env,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        raise ValueError(str(e))
+
+    return str(job_id)
+
+
+def _evo_stop_runner() -> None:
+    _evo_runs_ensure_dir()
+    try:
+        _evo_stop_flag_path().touch(exist_ok=True)
+    except Exception:
+        pass
+
+    pid = _evo_runner_pid()
+    if not _pid_alive(pid):
+        return
+
+    if not _pid_looks_like_evo_runner(pid):
+        try:
+            _atomic_write_json(_RUNS_DIR / "runner.pid", {"pid": 0, "stale_pid": int(pid), "cleared_at": float(time.time())})
+        except Exception:
+            pass
+        return
+
+    sent = False
+    try:
+        os.killpg(int(pid), signal.SIGTERM)
+        sent = True
+    except Exception:
+        pass
+
+    if not sent:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            sent = True
+        except Exception:
+            pass
+
+    if not sent:
+        return
+
+    t0 = time.time()
+    while time.time() - t0 < 1.5:
+        if not _pid_alive(pid):
+            try:
+                os.waitpid(int(pid), os.WNOHANG)
+            except Exception:
+                pass
+            return
+        time.sleep(0.05)
+
+    try:
+        os.killpg(int(pid), signal.SIGKILL)
+        sent = True
+    except Exception:
+        pass
+
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+        sent = True
+    except Exception:
+        pass
+
+    if not sent:
+        return
+
+    t1 = time.time()
+    while time.time() - t1 < 2.0:
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.05)
+
+    try:
+        os.waitpid(int(pid), os.WNOHANG)
+    except Exception:
+        pass
+
+    if _pid_is_zombie(pid):
+        try:
+            os.waitpid(int(pid), os.WNOHANG)
+        except Exception:
+            pass
+
+    if not _pid_alive(pid):
+        try:
+            cur = _safe_read_json(_RUNS_DIR / "runner.pid")
+            if isinstance(cur, dict) and int(cur.get("pid") or 0) == int(pid):
+                _atomic_write_json(_RUNS_DIR / "runner.pid", {"pid": 0, "started_at": float(cur.get("started_at") or 0.0), "cleared_at": float(time.time())})
+        except Exception:
+            pass
+
+
+def _evo_status_from_disk() -> Dict[str, Any]:
+    _evo_runs_ensure_dir()
+    st = _safe_read_json(_evo_state_path())
+    if isinstance(st, dict):
+        pid = 0
+        try:
+            pid = int(st.get("runner_pid") or 0)
+        except Exception:
+            pid = 0
+        if pid <= 0:
+            pid = _evo_runner_pid()
+        if pid and not _pid_alive(pid):
+            st = dict(st)
+            st["running"] = False
+            st["runner_pid"] = int(pid)
+        return st
+
+    pid = _evo_runner_pid()
+    if _pid_alive(pid):
+        return {
+            "ok": True,
+            "job_id": "",
+            "running": True,
+            "error": "",
+            "cfg": {},
+            "progress": {},
+            "history": {"best": [], "mean": [], "median": [], "p10": [], "p90": []},
+            "baseline": {},
+            "series": {"offset": 0, "fitness": [], "best": [], "mean": [], "median": []},
+            "perf": {},
+            "top": [],
+            "runner_pid": int(pid),
+        }
+
+    return {
+        "ok": True,
+        "job_id": "",
+        "running": False,
+        "error": "",
+        "cfg": {},
+        "progress": {},
+        "history": {"best": [], "mean": [], "median": [], "p10": [], "p90": []},
+        "baseline": {},
+        "series": {"offset": 0, "fitness": [], "best": [], "mean": [], "median": []},
+        "perf": {},
+        "top": [],
+    }
+
+
+def _evo_runner_pid() -> int:
+    dd = _safe_read_json(_RUNS_DIR / "runner.pid")
+    if isinstance(dd, dict):
+        try:
+            return int(dd.get("pid") or 0)
+        except Exception:
+            return 0
+    return 0
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="ignore")
+        # /proc/<pid>/stat format: pid (comm) state ...
+        parts = stat.split()
+        if len(parts) >= 3 and parts[2] == "Z":
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if _pid_is_zombie(pid):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _pid_looks_like_evo_runner(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        cmd = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        s = cmd.decode("utf-8", errors="ignore")
+        return "evolution_runner.py" in s
+    except Exception:
+        return False
+
+
+def _evo_build_candidate_payload(
+    base: Dict[str, Any],
+    cfg: Dict[str, Any],
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    genome = candidate.get("genome")
+    if not isinstance(genome, dict):
+        raise ValueError("candidate genome missing")
+
+    huge = float((cfg or {}).get("huge") or 1e9)
+    H = int(base.get("H") or 0)
+    W = int(base.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("base payload invalid H/W")
+
+    kinds: Dict[str, str] = {}
+    layer_meta = base.get("layers")
+    if isinstance(layer_meta, list):
+        for m in layer_meta:
+            if not isinstance(m, dict):
+                continue
+            nm = m.get("name")
+            if isinstance(nm, str) and nm:
+                kinds[nm] = str(m.get("kind") or "continuous")
+
+    cell_layer = _find_cell_layer_name(base)
+    cell_mask = None
+    if cell_layer:
+        dd0 = base.get("data")
+        if isinstance(dd0, dict):
+            ent0 = dd0.get(cell_layer)
+            if isinstance(ent0, dict) and ent0.get("dtype") == "float32" and isinstance(ent0.get("b64"), str):
+                try:
+                    cell_arr = _decode_float32_b64(
+                        str(ent0.get("b64") or ""), expected_len=H * W, layer_name=cell_layer
+                    )
+                    cell_mask = np.asarray(cell_arr, dtype=np.float32).reshape(H * W) > 0.5
+                except Exception:
+                    cell_mask = None
+
+    payload = _deepcopy_payload(base)
+    payload.pop("event_counters", None)
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("candidate payload missing data")
+
+    for nm, gb in genome.items():
+        if not isinstance(nm, str) or not nm:
+            continue
+        if not isinstance(gb, dict):
+            continue
+        ent = data.get(nm)
+        if not isinstance(ent, dict) or ent.get("dtype") != "float32":
+            continue
+        b64 = ent.get("b64")
+        if not isinstance(b64, str) or not b64:
+            continue
+        arr = _decode_float32_b64(b64, expected_len=H * W, layer_name=nm)
+        if "delta_b64" in gb and isinstance(gb.get("delta_b64"), str):
+            db64 = str(gb.get("delta_b64") or "")
+            delta = _decode_float32_b64(db64, expected_len=H * W, layer_name=f"{nm}:delta")
+            arr2 = np.asarray(arr + delta, dtype=np.float32)
+        else:
+            s = float(gb.get("scale", 1.0))
+            b = float(gb.get("bias", 0.0))
+            arr2 = np.asarray(arr * s + b, dtype=np.float32)
+            if isinstance(cell_mask, np.ndarray) and cell_mask.shape[0] == arr2.size:
+                arr2[~cell_mask] = np.asarray(arr, dtype=np.float32).reshape(-1)[~cell_mask]
+        arr2 = np.nan_to_num(arr2, nan=0.0, posinf=huge, neginf=0.0)
+        arr2 = np.clip(arr2, 0.0, huge)
+        if kinds.get(nm) == "counts":
+            arr2 = np.clip(np.rint(arr2), 0.0, huge)
+        ent["b64"] = _encode_float32_b64(arr2)
+
+    return payload
 
 
 _EVO_WORKER_BASE: Optional[Dict[str, Any]] = None
@@ -214,6 +1020,59 @@ _EVO_CEM_MU_SHM: Optional[shared_memory.SharedMemory] = None
 _EVO_CEM_SIG_SHM: Optional[shared_memory.SharedMemory] = None
 
 
+def _evo_worker_prepare_process() -> None:
+    try:
+        nice = int(os.environ.get("DT_WORKER_NICE", "10") or "10")
+        if nice != 0:
+            os.nice(int(nice))
+    except Exception:
+        pass
+
+    try:
+        port = int(os.environ.get("DT_RUNTIME_PORT", "8000") or "8000")
+    except Exception:
+        port = 8000
+
+    try:
+        for fd_name in os.listdir("/proc/self/fd"):
+            try:
+                fd = int(fd_name)
+            except Exception:
+                continue
+            if fd < 3:
+                continue
+            try:
+                s = socket.socket(fileno=fd)
+            except Exception:
+                continue
+            try:
+                if s.family not in (socket.AF_INET, socket.AF_INET6):
+                    continue
+                try:
+                    acc = int(s.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) or 0)
+                except Exception:
+                    acc = 0
+                if not acc:
+                    continue
+                try:
+                    addr = s.getsockname()
+                except Exception:
+                    continue
+                if isinstance(addr, tuple) and len(addr) >= 2 and int(addr[1]) == int(port):
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    if s.fileno() != -1:
+                        s.detach()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _evo_worker_init(
     base_payload_fast: Dict[str, Any],
     kinds: Dict[str, str],
@@ -222,6 +1081,8 @@ def _evo_worker_init(
 ) -> None:
     global _EVO_WORKER_BASE, _EVO_WORKER_BASE_DATA, _EVO_WORKER_PAYLOAD, _EVO_WORKER_DATA
     global _EVO_WORKER_KINDS, _EVO_WORKER_CELL_LAYER, _EVO_WORKER_CELL_MASK, _EVO_WORKER_HUGE
+
+    _evo_worker_prepare_process()
 
     _EVO_WORKER_BASE = base_payload_fast
     _EVO_WORKER_KINDS = dict(kinds)
@@ -255,6 +1116,20 @@ def _evo_worker_init(
     p["_skip_b64_writeback"] = True
     _EVO_WORKER_PAYLOAD = p
     _EVO_WORKER_DATA = out_data
+
+
+def _evo_fitness_from_metrics(metrics: Dict[str, Any], fitness_w: Dict[str, Any]) -> float:
+    meas_weights = fitness_w.get("measurements") if isinstance(fitness_w, dict) else None
+    if isinstance(meas_weights, dict):
+        mm = metrics.get("measurements") if isinstance(metrics, dict) else None
+        if isinstance(mm, dict):
+            fit = 0.0
+            for meas_name, w in meas_weights.items():
+                if meas_name in mm and isinstance(w, (int, float)):
+                    fit += float(w) * float(mm.get(meas_name) or 0.0)
+            return float(fit)
+        return 0.0
+    return 0.0
 
 
 def _evo_worker_eval_affine(
@@ -321,12 +1196,6 @@ def _evo_worker_eval_affine(
 
         H = int(p.get("H") or 0)
         W = int(p.get("W") or 0)
-        layers_dict: Dict[str, np.ndarray] = {}
-        for nm, ent in dd.items():
-            if isinstance(ent, dict) and ent.get("dtype") == "float32":
-                arr = ent.get("arr")
-                if isinstance(arr, np.ndarray):
-                    layers_dict[nm] = arr
 
         meas_aggs = fitness_w.get("measurement_aggs", {})
         if not isinstance(meas_aggs, dict):
@@ -358,7 +1227,14 @@ def _evo_worker_eval_affine(
                 per_tick_dmg.append(0)
 
             if agg_names:
-                sel = _compute_selected_measurements_from_layers(p, layers_dict, H, W, agg_names)
+                layers_dict_tick: Dict[str, np.ndarray] = {}
+                for nm2, ent2 in dd.items():
+                    if isinstance(ent2, dict) and ent2.get("dtype") == "float32":
+                        arr2 = ent2.get("arr")
+                        if isinstance(arr2, np.ndarray):
+                            layers_dict_tick[nm2] = arr2
+
+                sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, H, W, agg_names)
                 for nm in agg_names:
                     try:
                         per_tick_meas[nm].append(float(sel.get(nm) or 0.0))
@@ -378,7 +1254,14 @@ def _evo_worker_eval_affine(
         if not isinstance(totals, dict):
             totals = {}
         
-        measurements = _compute_measurements_from_layers(p, layers_dict, H, W)
+        layers_dict_end: Dict[str, np.ndarray] = {}
+        for nm2, ent2 in dd.items():
+            if isinstance(ent2, dict) and ent2.get("dtype") == "float32":
+                arr2 = ent2.get("arr")
+                if isinstance(arr2, np.ndarray):
+                    layers_dict_end[nm2] = arr2
+
+        measurements = _compute_measurements_from_layers(p, layers_dict_end, H, W)
         if not isinstance(measurements, dict):
             measurements = {}
         if agg_names:
@@ -445,13 +1328,7 @@ def _evo_worker_eval_affine(
         "measurements": merged_measurements,
     }
     
-    # Fitness calculation: measurement-based only
-    fit = 0.0
-    meas_weights = fitness_w.get("measurements", {})
-    if isinstance(meas_weights, dict) and merged_measurements:
-        for meas_name, w in meas_weights.items():
-            if isinstance(w, (int, float)) and meas_name in merged_measurements:
-                fit += float(w) * float(merged_measurements[meas_name])
+    fit = _evo_fitness_from_metrics(metrics, fitness_w)
 
     return {
         "vi": int(vi),
@@ -563,12 +1440,6 @@ def _evo_worker_eval_cem_delta(
 
         H = int(p.get("H") or 0)
         W = int(p.get("W") or 0)
-        layers_dict: Dict[str, np.ndarray] = {}
-        for nm, ent in dd.items():
-            if isinstance(ent, dict) and ent.get("dtype") == "float32":
-                arr = ent.get("arr")
-                if isinstance(arr, np.ndarray):
-                    layers_dict[nm] = arr
 
         meas_aggs = fitness_w.get("measurement_aggs", {})
         if not isinstance(meas_aggs, dict):
@@ -600,7 +1471,14 @@ def _evo_worker_eval_cem_delta(
                 per_tick_dmg.append(0)
 
             if agg_names:
-                sel = _compute_selected_measurements_from_layers(p, layers_dict, H, W, agg_names)
+                layers_dict_tick: Dict[str, np.ndarray] = {}
+                for nm2, ent2 in dd.items():
+                    if isinstance(ent2, dict) and ent2.get("dtype") == "float32":
+                        arr2 = ent2.get("arr")
+                        if isinstance(arr2, np.ndarray):
+                            layers_dict_tick[nm2] = arr2
+
+                sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, H, W, agg_names)
                 for nm in agg_names:
                     try:
                         per_tick_meas[nm].append(float(sel.get(nm) or 0.0))
@@ -620,7 +1498,14 @@ def _evo_worker_eval_cem_delta(
         if not isinstance(totals, dict):
             totals = {}
         
-        measurements = _compute_measurements_from_layers(p, layers_dict, H, W)
+        layers_dict_end: Dict[str, np.ndarray] = {}
+        for nm2, ent2 in dd.items():
+            if isinstance(ent2, dict) and ent2.get("dtype") == "float32":
+                arr2 = ent2.get("arr")
+                if isinstance(arr2, np.ndarray):
+                    layers_dict_end[nm2] = arr2
+
+        measurements = _compute_measurements_from_layers(p, layers_dict_end, H, W)
         if not isinstance(measurements, dict):
             measurements = {}
         if agg_names:
@@ -687,13 +1572,7 @@ def _evo_worker_eval_cem_delta(
         "measurements": merged_measurements,
     }
     
-    # Fitness calculation: measurement-based only
-    fit = 0.0
-    meas_weights = fitness_w.get("measurements", {})
-    if isinstance(meas_weights, dict) and merged_measurements:
-        for meas_name, w in meas_weights.items():
-            if isinstance(w, (int, float)) and meas_name in merged_measurements:
-                fit += float(w) * float(merged_measurements[meas_name])
+    fit = _evo_fitness_from_metrics(metrics, fitness_w)
 
     return {"vi": int(vi), "metrics": metrics, "fitness": float(fit), "evals_done": int(replicates)}
 
@@ -734,6 +1613,8 @@ class _EvolutionJob:
         self.running: bool = False
         self.error: str = ""
 
+        self.auto: Dict[str, Any] = {}
+
         self._base_payload: Optional[Dict[str, Any]] = None
 
         self.baseline: Dict[str, Any] = {}
@@ -742,6 +1623,7 @@ class _EvolutionJob:
             "fitness": [],
             "best": [],
             "mean": [],
+            "median": [],
         }
         self._series_sum: float = 0.0
         self._series_n: int = 0
@@ -762,6 +1644,7 @@ class _EvolutionJob:
         self.history: Dict[str, list] = {
             "best": [],
             "mean": [],
+            "median": [],
             "p10": [],
             "p90": [],
         }
@@ -806,11 +1689,13 @@ class _EvolutionJob:
                 "fitness": list(series.get("fitness") or []),
                 "best": list(series.get("best") or []),
                 "mean": list(series.get("mean") or []),
+                "median": list(series.get("median") or []),
             }
             history = self.history if isinstance(self.history, dict) else {}
             history_out = {
                 "best": list(history.get("best") or []),
                 "mean": list(history.get("mean") or []),
+                "median": list(history.get("median") or []),
                 "p10": list(history.get("p10") or []),
                 "p90": list(history.get("p90") or []),
             }
@@ -821,6 +1706,7 @@ class _EvolutionJob:
                 "running": self.running,
                 "error": self.error,
                 "cfg": self.cfg,
+                "auto": dict(self.auto) if isinstance(self.auto, dict) else {},
                 "progress": dict(self.progress),
                 "history": history_out,
                 "baseline": baseline,
@@ -924,11 +1810,12 @@ class _EvolutionJob:
         self.error = ""
         self.cfg = cfg
         self._base_payload = _deepcopy_payload(base_payload)
+        self.auto = {}
         self.candidates = {}
         self.top_ids = []
-        self.history = {"best": [], "mean": [], "p10": [], "p90": []}
+        self.history = {"best": [], "mean": [], "median": [], "p10": [], "p90": []}
         self.baseline = {}
-        self.series = {"offset": 0, "fitness": [], "best": [], "mean": []}
+        self.series = {"offset": 0, "fitness": [], "best": [], "mean": [], "median": []}
         self._series_sum = 0.0
         self._series_n = 0
         self._series_best = float("-inf")
@@ -998,6 +1885,14 @@ class _EvolutionJob:
         meas_weights = fitness_w.get("measurements")
         if not isinstance(meas_weights, dict):
             meas_weights = {}
+
+        active_w = [
+            float(w)
+            for w in meas_weights.values()
+            if isinstance(w, (int, float)) and float(w) != 0.0
+        ]
+        if not active_w:
+            raise ValueError("no active fitness objectives: set at least one non-zero measurement weight")
 
         if variants <= 0 or generations <= 0 or ticks <= 0:
             raise ValueError("variants/generations/ticks must be > 0")
@@ -1073,11 +1968,19 @@ class _EvolutionJob:
         if not mutable_names:
             raise ValueError("no gene_/rna_/protein_ layers found to mutate")
         
-        # Debug: print layer stats for CEM initialization
-        print(f"DEBUG CEM: Found {len(mutable_names)} mutable layers")
-        for nm in mutable_names[:5]:  # Show first 5
-            st = layer_stats.get(nm, {})
-            print(f"DEBUG CEM: Layer '{nm}' - mean={st.get('mean', 0):.4f}, std={st.get('std', 1):.4f}")
+        if _EVO_DEBUG:
+            try:
+                _LOG.info("DEBUG CEM: Found %s mutable layers", str(len(mutable_names)))
+                for nm in mutable_names[:5]:
+                    st = layer_stats.get(nm, {})
+                    _LOG.info(
+                        "DEBUG CEM: Layer '%s' - mean=%0.4f, std=%0.4f",
+                        str(nm),
+                        float(st.get("mean", 0.0) or 0.0),
+                        float(st.get("std", 1.0) or 1.0),
+                    )
+            except Exception:
+                pass
 
         eval_total = generations * variants * replicates
         with self._lock:
@@ -1331,12 +2234,6 @@ class _EvolutionJob:
             dd0 = p.get("data")
             if not isinstance(dd0, dict):
                 raise ValueError("payload missing data")
-            layers_dict0: Dict[str, np.ndarray] = {}
-            for nm, ent in dd0.items():
-                if isinstance(ent, dict) and ent.get("dtype") == "float32":
-                    arr = ent.get("arr")
-                    if isinstance(arr, np.ndarray):
-                        layers_dict0[str(nm)] = arr
             per_tick_meas: Dict[str, list[float]] = {k: [] for k in agg_names}
 
             t_ticks = 0.0
@@ -1348,7 +2245,14 @@ class _EvolutionJob:
                 t_ticks += time.perf_counter() - tt0
 
                 if agg_names:
-                    sel = _compute_selected_measurements_from_layers(p, layers_dict0, int(H), int(W), agg_names)
+                    layers_dict_tick: Dict[str, np.ndarray] = {}
+                    for nm2, ent2 in dd0.items():
+                        if isinstance(ent2, dict) and ent2.get("dtype") == "float32":
+                            arr2 = ent2.get("arr")
+                            if isinstance(arr2, np.ndarray):
+                                layers_dict_tick[str(nm2)] = arr2
+
+                    sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, int(H), int(W), agg_names)
                     for nm in agg_names:
                         try:
                             per_tick_meas[nm].append(float(sel.get(nm) or 0.0))
@@ -1434,25 +2338,7 @@ class _EvolutionJob:
             }
 
         def _fitness(metrics: Dict[str, Any]) -> float:
-            if meas_weights:
-                mm = metrics.get("measurements")
-                if isinstance(mm, dict):
-                    fit = 0.0
-                    for meas_name, w in meas_weights.items():
-                        if meas_name in mm and isinstance(w, (int, float)):
-                            fit += float(w) * float(mm.get(meas_name) or 0.0)
-                    return float(fit)
-                return 0.0
-            w_alive = float(fitness_w.get("alive", 1.0))
-            w_div = float(fitness_w.get("divisions", 2.0))
-            w_starv = float(fitness_w.get("starvation_deaths", -1.0))
-            w_dmg = float(fitness_w.get("damage_deaths", -1.0))
-            return (
-                w_alive * float(metrics.get("alive") or 0)
-                + w_div * float(metrics.get("divisions") or 0)
-                + w_starv * float(metrics.get("starvation_deaths") or 0)
-                + w_dmg * float(metrics.get("damage_deaths") or 0)
-            )
+            return _evo_fitness_from_metrics(metrics, fitness_w)
 
         def _merge_measurements(rep_metrics: list[Dict[str, Any]]) -> Dict[str, float]:
             out: Dict[str, float] = {}
@@ -1499,16 +2385,497 @@ class _EvolutionJob:
         # Calculate baseline fitness using exactly the same approach as candidates
         base_fit = float(_fitness(base_metrics))
         
-        # Log baseline details for debugging
-        print(f"DEBUG: Baseline fitness calculation: {base_fit}")
-        print(f"DEBUG: Baseline metrics: {base_metrics}")
-        print(f"DEBUG: Using measurement weights: {meas_weights}")
+        if _EVO_DEBUG:
+            try:
+                _LOG.info("DEBUG: Baseline fitness calculation: %s", str(base_fit))
+                _LOG.info("DEBUG: Baseline metrics: %s", str(base_metrics))
+                _LOG.info("DEBUG: Using measurement weights: %s", str(meas_weights))
+            except Exception:
+                pass
         
         with self._lock:
             self.baseline = {"fitness": base_fit, "metrics": base_metrics}
             self.progress["updated_at"] = time.time()
 
         max_points = int(cfg.get("plot_max_points") or 5000)
+
+        if algo == "auto_switch":
+            auto_first = str(cfg.get("auto_first") or "cem_delta").strip().lower()
+            if auto_first not in ("cem_delta", "affine"):
+                auto_first = "cem_delta"
+            auto_patience = max(1, int(cfg.get("auto_patience") or 5))
+            auto_min_delta = float(cfg.get("auto_min_delta") or 0.0)
+            auto_max_switches = int(cfg.get("auto_max_switches") or 20)
+            auto_max_switches = max(0, auto_max_switches)
+
+            use_cell_mask = cem_mask != "all"
+            n_cells = int(H * W)
+
+            def _clone_affine_genome(g: Any) -> Dict[str, Dict[str, float]]:
+                out2: Dict[str, Dict[str, float]] = {}
+                if not isinstance(g, dict):
+                    return out2
+                for nm, ent in g.items():
+                    if not isinstance(nm, str) or not nm:
+                        continue
+                    if not isinstance(ent, dict):
+                        continue
+                    out2[nm] = {"scale": float(ent.get("scale", 1.0)), "bias": float(ent.get("bias", 0.0))}
+                return out2
+
+            def _delta_seed_from_affine(g: Any) -> Dict[str, np.ndarray]:
+                gg = _clone_affine_genome(g)
+                out2: Dict[str, np.ndarray] = {}
+                for nm in mutable_names:
+                    base_arr0 = base_layers.get(nm)
+                    if not isinstance(base_arr0, np.ndarray):
+                        continue
+                    ent = gg.get(nm) or {"scale": 1.0, "bias": 0.0}
+                    s = float(ent.get("scale", 1.0))
+                    b = float(ent.get("bias", 0.0))
+                    base_arr = np.asarray(base_arr0, dtype=np.float32).reshape(n_cells)
+                    d = np.asarray(base_arr * np.float32(s - 1.0) + np.float32(b), dtype=np.float32)
+                    if use_cell_mask:
+                        d[~cell_mask] = 0.0
+                    out2[nm] = d
+                return out2
+
+            def _affine_seed_from_delta(delta_seed: Any) -> Dict[str, Dict[str, float]]:
+                out2: Dict[str, Dict[str, float]] = {}
+                if not isinstance(delta_seed, dict):
+                    return out2
+                for nm in mutable_names:
+                    d0 = delta_seed.get(nm)
+                    base_arr0 = base_layers.get(nm)
+                    if not isinstance(d0, np.ndarray) or not isinstance(base_arr0, np.ndarray):
+                        continue
+                    x = np.asarray(base_arr0, dtype=np.float64).reshape(n_cells)
+                    y = x + np.asarray(d0, dtype=np.float64).reshape(n_cells)
+                    if use_cell_mask:
+                        xx = x[cell_mask]
+                        yy = y[cell_mask]
+                    else:
+                        xx = x
+                        yy = y
+                    if xx.size <= 1:
+                        s = 1.0
+                        b = float(np.mean(yy - xx)) if xx.size else 0.0
+                    else:
+                        xm = float(xx.mean())
+                        ym = float(yy.mean())
+                        denom = float(np.sum((xx - xm) ** 2))
+                        if denom <= 1e-12:
+                            s = 1.0
+                        else:
+                            s = float(np.sum((xx - xm) * (yy - ym)) / denom)
+                        if not np.isfinite(s):
+                            s = 1.0
+                        if s < 0.0:
+                            s = 0.0
+                        b = float(ym - s * xm)
+                        if not np.isfinite(b):
+                            b = 0.0
+                    out2[nm] = {"scale": float(s), "bias": float(b)}
+                return out2
+
+            def _series_push(vi: int, fit: float, evals_done: int) -> None:
+                with self._lock:
+                    self.progress["variant"] = int(vi)
+                    self.progress["evaluations_done"] = int(
+                        self.progress.get("evaluations_done", 0) + max(0, int(evals_done))
+                    )
+                    self._series_sum += float(fit)
+                    self._series_n += 1
+                    if float(fit) > self._series_best:
+                        self._series_best = float(fit)
+                    self.series.setdefault("median", [])
+                    self.series["fitness"].append(float(fit))
+                    self.series["best"].append(float(self._series_best))
+                    self.series["mean"].append(float(self._series_sum / max(1, self._series_n)))
+                    try:
+                        self.series["median"].append(
+                            float(np.median(np.asarray(self.series["fitness"], dtype=np.float64)))
+                        )
+                    except Exception:
+                        self.series["median"].append(float(fit))
+                    while len(self.series["fitness"]) > max_points:
+                        self.series["fitness"].pop(0)
+                        self.series["best"].pop(0)
+                        self.series["mean"].pop(0)
+                        self.series["median"].pop(0)
+                        self.series["offset"] = int(self.series.get("offset") or 0) + 1
+                    self.progress["updated_at"] = time.time()
+
+            cem_alpha2 = float(np.clip(cem_alpha, 0.0, 1.0))
+            cem_sigma_init2 = max(0.0, cem_sigma_init)
+            cem_sigma_floor2 = max(0.0, cem_sigma_floor)
+            cem_topk = max(1, min(variants, elites if elites > 0 else max(1, variants // 10)))
+
+            def _cem_init(seed_delta: Optional[Dict[str, np.ndarray]]) -> tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, float]]:
+                mu2: Dict[str, np.ndarray] = {}
+                sig2: Dict[str, np.ndarray] = {}
+                sig_floor2: Dict[str, float] = {}
+                sd = seed_delta if isinstance(seed_delta, dict) else {}
+                for nm in mutable_names:
+                    layer_mean = float(layer_stats.get(nm, {}).get("mean", 1.0))
+                    layer_std = float(layer_stats.get(nm, {}).get("std", 1.0))
+                    scale_ref = min(layer_std, abs(layer_mean) * 0.1) if abs(layer_mean) > 1.0 else layer_std
+                    if scale_ref <= 0:
+                        scale_ref = 1.0
+                    sig_floor2[nm] = float(cem_sigma_floor2 * scale_ref)
+                    m0 = np.zeros((n_cells,), dtype=np.float32)
+                    sd0 = sd.get(nm)
+                    if isinstance(sd0, np.ndarray) and int(sd0.size) == int(n_cells):
+                        m0 = np.asarray(sd0, dtype=np.float32).reshape(n_cells).copy()
+                    if use_cell_mask:
+                        m0[~cell_mask] = 0.0
+                    mu2[nm] = m0
+                    s0 = np.full((n_cells,), float(cem_sigma_init2 * scale_ref), dtype=np.float32)
+                    if use_cell_mask:
+                        s0[~cell_mask] = 0.0
+                    sig2[nm] = s0
+                return mu2, sig2, sig_floor2
+
+            def _cem_delta_for_vi(gen_i: int, vi: int, mu0: Dict[str, np.ndarray], sig0: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+                rr0 = np.random.default_rng(int(seed) + 1234567 + (int(gen_i) * 1000003) + (int(vi) * 1009))
+                out2: Dict[str, np.ndarray] = {}
+                for nm in mutable_names:
+                    eps = rr0.normal(0.0, 1.0, size=(n_cells,)).astype(np.float32)
+                    d = np.asarray(mu0[nm] + sig0[nm] * eps, dtype=np.float32)
+                    if use_cell_mask:
+                        d = np.where(cell_mask, d, 0.0).astype(np.float32)
+                    out2[nm] = d
+                return out2
+
+            def _cem_encode_genome(gen_i: int, vi: int, mu0: Dict[str, np.ndarray], sig0: Dict[str, np.ndarray]) -> Dict[str, Any]:
+                dd0 = _cem_delta_for_vi(gen_i, int(vi), mu0, sig0)
+                g2: Dict[str, Any] = {}
+                for nm in mutable_names:
+                    g2[nm] = {"delta_b64": _encode_float32_b64(np.asarray(dd0[nm], dtype=np.float32))}
+                return g2
+
+            def _run_cem_gen(ex: concurrent.futures.ThreadPoolExecutor, gen_i: int, mu2: Dict[str, np.ndarray], sig2: Dict[str, np.ndarray], sig_floor2: Dict[str, float]) -> tuple[float, Dict[str, np.ndarray]]:
+                if self._stop.is_set():
+                    return float("-inf"), {}
+                with self._lock:
+                    self.progress["generation"] = int(gen_i)
+                    self.progress["variant"] = 0
+                    self.progress["updated_at"] = time.time()
+                mu0 = {nm: mu2[nm].copy() for nm in mutable_names}
+                sig0 = {nm: sig2[nm].copy() for nm in mutable_names}
+                plan = list(range(int(variants)))
+                gen_workers = max(1, min(int(workers), len(plan)))
+
+                def _eval_variant(vi: int) -> Optional[Dict[str, Any]]:
+                    rr0 = np.random.default_rng(int(seed) + 1234567 + (int(gen_i) * 1000003) + (int(vi) * 1009))
+                    t_sample0 = time.perf_counter()
+                    genome: Dict[str, Any] = {}
+                    for nm in mutable_names:
+                        eps = rr0.normal(0.0, 1.0, size=(n_cells,)).astype(np.float32)
+                        d = np.asarray(mu0[nm] + sig0[nm] * eps, dtype=np.float32)
+                        if use_cell_mask:
+                            d = np.where(cell_mask, d, 0.0).astype(np.float32)
+                        genome[nm] = {"delta": d}
+                    t_sample = time.perf_counter() - t_sample0
+                    rep_metrics = []
+                    for ri in range(int(replicates)):
+                        if self._stop.is_set():
+                            return None
+                        seed0 = int(seed) + (int(gen_i) * 1000003) + (int(vi) * 1009) + (int(ri) * 97)
+                        rep_metrics.append(_eval_genome(genome, seed0=seed0, sample_s=t_sample if ri == 0 else 0.0))
+                    if not rep_metrics:
+                        return None
+                    merged_measurements = _merge_measurements(rep_metrics)
+                    alive_m = float(np.mean([mm["alive"] for mm in rep_metrics]))
+                    div_m = float(np.mean([mm["divisions"] for mm in rep_metrics]))
+                    starv_m = float(np.mean([mm["starvation_deaths"] for mm in rep_metrics]))
+                    dmg_m = float(np.mean([mm["damage_deaths"] for mm in rep_metrics]))
+                    metrics = {
+                        "alive": int(round(alive_m)),
+                        "divisions": div_m,
+                        "starvation_deaths": starv_m,
+                        "damage_deaths": dmg_m,
+                        "measurements": merged_measurements,
+                    }
+                    fit = float(_fitness(metrics))
+                    return {"vi": int(vi), "metrics": metrics, "fitness": fit, "evals_done": int(replicates)}
+
+                pending: set[concurrent.futures.Future] = set()
+                it = iter(plan)
+
+                def _submit_one() -> None:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        vi0 = next(it)
+                    except StopIteration:
+                        return
+                    pending.add(ex.submit(_eval_variant, int(vi0)))
+
+                for _ in range(gen_workers):
+                    _submit_one()
+
+                candidates_this_gen: list[Dict[str, Any]] = []
+                while pending:
+                    if self._stop.is_set():
+                        break
+                    done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for fut in done:
+                        if self._stop.is_set():
+                            break
+                        try:
+                            res = fut.result()
+                        except Exception:
+                            _submit_one()
+                            continue
+                        if not isinstance(res, dict):
+                            _submit_one()
+                            continue
+                        vi = int(res.get("vi") or 0)
+                        metrics = res.get("metrics")
+                        fit = float(res.get("fitness") or 0.0)
+                        evals_done = int(res.get("evals_done") or 0)
+                        if not isinstance(metrics, dict):
+                            _submit_one()
+                            continue
+                        _series_push(vi, fit, evals_done)
+                        cid = str(uuid.uuid4())
+                        candidates_this_gen.append({"id": cid, "gen": int(gen_i), "fitness": fit, "metrics": metrics, "vi": vi})
+                        _submit_one()
+
+                if not candidates_this_gen:
+                    return float("-inf"), {}
+                candidates_this_gen.sort(key=lambda c: float(c.get("fitness") or 0.0), reverse=True)
+                fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
+                best = float(fits.max())
+                mean = float(fits.mean())
+                median = float(np.quantile(fits, 0.50))
+                p10 = float(np.quantile(fits, 0.10))
+                p90 = float(np.quantile(fits, 0.90))
+
+                top = candidates_this_gen[:cem_topk]
+                top_deltas: list[Dict[str, np.ndarray]] = []
+                for c in top:
+                    vi = int(c.get("vi") or 0)
+                    top_deltas.append(_cem_delta_for_vi(gen_i, vi, mu0, sig0))
+                for nm in mutable_names:
+                    stack = np.stack([d[nm] for d in top_deltas], axis=0)
+                    mu_new = stack.mean(axis=0).astype(np.float32)
+                    sig_new = stack.std(axis=0).astype(np.float32)
+                    mu2[nm] = ((1.0 - cem_alpha2) * mu2[nm] + cem_alpha2 * mu_new).astype(np.float32)
+                    sig2[nm] = ((1.0 - cem_alpha2) * sig2[nm] + cem_alpha2 * sig_new).astype(np.float32)
+                    sig2[nm] = np.maximum(sig2[nm], float(sig_floor2.get(nm, 0.0))).astype(np.float32)
+                    if use_cell_mask:
+                        mu2[nm][~cell_mask] = 0.0
+                        sig2[nm][~cell_mask] = 0.0
+
+                with self._lock:
+                    for c in candidates_this_gen[: max(int(elites), 10)]:
+                        vi = int(c.get("vi") or 0)
+                        c2 = dict(c)
+                        c2["genome"] = _cem_encode_genome(gen_i, vi, mu0, sig0)
+                        c2["genome_type"] = "delta"
+                        self.candidates[str(c2["id"])] = c2
+                    self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
+                    self.history["best"].append(best)
+                    self.history["mean"].append(mean)
+                    self.history.setdefault("median", [])
+                    self.history["median"].append(median)
+                    self.history["p10"].append(p10)
+                    self.history["p90"].append(p90)
+                    self.progress["updated_at"] = time.time()
+
+                best_vi = int(candidates_this_gen[0].get("vi") or 0)
+                best_delta = _cem_delta_for_vi(gen_i, best_vi, mu0, sig0)
+                return float(best), best_delta
+
+            def _run_affine_gen(ex: concurrent.futures.ThreadPoolExecutor, gen_i: int, parents2: list[Dict[str, Dict[str, float]]]) -> tuple[float, Dict[str, Dict[str, float]], list[Dict[str, Dict[str, float]]]]:
+                if self._stop.is_set():
+                    return float("-inf"), {}, parents2
+                with self._lock:
+                    self.progress["generation"] = int(gen_i)
+                    self.progress["variant"] = 0
+                    self.progress["updated_at"] = time.time()
+
+                plan: list[tuple[int, Dict[str, Dict[str, float]]]] = []
+                for vi in range(int(variants)):
+                    if self._stop.is_set():
+                        break
+                    parent = parents2[int(rng.integers(0, len(parents2)))]
+                    genome = _mutate_genome(parent)
+                    plan.append((int(vi), genome))
+
+                gen_workers = max(1, min(int(workers), len(plan)))
+
+                def _eval_variant(vi: int, genome: Dict[str, Dict[str, float]]) -> Optional[Dict[str, Any]]:
+                    rep_metrics = []
+                    for ri in range(int(replicates)):
+                        if self._stop.is_set():
+                            return None
+                        seed0 = int(seed) + (int(gen_i) * 1000003) + (int(vi) * 1009) + (int(ri) * 97)
+                        rep_metrics.append(_eval_genome(genome, seed0=seed0))
+                    if not rep_metrics:
+                        return None
+                    merged_measurements = _merge_measurements(rep_metrics)
+                    alive_m = float(np.mean([mm["alive"] for mm in rep_metrics]))
+                    div_m = float(np.mean([mm["divisions"] for mm in rep_metrics]))
+                    starv_m = float(np.mean([mm["starvation_deaths"] for mm in rep_metrics]))
+                    dmg_m = float(np.mean([mm["damage_deaths"] for mm in rep_metrics]))
+                    metrics = {
+                        "alive": int(round(alive_m)),
+                        "divisions": div_m,
+                        "starvation_deaths": starv_m,
+                        "damage_deaths": dmg_m,
+                        "measurements": merged_measurements,
+                    }
+                    fit = float(_fitness(metrics))
+                    return {"vi": int(vi), "genome": genome, "metrics": metrics, "fitness": fit, "evals_done": int(replicates)}
+
+                pending: set[concurrent.futures.Future] = set()
+                it = iter(plan)
+
+                def _submit_one() -> None:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        vi0, genome0 = next(it)
+                    except StopIteration:
+                        return
+                    pending.add(ex.submit(_eval_variant, int(vi0), genome0))
+
+                for _ in range(gen_workers):
+                    _submit_one()
+
+                candidates_this_gen: list[Dict[str, Any]] = []
+                while pending:
+                    if self._stop.is_set():
+                        break
+                    done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for fut in done:
+                        if self._stop.is_set():
+                            break
+                        try:
+                            res = fut.result()
+                        except Exception:
+                            _submit_one()
+                            continue
+                        if not isinstance(res, dict):
+                            _submit_one()
+                            continue
+                        vi = int(res.get("vi") or 0)
+                        genome = res.get("genome")
+                        metrics = res.get("metrics")
+                        fit = float(res.get("fitness") or 0.0)
+                        evals_done = int(res.get("evals_done") or 0)
+                        if not isinstance(genome, dict) or not isinstance(metrics, dict):
+                            _submit_one()
+                            continue
+                        _series_push(vi, fit, evals_done)
+                        cid = str(uuid.uuid4())
+                        candidates_this_gen.append({"id": cid, "gen": int(gen_i), "fitness": fit, "metrics": metrics, "genome": genome})
+                        _submit_one()
+
+                if not candidates_this_gen:
+                    return float("-inf"), {}, parents2
+                candidates_this_gen.sort(key=lambda c: float(c.get("fitness") or 0.0), reverse=True)
+                fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
+                best = float(fits.max())
+                mean = float(fits.mean())
+                median = float(np.quantile(fits, 0.50))
+                p10 = float(np.quantile(fits, 0.10))
+                p90 = float(np.quantile(fits, 0.90))
+
+                with self._lock:
+                    for c in candidates_this_gen[: max(int(elites), 10)]:
+                        self.candidates[str(c["id"])] = c
+                    self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
+                    self.history["best"].append(best)
+                    self.history["mean"].append(mean)
+                    self.history.setdefault("median", [])
+                    self.history["median"].append(median)
+                    self.history["p10"].append(p10)
+                    self.history["p90"].append(p90)
+                    self.progress["updated_at"] = time.time()
+
+                new_parents = [c["genome"] for c in candidates_this_gen[: int(elites)]]
+                best_genome = _clone_affine_genome(candidates_this_gen[0].get("genome"))
+                return float(best), best_genome, new_parents if new_parents else parents2
+
+            active_algo = str(auto_first)
+            plateau_count = 0
+            last_switch_gen = -1
+            switches = 0
+
+            best_so_far = float(base_fit)
+            best_delta_seed: Dict[str, np.ndarray] = {}
+            best_affine_seed: Dict[str, Dict[str, float]] = {}
+            parents: list[Dict[str, Dict[str, float]]] = [{}]
+            mu, sig, sig_floor = _cem_init(best_delta_seed)
+
+            with self._lock:
+                self.auto = {
+                    "active_algo": str(active_algo),
+                    "plateau_count": int(plateau_count),
+                    "last_switch_gen": int(last_switch_gen),
+                    "switches": int(switches),
+                }
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                for gen_i in range(int(generations)):
+                    if self._stop.is_set():
+                        break
+                    if active_algo == "affine":
+                        best_fit_gen, best_genome, parents = _run_affine_gen(ex, int(gen_i), parents)
+                        if isinstance(best_genome, dict) and best_fit_gen > float("-inf"):
+                            improved = bool(best_fit_gen > (best_so_far + float(auto_min_delta)))
+                            if improved:
+                                best_so_far = float(best_fit_gen)
+                                plateau_count = 0
+                                best_affine_seed = _clone_affine_genome(best_genome)
+                                best_delta_seed = _delta_seed_from_affine(best_genome)
+                            else:
+                                plateau_count += 1
+                    else:
+                        best_fit_gen, best_delta = _run_cem_gen(ex, int(gen_i), mu, sig, sig_floor)
+                        if isinstance(best_delta, dict) and best_fit_gen > float("-inf"):
+                            improved = bool(best_fit_gen > (best_so_far + float(auto_min_delta)))
+                            if improved:
+                                best_so_far = float(best_fit_gen)
+                                plateau_count = 0
+                                best_delta_seed = {k: np.asarray(v, dtype=np.float32).reshape(n_cells) for k, v in best_delta.items() if isinstance(k, str) and isinstance(v, np.ndarray)}
+                                best_affine_seed = _affine_seed_from_delta(best_delta_seed)
+                            else:
+                                plateau_count += 1
+
+                    if (
+                        auto_max_switches > 0
+                        and switches < auto_max_switches
+                        and plateau_count >= int(auto_patience)
+                        and int(gen_i) < int(generations) - 1
+                    ):
+                        switches += 1
+                        last_switch_gen = int(gen_i)
+                        plateau_count = 0
+                        active_algo = "affine" if active_algo == "cem_delta" else "cem_delta"
+                        if active_algo == "affine":
+                            parents = [best_affine_seed] if best_affine_seed else [{}]
+                        else:
+                            mu, sig, sig_floor = _cem_init(best_delta_seed)
+
+                    with self._lock:
+                        self.auto = {
+                            "active_algo": str(active_algo),
+                            "plateau_count": int(plateau_count),
+                            "last_switch_gen": int(last_switch_gen),
+                            "switches": int(switches),
+                            "patience": int(auto_patience),
+                            "min_delta": float(auto_min_delta),
+                            "max_switches": int(auto_max_switches),
+                            "best_fitness": float(best_so_far),
+                            "updated_at": float(time.time()),
+                        }
+
+            return
 
         if algo == "cem_delta":
             topk = max(1, min(variants, elites if elites > 0 else max(1, variants // 10)))
@@ -1535,16 +2902,27 @@ class _EvolutionJob:
                     mu[nm][~cell_mask] = 0.0
                     sig[nm][~cell_mask] = 0.0
             
-            # Debug: print initial CEM sigma values
-            print(f"DEBUG CEM: cem_sigma_init={cem_sigma_init}, cem_alpha={cem_alpha}")
-            for nm in mutable_names[:3]:  # Show first 3
-                layer_mean = layer_stats.get(nm, {}).get("mean", 1.0)
-                layer_std = layer_stats.get(nm, {}).get("std", 1.0)
-                scale_ref = min(layer_std, abs(layer_mean) * 0.1) if abs(layer_mean) > 1.0 else layer_std
-                init_sig = cem_sigma_init * scale_ref
-                print(f"DEBUG CEM: Layer '{nm}' initial sigma={init_sig:.4f} (mean={layer_mean:.1f}, std={layer_std:.1f}, scale_ref={scale_ref:.1f})")
+            if _EVO_DEBUG:
+                try:
+                    _LOG.info("DEBUG CEM: cem_sigma_init=%s, cem_alpha=%s", str(cem_sigma_init), str(cem_alpha))
+                    for nm in mutable_names[:3]:
+                        layer_mean = layer_stats.get(nm, {}).get("mean", 1.0)
+                        layer_std = layer_stats.get(nm, {}).get("std", 1.0)
+                        scale_ref = min(layer_std, abs(layer_mean) * 0.1) if abs(layer_mean) > 1.0 else layer_std
+                        init_sig = cem_sigma_init * scale_ref
+                        _LOG.info(
+                            "DEBUG CEM: Layer '%s' initial sigma=%0.4f (mean=%0.1f, std=%0.1f, scale_ref=%0.1f)",
+                            str(nm),
+                            float(init_sig),
+                            float(layer_mean),
+                            float(layer_std),
+                            float(scale_ref),
+                        )
+                except Exception:
+                    pass
 
             if worker_mode == "process":
+                ctx = mp.get_context("spawn")
                 k_layers = int(len(mutable_names))
                 n_cells = int(H * W)
                 mu_shm = shared_memory.SharedMemory(create=True, size=int(k_layers * n_cells * 4))
@@ -1554,6 +2932,7 @@ class _EvolutionJob:
                 try:
                     with concurrent.futures.ProcessPoolExecutor(
                         max_workers=workers,
+                        mp_context=ctx,
                         initializer=_evo_worker_init_cem_delta,
                         initargs=(
                             base_payload_fast,
@@ -1676,13 +3055,21 @@ class _EvolutionJob:
                                             self._series_n += 1
                                             if fit > self._series_best:
                                                 self._series_best = fit
+                                            self.series.setdefault("median", [])
                                             self.series["fitness"].append(fit)
                                             self.series["best"].append(float(self._series_best))
                                             self.series["mean"].append(float(self._series_sum / max(1, self._series_n)))
+                                            try:
+                                                self.series["median"].append(
+                                                    float(np.median(np.asarray(self.series["fitness"], dtype=np.float64)))
+                                                )
+                                            except Exception:
+                                                self.series["median"].append(float(fit))
                                             while len(self.series["fitness"]) > max_points:
                                                 self.series["fitness"].pop(0)
                                                 self.series["best"].pop(0)
                                                 self.series["mean"].pop(0)
+                                                self.series["median"].pop(0)
                                                 self.series["offset"] = int(self.series.get("offset") or 0) + 1
                                             self.progress["updated_at"] = time.time()
 
@@ -1700,6 +3087,7 @@ class _EvolutionJob:
                             fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
                             best = float(fits.max())
                             mean = float(fits.mean())
+                            median = float(np.quantile(fits, 0.50))
                             p10 = float(np.quantile(fits, 0.10))
                             p90 = float(np.quantile(fits, 0.90))
 
@@ -1749,6 +3137,8 @@ class _EvolutionJob:
                                 self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
                                 self.history["best"].append(best)
                                 self.history["mean"].append(mean)
+                                self.history.setdefault("median", [])
+                                self.history["median"].append(median)
                                 self.history["p10"].append(p10)
                                 self.history["p90"].append(p90)
                                 self.progress["updated_at"] = time.time()
@@ -1873,13 +3263,21 @@ class _EvolutionJob:
                                 self._series_n += 1
                                 if fit > self._series_best:
                                     self._series_best = fit
+                                self.series.setdefault("median", [])
                                 self.series["fitness"].append(fit)
                                 self.series["best"].append(float(self._series_best))
                                 self.series["mean"].append(float(self._series_sum / max(1, self._series_n)))
+                                try:
+                                    self.series["median"].append(
+                                        float(np.median(np.asarray(self.series["fitness"], dtype=np.float64)))
+                                    )
+                                except Exception:
+                                    self.series["median"].append(float(fit))
                                 while len(self.series["fitness"]) > max_points:
                                     self.series["fitness"].pop(0)
                                     self.series["best"].pop(0)
                                     self.series["mean"].pop(0)
+                                    self.series["median"].pop(0)
                                     self.series["offset"] = int(self.series.get("offset") or 0) + 1
                                 self.progress["updated_at"] = time.time()
 
@@ -1897,6 +3295,7 @@ class _EvolutionJob:
                     fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
                     best = float(fits.max())
                     mean = float(fits.mean())
+                    median = float(np.quantile(fits, 0.50))
                     p10 = float(np.quantile(fits, 0.10))
                     p90 = float(np.quantile(fits, 0.90))
 
@@ -1946,6 +3345,8 @@ class _EvolutionJob:
                         self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
                         self.history["best"].append(best)
                         self.history["mean"].append(mean)
+                        self.history.setdefault("median", [])
+                        self.history["median"].append(median)
                         self.history["p10"].append(p10)
                         self.history["p90"].append(p90)
                         self.progress["updated_at"] = time.time()
@@ -1955,8 +3356,10 @@ class _EvolutionJob:
         parents: list[Dict[str, Dict[str, float]]] = [{}]
 
         if worker_mode == "process":
+            ctx = mp.get_context("spawn")
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=workers,
+                mp_context=ctx,
                 initializer=_evo_worker_init,
                 initargs=(base_payload_fast, kinds, cell_layer, huge),
             ) as ex:
@@ -2195,13 +3598,21 @@ class _EvolutionJob:
                             self._series_n += 1
                             if fit > self._series_best:
                                 self._series_best = fit
+                            self.series.setdefault("median", [])
                             self.series["fitness"].append(fit)
                             self.series["best"].append(float(self._series_best))
                             self.series["mean"].append(float(self._series_sum / max(1, self._series_n)))
+                            try:
+                                self.series["median"].append(
+                                    float(np.median(np.asarray(self.series["fitness"], dtype=np.float64)))
+                                )
+                            except Exception:
+                                self.series["median"].append(float(fit))
                             while len(self.series["fitness"]) > max_points:
                                 self.series["fitness"].pop(0)
                                 self.series["best"].pop(0)
                                 self.series["mean"].pop(0)
+                                self.series["median"].pop(0)
                                 self.series["offset"] = int(self.series.get("offset") or 0) + 1
                             self.progress["updated_at"] = time.time()
 
@@ -2224,6 +3635,7 @@ class _EvolutionJob:
                 fits = np.array([float(c.get("fitness") or 0.0) for c in candidates_this_gen], dtype=np.float64)
                 best = float(fits.max())
                 mean = float(fits.mean())
+                median = float(np.quantile(fits, 0.50))
                 p10 = float(np.quantile(fits, 0.10))
                 p90 = float(np.quantile(fits, 0.90))
 
@@ -2233,6 +3645,8 @@ class _EvolutionJob:
                     self.top_ids = [str(c["id"]) for c in candidates_this_gen[:10]]
                     self.history["best"].append(best)
                     self.history["mean"].append(mean)
+                    self.history.setdefault("median", [])
+                    self.history["median"].append(median)
                     self.history["p10"].append(p10)
                     self.history["p90"].append(p90)
                     self.progress["updated_at"] = time.time()
@@ -2457,6 +3871,19 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(_WEB_DIR), **kwargs)
 
+    def log_message(self, fmt: str, *args: Any) -> None:
+        try:
+            _LOG.debug("HTTP %s", (fmt % args) if args else str(fmt))
+        except Exception:
+            pass
+
+    def setup(self) -> None:
+        super().setup()
+        try:
+            self.connection.settimeout(30)
+        except Exception:
+            pass
+
     def end_headers(self) -> None:
         # This is a local dev server; always disable caching so HTML/JS/CSS updates are picked up.
         self.send_header("Cache-Control", "no-store")
@@ -2486,8 +3913,80 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
             raise ValueError("json body must be an object")
         return obj
 
-    def do_POST(self):  # noqa: N802
+    def do_GET(self):  # noqa: N802
+        t0 = time.time()
         try:
+            if self.path == "/api/health":
+                self._send_json(200, {"ok": True, "tick": int(_RT.tick)})
+                return
+            if self.path == "/api/doc/status":
+                self._send_json(200, _DOC.status())
+                return
+            if self.path == "/api/doc/list":
+                self._send_json(200, _DOC.list_docs())
+                return
+            super().do_GET()
+        finally:
+            try:
+                dt_ms = (time.time() - t0) * 1000.0
+                _LOG.info("GET %s %.1fms", str(self.path), float(dt_ms))
+            except Exception:
+                pass
+
+    def do_POST(self):  # noqa: N802
+        t0 = time.time()
+        try:
+            if self.path == "/api/doc/clear":
+                _DOC.clear_active()
+                self._send_json(200, _DOC.status())
+                return
+
+            if self.path == "/api/doc/get":
+                self._send_json(200, {"ok": True, "payload_text": _DOC.get_payload_text(), **_DOC.status()})
+                return
+
+            if self.path == "/api/doc/autosave":
+                body = self._read_json_body()
+                payload_text = body.get("payload_text")
+                path = body.get("path")
+                if not isinstance(payload_text, str):
+                    raise ValueError("payload_text must be string")
+                out = _DOC.set_payload_from_text(payload_text, path=str(path or "") if isinstance(path, str) else "")
+                self._send_json(200, out)
+                return
+
+            if self.path == "/api/doc/open":
+                body = self._read_json_body()
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("missing name")
+                out = _DOC.open_doc(name)
+                self._send_json(200, out)
+                return
+
+            if self.path == "/api/doc/save":
+                body = self._read_json_body()
+                name = body.get("name")
+                if name is not None and (not isinstance(name, str) or not name.strip()):
+                    raise ValueError("bad name")
+                out = _DOC.save_doc(name if isinstance(name, str) else None)
+                self._send_json(200, out)
+                return
+
+            if self.path == "/api/doc/delete":
+                body = self._read_json_body()
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("missing name")
+                out = _DOC.delete_doc(name)
+                self._send_json(200, out)
+                return
+
+            if self.path == "/api/doc/recover":
+                out = _DOC.recover_autosave()
+                self._send_json(200, out)
+                return
+
             if self.path == "/api/evolution/start":
                 body = self._read_json_body()
                 payload = body.get("payload")
@@ -2496,17 +3995,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError("missing payload")
                 if not isinstance(cfg, dict):
                     raise ValueError("missing config")
-                _EVO.start(payload, cfg)
-                self._send_json(200, {"ok": True, "job_id": _EVO.job_id})
+                job_id = _evo_start_runner(payload, cfg)
+                self._send_json(200, {"ok": True, "job_id": job_id})
                 return
 
             if self.path == "/api/evolution/stop":
-                _EVO.stop()
+                _evo_stop_runner()
                 self._send_json(200, {"ok": True})
                 return
 
             if self.path == "/api/evolution/status":
-                self._send_json(200, _EVO.status())
+                self._send_json(200, _evo_status_from_disk())
                 return
 
             if self.path == "/api/evolution/candidate":
@@ -2514,7 +4013,35 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 cid = body.get("id")
                 if not isinstance(cid, str) or not cid:
                     raise ValueError("missing id")
-                self._send_json(200, _EVO.candidate(cid))
+                base = _safe_read_json(_evo_base_payload_path())
+                cfg = _safe_read_json(_evo_cfg_path())
+                cands = _safe_read_json(_evo_candidates_path())
+                if not isinstance(base, dict) or not isinstance(cfg, dict) or not isinstance(cands, dict):
+                    raise ValueError("candidate store missing")
+                c = cands.get(cid)
+                if not isinstance(c, dict):
+                    raise ValueError("unknown candidate")
+
+                # Auto-switch persists a stable "__winner__" snapshot that may already be
+                # reflected in base_payload.json. In that case, return the base payload directly
+                # so the latest winner can always be fetched even if candidates were cleared.
+                if bool(c.get("payload_inline")) and isinstance(c.get("payload"), dict):
+                    payload = c.get("payload")
+                elif bool(c.get("payload_is_base")):
+                    payload = base
+                else:
+                    payload = _evo_build_candidate_payload(base, cfg, c)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "id": cid,
+                        "fitness": c.get("fitness"),
+                        "metrics": c.get("metrics"),
+                        "genome": c.get("genome"),
+                        "payload": payload,
+                    },
+                )
                 return
 
             if self.path == "/api/evolution/fitness-config":
@@ -2584,12 +4111,29 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
             self._send_json(404, {"ok": False, "error": "not found"})
         except Exception as e:
-            self._send_json(400, {"ok": False, "error": str(e)})
+            err_id = uuid.uuid4().hex[:10]
+            try:
+                _LOG.exception("POST %s failed (error_id=%s)", str(self.path), err_id)
+            except Exception:
+                pass
+            self._send_json(400, {"ok": False, "error": str(e), "error_id": err_id})
+        finally:
+            try:
+                dt_ms = (time.time() - t0) * 1000.0
+                _LOG.info("POST %s %.1fms", str(self.path), float(dt_ms))
+            except Exception:
+                pass
 
 
 def main() -> int:
+    _setup_logging()
+    _install_exception_hooks()
+    _ensure_dirs()
     if not _WEB_DIR.exists():
-        print(f"web editor dir not found: {_WEB_DIR}", file=sys.stderr)
+        try:
+            _LOG.error("web editor dir not found: %s", str(_WEB_DIR))
+        except Exception:
+            pass
         return 2
 
     port = 8000
@@ -2601,16 +4145,32 @@ def main() -> int:
 
     # Avoid caching during dev.
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ.setdefault("DT_RUNTIME_PORT", str(port))
 
     srv = ThreadingHTTPServer(("0.0.0.0", port), RuntimeHandler)
-    print(f"Runtime server: http://0.0.0.0:{port}/")
-    print("Open Functions → Runtime")
+    try:
+        srv.daemon_threads = True
+    except Exception:
+        pass
+    try:
+        _LOG.info("Runtime server: http://0.0.0.0:%s/", str(port))
+        _LOG.info("Open Functions → Runtime")
+    except Exception:
+        pass
+    try:
+        _LOG.info("Runtime server starting on port %s", str(port))
+    except Exception:
+        pass
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
         srv.server_close()
+        try:
+            _LOG.info("Runtime server stopped")
+        except Exception:
+            pass
     return 0
 
 

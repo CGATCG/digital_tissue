@@ -402,6 +402,22 @@ input[type="color"].input.input--tiny{min-height: var(--control-h-tiny); height:
   justify-content:flex-start;
 }
 
+/* Measurements tab: keep primary action buttons compact and tastefully grouped */
+.tabPanel[data-tab="measurements"] .row.row--inline .two.two--equal{
+  display:flex;
+  justify-content:flex-end;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:8px;
+}
+.tabPanel[data-tab="measurements"] #fnAddRowBtn{
+  width:auto;
+  padding:7px 10px;
+  border-radius:9px;
+  font-size:13px;
+  white-space:nowrap;
+}
+
 /* Make formula/op tables feel like pro tools: reserve width for Expr, keep actions compact */
 #fnSpecsTable table{table-layout:fixed;}
 #fnSpecsTable th:nth-child(1){width:200px;}
@@ -665,6 +681,13 @@ input[type="color"].input.input--tiny{min-height: var(--control-h-tiny); height:
   width:100%;
   height:220px;
   display:block;
+}
+
+.evoImpCanvas{
+  width:100%;
+  height:90px;
+  display:block;
+  margin-top:8px;
 }
 
 .runtimeMeasList{

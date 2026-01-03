@@ -646,6 +646,44 @@ def apply_layer_ops_inplace(
         matched.sort()
         return matched
 
+    def _expand_target_spec(spec: str, step_i: int) -> List[str]:
+        raw = str(spec or "")
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
+            return []
+        out: List[str] = []
+        seen = set()
+        for p in parts:
+            if p.startswith("glob:"):
+                pat = p[len("glob:") :].strip()
+                matched = _match_layer_names_glob(pat)
+                if not matched:
+                    raise ValueError(f"Step #{step_i}: target pattern {p!r} matched no layers")
+                for nm in matched:
+                    if nm in seen:
+                        continue
+                    seen.add(nm)
+                    out.append(nm)
+                continue
+
+            if _is_glob_like_pattern(p):
+                matched = _match_layer_names_glob(p)
+                if not matched:
+                    raise ValueError(f"Step #{step_i}: target pattern {p!r} matched no layers")
+                for nm in matched:
+                    if nm in seen:
+                        continue
+                    seen.add(nm)
+                    out.append(nm)
+                continue
+
+            if p not in layers:
+                raise ValueError(f"Step #{step_i}: unknown target layer '{p}'")
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
     def _reduce_layers(pat: str, op: str) -> np.ndarray:
         names = _match_layer_names_glob(pat)
         if not names:
@@ -1703,82 +1741,85 @@ def apply_layer_ops_inplace(
                 _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
-        target = str(step.get("target") or "").strip()
-        if not target:
+        target_raw = str(step.get("target") or "").strip()
+        if not target_raw:
             if profile_layer_ops:
                 _prof_add(step_type, time.perf_counter() - t_step0)
             continue
 
-        if target not in layers:
-            raise ValueError(f"Step #{i}: unknown target layer '{target}'")
+        targets = _expand_target_spec(target_raw, i)
+        if not targets:
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
+            continue
 
-        kind = kinds.get(target)
-        if kind == "categorical":
-            allowed_raw = step.get("allowed_values", None)
-            if allowed_raw is None:
-                cur = np.rint(layers[target].reshape(H, W)).astype(np.int64)
-                allowed = np.unique(cur)
-            else:
-                if not isinstance(allowed_raw, list) or not allowed_raw:
-                    raise ValueError(f"Step #{i}: categorical allowed_values must be a non-empty list")
-                try:
-                    allowed = np.asarray([int(x) for x in allowed_raw], dtype=np.int64)
-                except Exception as e:
-                    raise ValueError(f"Step #{i}: categorical allowed_values invalid: {e}") from e
-                allowed = np.unique(allowed)
+        for target in targets:
+            kind = kinds.get(target)
+            if kind == "categorical":
+                allowed_raw = step.get("allowed_values", None)
+                if allowed_raw is None:
+                    cur = np.rint(layers[target].reshape(H, W)).astype(np.int64)
+                    allowed = np.unique(cur)
+                else:
+                    if not isinstance(allowed_raw, list) or not allowed_raw:
+                        raise ValueError(f"Step #{i}: categorical allowed_values must be a non-empty list")
+                    try:
+                        allowed = np.asarray([int(x) for x in allowed_raw], dtype=np.int64)
+                    except Exception as e:
+                        raise ValueError(f"Step #{i}: categorical allowed_values invalid: {e}") from e
+                    allowed = np.unique(allowed)
 
-            if allowed.size <= 0:
-                raise ValueError(f"Step #{i}: categorical target '{target}' has no allowed values")
+                if allowed.size <= 0:
+                    raise ValueError(f"Step #{i}: categorical target '{target}' has no allowed values")
 
-            out_i = np.rint(out2d).astype(np.int64)
+                out_i = np.rint(out2d).astype(np.int64)
 
-            mn = int(allowed.min())
-            mx = int(allowed.max())
-            if allowed.size == (mx - mn + 1) and np.all(allowed == np.arange(mn, mx + 1, dtype=np.int64)):
-                out_i = np.clip(out_i, mn, mx)
-            else:
-                best = np.full(out_i.shape, int(allowed[0]), dtype=np.int64)
-                bestd = np.abs(out_i - int(allowed[0]))
-                for v in allowed[1:]:
-                    vv = int(v)
-                    d = np.abs(out_i - vv)
-                    m = d < bestd
-                    if np.any(m):
-                        best[m] = vv
-                        bestd[m] = d[m]
-                out_i = best
+                mn = int(allowed.min())
+                mx = int(allowed.max())
+                if allowed.size == (mx - mn + 1) and np.all(allowed == np.arange(mn, mx + 1, dtype=np.int64)):
+                    out_i = np.clip(out_i, mn, mx)
+                else:
+                    best = np.full(out_i.shape, int(allowed[0]), dtype=np.int64)
+                    bestd = np.abs(out_i - int(allowed[0]))
+                    for v in allowed[1:]:
+                        vv = int(v)
+                        d = np.abs(out_i - vv)
+                        m = d < bestd
+                        if np.any(m):
+                            best[m] = vv
+                            bestd[m] = d[m]
+                    out_i = best
 
-            old_i = None
-            if target == "cell" and out_i.shape == (H, W):
-                old_i = np.rint(layers[target].reshape(H, W)).astype(np.int64)
-            layers[target] = np.asarray(out_i, dtype=np.float32).reshape(H * W)
+                old_i = None
+                if target == "cell" and out_i.shape == (H, W):
+                    old_i = np.rint(layers[target].reshape(H, W)).astype(np.int64)
+                layers[target] = np.asarray(out_i, dtype=np.float32).reshape(H * W)
+                _env_update_layer(target)
+                dirty_layers.add(target)
+                if profile_expr:
+                    _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
+                if old_i is not None:
+                    step_name = str(step.get("name") or "").strip()
+                    deaths = int(((old_i == 1) & (out_i == 0)).sum())
+                    if deaths:
+                        if step_name == "atp_starvation_death":
+                            step_events["starvation_deaths"] = int(step_events.get("starvation_deaths", 0) + deaths)
+                        elif step_name == "cell_death":
+                            step_events["damage_deaths"] = int(step_events.get("damage_deaths", 0) + deaths)
+                applied += 1
+                continue
+
+            out2d_w = out2d
+            if kind == "counts":
+                out2d_w = np.clip(np.rint(out2d_w), 0, None)
+
+            layers[target] = np.asarray(out2d_w, dtype=np.float32).reshape(H * W)
             _env_update_layer(target)
             dirty_layers.add(target)
+            applied += 1
             if profile_expr:
                 _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
-            if old_i is not None:
-                step_name = str(step.get("name") or "").strip()
-                deaths = int(((old_i == 1) & (out_i == 0)).sum())
-                if deaths:
-                    if step_name == "atp_starvation_death":
-                        step_events["starvation_deaths"] = int(step_events.get("starvation_deaths", 0) + deaths)
-                    elif step_name == "cell_death":
-                        step_events["damage_deaths"] = int(step_events.get("damage_deaths", 0) + deaths)
-            applied += 1
-            if profile_layer_ops:
-                _prof_add(step_type, time.perf_counter() - t_step0)
-            continue
 
-        if kind == "counts":
-            # counts are non-negative integers; store as float32 but enforce integer semantics
-            out2d = np.clip(np.rint(out2d), 0, None)
-
-        layers[target] = np.asarray(out2d, dtype=np.float32).reshape(H * W)
-        _env_update_layer(target)
-        dirty_layers.add(target)
-        applied += 1
-        if profile_expr:
-            _expr_prof_add("writeback_s", time.perf_counter() - t_wb0)
         if profile_layer_ops:
             _prof_add(step_type, time.perf_counter() - t_step0)
 

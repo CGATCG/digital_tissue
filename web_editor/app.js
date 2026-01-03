@@ -4,7 +4,11 @@ const ui = {
   currentFileInfo: $("currentFileInfo"),
   fileInput: $("fileInput"),
   newBtn: $("newBtn"),
+  openBtn: $("openBtn"),
+  deleteBtn: $("deleteBtn"),
   saveBtn: $("saveBtn"),
+  saveAsBtn: $("saveAsBtn"),
+  downloadBtn: $("downloadBtn"),
   demoBtn: $("demoBtn"),
   HInput: $("HInput"),
   WInput: $("WInput"),
@@ -82,7 +86,6 @@ const ui = {
   fnInsertFn: $("fnInsertFn"),
   fnInsertFnBtn: $("fnInsertFnBtn"),
   fnAddRowBtn: $("fnAddRowBtn"),
-  fnResetBtn: $("fnResetBtn"),
   fnSpecsTable: $("fnSpecsTable"),
 
   opsInsertLayer: $("opsInsertLayer"),
@@ -162,6 +165,11 @@ const ui = {
 
   evoBase: $("evoBase"),
   evoAlgo: $("evoAlgo"),
+  evoAutoParams: $("evoAutoParams"),
+  evoAutoFirst: $("evoAutoFirst"),
+  evoAutoPatience: $("evoAutoPatience"),
+  evoAutoMinDelta: $("evoAutoMinDelta"),
+  evoAutoMaxSwitches: $("evoAutoMaxSwitches"),
   evoAffineParams: $("evoAffineParams"),
   evoCemParams: $("evoCemParams"),
   evoVariants: $("evoVariants"),
@@ -196,11 +204,16 @@ const ui = {
   evoStopBtn: $("evoStopBtn"),
   evoStatus: $("evoStatus"),
   evoCanvas: $("evoCanvas"),
+  evoImpCanvas: $("evoImpCanvas"),
   evoTopList: $("evoTopList"),
   editMode: $("editMode"),
+  paintLayerSelect: $("paintLayerSelect"),
+  paintOverlayEnabled: $("paintOverlayEnabled"),
+  paintOverlayAlpha: $("paintOverlayAlpha"),
   paintValue: $("paintValue"),
   brushRadius: $("brushRadius"),
   toggleEraser: $("toggleEraser"),
+  paintCloneInfo: $("paintCloneInfo"),
   cursorInfo: $("cursorInfo"),
   inspectTable: $("inspectTable"),
   inspectMode: $("inspectMode"),
@@ -232,6 +245,155 @@ _evoUpdateAlgoUi();
 let evoAvailableMeasurements = [];
 let evoMeasurementWeights = {};
 let evoMeasurementAggs = {};
+
+let evoLocked = false;
+let evoCfgSnapshot = null;
+let evoMeasSyncTimer = null;
+
+function _evoScheduleMeasurementsSync() {
+  if (evoLocked) return;
+  if (evoMeasSyncTimer) {
+    clearTimeout(evoMeasSyncTimer);
+    evoMeasSyncTimer = null;
+  }
+  evoMeasSyncTimer = setTimeout(() => {
+    evoMeasSyncTimer = null;
+    _evoSyncMeasurementsFromEditor();
+  }, 150);
+}
+
+function _evoSyncMeasurementsFromEditor() {
+  if (evoLocked) return;
+  try {
+    const cfg = buildFunctionsConfigJson();
+    const meas = cfg && Array.isArray(cfg.measurements) ? cfg.measurements : [];
+    evoAvailableMeasurements = meas
+      .filter((m) => m && typeof m === "object")
+      .map((m) => ({ name: String(m.name || "").trim(), expr: String(m.expr || "").trim() }))
+      .filter((m) => m.name && m.expr);
+  } catch {
+    evoAvailableMeasurements = [];
+  }
+  _evoUpdateMeasurementsUI();
+}
+
+function _evoApplyCfgSnapshot(cfg) {
+  evoCfgSnapshot = cfg && typeof cfg === "object" ? cfg : null;
+  const c = evoCfgSnapshot || {};
+
+  if (ui.evoAlgo) ui.evoAlgo.value = String(c.algo || ui.evoAlgo.value || "cem_delta");
+  if (ui.evoVariants && c.variants != null) ui.evoVariants.value = String(c.variants);
+  if (ui.evoTicks && c.ticks != null) ui.evoTicks.value = String(c.ticks);
+  if (ui.evoGenerations && c.generations != null) ui.evoGenerations.value = String(c.generations);
+  if (ui.evoElites && c.elites != null) ui.evoElites.value = String(c.elites);
+  if (ui.evoReplicates && c.replicates != null) ui.evoReplicates.value = String(c.replicates);
+  if (ui.evoWorkers && c.workers != null) ui.evoWorkers.value = String(c.workers);
+  if (ui.evoSeed && c.seed != null) ui.evoSeed.value = String(c.seed);
+  if (ui.evoMutationRate && c.mutation_rate != null) ui.evoMutationRate.value = String(c.mutation_rate);
+  if (ui.evoSigmaScale && c.sigma_scale != null) ui.evoSigmaScale.value = String(c.sigma_scale);
+  if (ui.evoSigmaBias && c.sigma_bias != null) ui.evoSigmaBias.value = String(c.sigma_bias);
+  if (ui.evoCemSigma && c.cem_sigma_init != null) ui.evoCemSigma.value = String(c.cem_sigma_init);
+  if (ui.evoCemAlpha && c.cem_alpha != null) ui.evoCemAlpha.value = String(c.cem_alpha);
+  if (ui.evoCemSigmaFloor && c.cem_sigma_floor != null) ui.evoCemSigmaFloor.value = String(c.cem_sigma_floor);
+  if (ui.evoCemMask && c.cem_mask != null) ui.evoCemMask.value = String(c.cem_mask);
+  if (ui.evoAutoFirst && c.auto_first != null) ui.evoAutoFirst.value = String(c.auto_first);
+  if (ui.evoAutoPatience && c.auto_patience != null) ui.evoAutoPatience.value = String(c.auto_patience);
+  if (ui.evoAutoMinDelta && c.auto_min_improve_pct != null) ui.evoAutoMinDelta.value = String(c.auto_min_improve_pct);
+  else if (ui.evoAutoMinDelta && c.auto_min_delta != null) ui.evoAutoMinDelta.value = String(c.auto_min_delta);
+  if (ui.evoAutoMaxSwitches && c.auto_max_switches != null) ui.evoAutoMaxSwitches.value = String(c.auto_max_switches);
+  if (ui.evoHuge && c.huge != null) ui.evoHuge.value = String(c.huge);
+
+  const fw = c.fitness_weights && typeof c.fitness_weights === "object" ? c.fitness_weights : {};
+  const measW = fw.measurements && typeof fw.measurements === "object" ? fw.measurements : {};
+  const measAgg = fw.measurement_aggs && typeof fw.measurement_aggs === "object" ? fw.measurement_aggs : {};
+
+  evoMeasurementWeights = {};
+  evoMeasurementAggs = {};
+  for (const [k, v] of Object.entries(measW)) {
+    const kk = String(k || "").trim();
+    if (!kk) continue;
+    const vv = Number(v);
+    if (Number.isFinite(vv)) evoMeasurementWeights[kk] = vv;
+  }
+  for (const [k, v] of Object.entries(measAgg)) {
+    const kk = String(k || "").trim();
+    if (!kk) continue;
+    const vv = String(v || "").trim();
+    if (vv) evoMeasurementAggs[kk] = vv;
+  }
+
+  const defs = Array.isArray(c.measurement_defs) ? c.measurement_defs : [];
+  evoAvailableMeasurements = defs
+    .filter((m) => m && typeof m === "object")
+    .map((m) => ({ name: String(m.name || "").trim(), expr: String(m.expr || "").trim() }))
+    .filter((m) => m.name && m.expr);
+
+  if (Array.isArray(c.target_layers)) {
+    evoTargetPatterns = c.target_layers.filter((p) => typeof p === "string" && p.trim()).map((p) => String(p).trim());
+  }
+
+  _evoUpdateAlgoUi();
+  _evoUpdateMeasurementsUI();
+  _evoRenderTargetLayersUI();
+}
+
+function _evoSetPanelLocked(locked, cfg) {
+  evoLocked = !!locked;
+
+  if (evoLocked) {
+    _evoApplyCfgSnapshot(cfg);
+  } else {
+    evoCfgSnapshot = null;
+    _evoSyncMeasurementsFromEditor();
+    _evoRenderTargetLayersUI();
+  }
+
+  const dis = (el, on) => {
+    if (!el) return;
+    el.disabled = !!on;
+  };
+
+  dis(ui.evoAlgo, evoLocked);
+  dis(ui.evoVariants, evoLocked);
+  dis(ui.evoTicks, evoLocked);
+  dis(ui.evoGenerations, evoLocked);
+  dis(ui.evoElites, evoLocked);
+  dis(ui.evoReplicates, evoLocked);
+  dis(ui.evoWorkers, evoLocked);
+  dis(ui.evoSeed, evoLocked);
+  dis(ui.evoMutationRate, evoLocked);
+  dis(ui.evoSigmaScale, evoLocked);
+  dis(ui.evoSigmaBias, evoLocked);
+  dis(ui.evoCemSigma, evoLocked);
+  dis(ui.evoCemAlpha, evoLocked);
+  dis(ui.evoCemSigmaFloor, evoLocked);
+  dis(ui.evoCemMask, evoLocked);
+  dis(ui.evoAutoFirst, evoLocked);
+  dis(ui.evoAutoPatience, evoLocked);
+  dis(ui.evoAutoMinDelta, evoLocked);
+  dis(ui.evoAutoMaxSwitches, evoLocked);
+  dis(ui.evoHuge, evoLocked);
+
+  dis(ui.evoTargetFilter, evoLocked);
+  dis(ui.evoTargetAddGene, evoLocked);
+  dis(ui.evoTargetAddRna, evoLocked);
+  dis(ui.evoTargetAddProtein, evoLocked);
+  dis(ui.evoTargetAddMolecule, evoLocked);
+  dis(ui.evoTargetClear, evoLocked);
+  dis(ui.evoTargetCustomPattern, evoLocked);
+  dis(ui.evoTargetAddCustom, evoLocked);
+
+  dis(ui.evoRefreshMeasBtn, evoLocked);
+
+  dis(ui.evoStartBtn, evoLocked);
+  dis(ui.evoStopBtn, !evoLocked);
+}
+
+function _evoOnEditorPayloadChanged() {
+  if (evoLocked) return;
+  _evoSyncMeasurementsFromEditor();
+  _evoRenderTargetLayersUI();
+}
 
 function _evoResetMeasurementWeights() {
   evoAvailableMeasurements = [];
@@ -273,6 +435,235 @@ function _evoAddTargetPattern(pattern) {
   }
 }
 
+let _docModal = null;
+
+function _docModalEnsure() {
+  if (_docModal) return _docModal;
+
+  const root = document.createElement("div");
+  root.className = "modal";
+
+  const overlay = document.createElement("div");
+  overlay.className = "modal__overlay";
+
+  const panel = document.createElement("div");
+  panel.className = "modal__panel";
+
+  const header = document.createElement("div");
+  header.className = "modal__header";
+
+  const title = document.createElement("div");
+  title.className = "modal__title";
+
+  const closeBtn = document.createElement("button");
+  closeBtn.className = "btn btn--secondary";
+  closeBtn.textContent = "Close";
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement("div");
+  body.className = "modal__body";
+
+  panel.appendChild(header);
+  panel.appendChild(body);
+  root.appendChild(overlay);
+  root.appendChild(panel);
+  document.body.appendChild(root);
+
+  const api = {
+    root,
+    overlay,
+    title,
+    body,
+    _resolve: null,
+    close(result) {
+      console.log("Modal closing with:", result);
+      try {
+        const ae = document.activeElement;
+        if (ae && root.contains(ae) && typeof ae.blur === "function") ae.blur();
+      } catch {
+      }
+      root.classList.remove("modal--open");
+      const r = api._resolve;
+      api._resolve = null;
+      if (typeof r === "function") {
+        r(result);
+      } else {
+        console.warn("Modal close called but no resolver!");
+      }
+    },
+  };
+
+  overlay.addEventListener("click", () => api.close(null));
+  closeBtn.addEventListener("click", () => api.close(null));
+  window.addEventListener("keydown", (ev) => {
+    if (!root.classList.contains("modal--open")) return;
+    if (ev.key === "Escape") api.close(null);
+  });
+
+  _docModal = api;
+  return _docModal;
+}
+
+function _docModalPick(titleText, items, initialValue) {
+  const m = _docModalEnsure();
+  m.title.textContent = String(titleText || "");
+  m.body.innerHTML = "";
+
+  const search = document.createElement("input");
+  search.className = "input";
+  search.placeholder = "Search...";
+
+  const list = document.createElement("div");
+  list.style.display = "flex";
+  list.style.flexDirection = "column";
+  list.style.gap = "8px";
+
+  const render = () => {
+    const q = String(search.value || "").toLowerCase();
+    list.innerHTML = "";
+    const filtered = items.filter((x) => String(x).toLowerCase().includes(q));
+    const shown = filtered.slice(0, 250);
+    for (const nm of shown) {
+      const b = document.createElement("button");
+      b.type = "button";  // Prevent form submission behavior
+      b.className = "btn btn--secondary";
+      b.style.justifyContent = "flex-start";
+      b.textContent = String(nm);
+      b.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log("Modal pick:", nm);
+        m.close(String(nm));
+      });
+      list.appendChild(b);
+    }
+    if (filtered.length > shown.length) {
+      const more = document.createElement("div");
+      more.className = "meta";
+      more.textContent = `Showing ${shown.length} of ${filtered.length}. Refine search to narrow.`;
+      list.appendChild(more);
+    }
+  };
+
+  search.addEventListener("input", render);
+  m.body.appendChild(search);
+  m.body.appendChild(document.createElement("div"));
+  m.body.appendChild(list);
+
+  m.root.classList.add("modal--open");
+  search.value = String(initialValue || "");
+  render();
+  console.log("Modal opened with", items.length, "items");
+  setTimeout(() => {
+    try {
+      search.focus();
+      search.select();
+    } catch {
+    }
+  }, 0);
+
+  return new Promise((resolve) => {
+    m._resolve = resolve;
+  });
+}
+
+function _docModalConfirm(titleText, messageText, okLabel) {
+  const m = _docModalEnsure();
+  m.title.textContent = String(titleText || "");
+  m.body.innerHTML = "";
+
+  const msg = document.createElement("div");
+  msg.className = "meta";
+  msg.textContent = String(messageText || "");
+
+  const actions = document.createElement("div");
+  actions.style.display = "flex";
+  actions.style.gap = "10px";
+  actions.style.marginTop = "12px";
+
+  const okBtn = document.createElement("button");
+  okBtn.className = "btn btn--primary";
+  okBtn.textContent = String(okLabel || "OK");
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn btn--secondary";
+  cancelBtn.textContent = "Cancel";
+
+  okBtn.addEventListener("click", () => m.close(true));
+  cancelBtn.addEventListener("click", () => m.close(false));
+
+  actions.appendChild(okBtn);
+  actions.appendChild(cancelBtn);
+  m.body.appendChild(msg);
+  m.body.appendChild(actions);
+
+  m.root.classList.add("modal--open");
+  setTimeout(() => {
+    try {
+      okBtn.focus();
+    } catch {
+    }
+  }, 0);
+
+  return new Promise((resolve) => {
+    m._resolve = resolve;
+  });
+}
+
+function _docModalText(titleText, defaultValue, placeholder, okLabel) {
+  const m = _docModalEnsure();
+  m.title.textContent = String(titleText || "");
+  m.body.innerHTML = "";
+
+  const input = document.createElement("input");
+  input.className = "input";
+  input.placeholder = String(placeholder || "");
+  input.value = String(defaultValue || "");
+
+  const actions = document.createElement("div");
+  actions.style.display = "flex";
+  actions.style.gap = "10px";
+  actions.style.marginTop = "12px";
+
+  const okBtn = document.createElement("button");
+  okBtn.className = "btn btn--primary";
+  okBtn.textContent = String(okLabel || "OK");
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn btn--secondary";
+  cancelBtn.textContent = "Cancel";
+
+  actions.appendChild(okBtn);
+  actions.appendChild(cancelBtn);
+
+  okBtn.addEventListener("click", () => m.close(String(input.value || "").trim()));
+  cancelBtn.addEventListener("click", () => m.close(null));
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      m.close(String(input.value || "").trim());
+    }
+  });
+
+  m.body.appendChild(input);
+  m.body.appendChild(actions);
+
+  m.root.classList.add("modal--open");
+  setTimeout(() => {
+    try {
+      input.focus();
+      input.select();
+    } catch {
+    }
+  }, 0);
+
+  return new Promise((resolve) => {
+    m._resolve = resolve;
+  });
+}
+
 function _evoRemoveTargetPattern(pattern) {
   const idx = evoTargetPatterns.indexOf(pattern);
   if (idx >= 0) {
@@ -304,6 +695,11 @@ function _evoGetMatchingLayers() {
 }
 
 function _evoRenderTargetLayersUI() {
+  const locked = !!evoLocked;
+  const snapResolved = locked && evoCfgSnapshot && Array.isArray(evoCfgSnapshot.target_layers_resolved)
+    ? evoCfgSnapshot.target_layers_resolved.filter((x) => typeof x === "string" && x.trim()).map((x) => String(x).trim())
+    : [];
+
   // Render patterns list
   if (ui.evoTargetPatterns) {
     if (evoTargetPatterns.length === 0) {
@@ -317,6 +713,8 @@ function _evoRenderTargetLayersUI() {
         const removeBtn = document.createElement("button");
         removeBtn.textContent = "×";
         removeBtn.style.cssText = "border: none; background: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1;";
+        removeBtn.disabled = locked;
+        if (locked) removeBtn.style.cursor = "default";
         removeBtn.addEventListener("click", () => _evoRemoveTargetPattern(pat));
         tag.appendChild(removeBtn);
         ui.evoTargetPatterns.appendChild(tag);
@@ -325,7 +723,7 @@ function _evoRenderTargetLayersUI() {
   }
 
   // Render matching count
-  const matching = _evoGetMatchingLayers();
+  const matching = snapResolved.length ? snapResolved : _evoGetMatchingLayers();
   if (ui.evoTargetInfo) {
     if (evoTargetPatterns.length === 0) {
       ui.evoTargetInfo.textContent = "Using defaults: gene_*, rna_*, protein_*";
@@ -337,6 +735,25 @@ function _evoRenderTargetLayersUI() {
   // Render layer list
   if (ui.evoTargetList) {
     ui.evoTargetList.innerHTML = "";
+
+    if (locked && snapResolved.length) {
+      for (const nm of snapResolved) {
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); font-size: 12px;";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = true;
+        cb.disabled = true;
+        row.appendChild(cb);
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = nm;
+        nameSpan.style.flex = "1";
+        row.appendChild(nameSpan);
+        ui.evoTargetList.appendChild(row);
+      }
+      return;
+    }
+
     if (!state || !Array.isArray(state.layers) || state.layers.length === 0) {
       const msg = document.createElement("div");
       msg.className = "meta";
@@ -374,6 +791,7 @@ function _evoRenderTargetLayersUI() {
       groupCb.type = "checkbox";
       groupCb.checked = allMatch;
       groupCb.indeterminate = someMatch && !allMatch;
+      groupCb.disabled = locked;
       groupCb.addEventListener("change", () => {
         if (groupCb.checked) {
           _evoAddTargetPattern(prefix + "_*");
@@ -402,6 +820,7 @@ function _evoRenderTargetLayersUI() {
         const cb = document.createElement("input");
         cb.type = "checkbox";
         cb.checked = isMatch;
+        cb.disabled = locked;
         cb.addEventListener("change", () => {
           if (cb.checked) {
             // Add exact layer name as a pattern
@@ -440,6 +859,7 @@ function _evoResetTargetPatterns() {
 _evoLoadTargetPatterns();
 
 function _evoUpdateMeasurementsUI() {
+  const locked = !!evoLocked;
   if (!ui.evoMeasList) return;
   ui.evoMeasList.innerHTML = "";
   
@@ -450,7 +870,7 @@ function _evoUpdateMeasurementsUI() {
     msg.style.backgroundColor = "rgba(255, 200, 100, 0.1)";
     msg.style.borderRadius = "4px";
     msg.style.marginBottom = "8px";
-    msg.innerHTML = "<strong>No measurements found.</strong><br>Add measurements in the Measurements tab, then click Refresh.";
+    msg.innerHTML = "<strong>No measurements found.</strong><br>Add measurements in the Measurements tab.";
     ui.evoMeasList.appendChild(msg);
     return;
   }
@@ -506,6 +926,7 @@ function _evoUpdateMeasurementsUI() {
     weightInput.style.width = "70px";
     weightInput.style.minWidth = "60px";
     weightInput.style.maxWidth = "70px";
+    weightInput.disabled = locked;
     weightInput.addEventListener("input", () => {
       const w = parseFloat(weightInput.value);
       if (!isNaN(w)) {
@@ -527,6 +948,7 @@ function _evoUpdateMeasurementsUI() {
     aggSelect.style.width = "110px";
     aggSelect.style.minWidth = "100px";
     aggSelect.style.maxWidth = "130px";
+    aggSelect.disabled = locked;
     aggSelect.innerHTML = "";
     {
       const optLast = document.createElement("option");
@@ -571,16 +993,7 @@ function _evoUpdateMeasurementsUI() {
 }
 
 async function _evoRefreshMeasurements() {
-  try {
-    const payload = _evoBasePayloadFromUi();
-    const res = await _rtPostJson("/api/evolution/fitness-config", { payload });
-    if (res.ok && Array.isArray(res.measurements)) {
-      evoAvailableMeasurements = res.measurements;
-      _evoUpdateMeasurementsUI();
-    }
-  } catch (err) {
-    console.error("Failed to fetch measurements:", err);
-  }
+  _evoSyncMeasurementsFromEditor();
 }
 
 if (ui.evoRefreshMeasBtn) {
@@ -767,6 +1180,30 @@ async function _rtEnsureSyncedFromEditor(force = false, sourceLabel = "editor") 
   const payload = JSON.parse(txt);
   await _rtResetWithPayload(payload, sourceLabel);
   rtLastSyncedStateTxt = txt;
+}
+
+async function _rtGetJson(path, opts) {
+  const res = await fetch(path, {
+    method: "GET",
+    signal: opts?.signal,
+  });
+  const txt = await res.text();
+  const contentType = String(res.headers.get("content-type") || "");
+  const looksLikeHtml = /^\s*<!doctype\s+html/i.test(txt) || /^\s*<html/i.test(txt);
+  if (res.status === 501 || (looksLikeHtml && /Unsupported method \('POST'\)/i.test(txt))) {
+    throw new Error(
+      "Runtime API not available at this URL. You are likely serving the editor with a static server (e.g. `python -m http.server`).\n\nRun: `python3 runtime_server.py`\nThen open: http://127.0.0.1:8000/"
+    );
+  }
+  if (!res.ok) {
+    if (looksLikeHtml) {
+      throw new Error(`HTTP ${res.status} ${res.statusText} (got HTML)`);
+    }
+    const obj = txt && contentType.includes("json") ? JSON.parse(txt) : null;
+    const msg = String(obj?.error || obj?.message || txt || res.statusText || "request failed");
+    throw new Error(msg);
+  }
+  return txt && contentType.includes("json") ? JSON.parse(txt) : { ok: res.ok, text: txt };
 }
 
 const RT_HIST_LAYER_KEY = "rt_hist_layer";
@@ -963,11 +1400,12 @@ function _rtIntervalValueMs() {
   return Math.max(50, Math.floor(v));
 }
 
-async function _rtPostJson(path, bodyObj) {
+async function _rtPostJson(path, bodyObj, opts) {
   const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(bodyObj || {}),
+    signal: opts?.signal,
   });
   const txt = await res.text();
   const contentType = String(res.headers.get("content-type") || "");
@@ -1436,6 +1874,49 @@ function _rtPopulateHistLayerSelect() {
   searchable.input.className = "input input--tiny";
   ui.rtHistLayer.replaceWith(searchable.wrapper);
   ui.rtHistLayer = searchable.input;
+
+  // Re-bind handlers because the underlying DOM node was replaced.
+  // Use both 'input' (immediate feedback for datalist picks) and 'change'.
+  if (ui.rtHistLayer && !ui.rtHistLayer.dataset.rtHistBound) {
+    ui.rtHistLayer.dataset.rtHistBound = "1";
+    const apply = async () => {
+      const v = String(ui.rtHistLayer?.value || "").trim();
+      rtHistLayer = v;
+      try {
+        localStorage.setItem(RT_HIST_LAYER_KEY, String(rtHistLayer || ""));
+      } catch {}
+
+      if (!rtLoaded) {
+        _rtRenderHistogram();
+        return;
+      }
+
+      const avail = new Set((rtMeta?.layers || []).map((m) => String(m?.name || "")));
+      if (!v || !avail.has(v)) {
+        _rtRenderHistogram();
+        return;
+      }
+
+      try {
+        const frame = await _rtPostJson("/api/runtime/frame", { layers: _rtGetRequestedLayerNames() });
+        _rtApplyFrame(frame);
+      } catch (e) {
+        _rtSetStatus(String(e?.message || e));
+      }
+    };
+
+    ui.rtHistLayer.addEventListener("change", apply);
+    ui.rtHistLayer.addEventListener("input", () => {
+      // Avoid spamming requests while typing partial names.
+      const v = String(ui.rtHistLayer?.value || "").trim();
+      const avail = new Set((rtMeta?.layers || []).map((m) => String(m?.name || "")));
+      if (!v || avail.has(v)) void apply();
+      else {
+        rtHistLayer = v;
+        _rtRenderHistogram();
+      }
+    });
+  }
 }
 
 function _rtPopulateHistMaskLayerSelect() {
@@ -1447,6 +1928,49 @@ function _rtPopulateHistMaskLayerSelect() {
   searchable.input.className = "input input--tiny";
   ui.rtHistMaskLayer.replaceWith(searchable.wrapper);
   ui.rtHistMaskLayer = searchable.input;
+
+  // Re-bind handlers because the underlying DOM node was replaced.
+  if (ui.rtHistMaskLayer && !ui.rtHistMaskLayer.dataset.rtHistMaskBound) {
+    ui.rtHistMaskLayer.dataset.rtHistMaskBound = "1";
+    const apply = async () => {
+      const v = String(ui.rtHistMaskLayer?.value || "").trim();
+      rtHistMaskLayer = v;
+      try {
+        localStorage.setItem(RT_HIST_MASK_LAYER_KEY, String(rtHistMaskLayer || ""));
+      } catch {}
+
+      if (!rtLoaded) {
+        _rtRenderHistogram();
+        return;
+      }
+
+      const avail = new Set((rtMeta?.layers || []).map((m) => String(m?.name || "")));
+      if (v && !avail.has(v)) {
+        _rtRenderHistogram();
+        if (rtHeatMaskEnabled) _rtRenderHeatmaps();
+        return;
+      }
+
+      try {
+        const frame = await _rtPostJson("/api/runtime/frame", { layers: _rtGetRequestedLayerNames() });
+        _rtApplyFrame(frame);
+      } catch (e) {
+        console.error("rtHistMaskLayer change error:", e);
+      }
+    };
+
+    ui.rtHistMaskLayer.addEventListener("change", apply);
+    ui.rtHistMaskLayer.addEventListener("input", () => {
+      const v = String(ui.rtHistMaskLayer?.value || "").trim();
+      const avail = new Set((rtMeta?.layers || []).map((m) => String(m?.name || "")));
+      if (!v || avail.has(v)) void apply();
+      else {
+        rtHistMaskLayer = v;
+        _rtRenderHistogram();
+        if (rtHeatMaskEnabled) _rtRenderHeatmaps();
+      }
+    });
+  }
 }
 
 function _rtInitHistogramControls() {
@@ -1998,11 +2522,15 @@ let evoRunning = false;
 let evoTimer = null;
 let evoJobId = "";
 let evoLastStatus = null;
+let evoLastTop = [];
+
+const EVO_DEBUG = false;
 
 function _evoUpdateAlgoUi() {
   const algo = String(ui.evoAlgo?.value || "cem_delta");
-  if (ui.evoAffineParams) ui.evoAffineParams.style.display = algo === "affine" ? "block" : "none";
-  if (ui.evoCemParams) ui.evoCemParams.style.display = algo === "cem_delta" ? "block" : "none";
+  if (ui.evoAffineParams) ui.evoAffineParams.style.display = (algo === "affine" || algo === "auto_switch") ? "block" : "none";
+  if (ui.evoCemParams) ui.evoCemParams.style.display = (algo === "cem_delta" || algo === "auto_switch") ? "block" : "none";
+  if (ui.evoAutoParams) ui.evoAutoParams.style.display = algo === "auto_switch" ? "block" : "none";
 }
 
 function _evoConfigFromUi() {
@@ -2021,6 +2549,10 @@ function _evoConfigFromUi() {
   const cemAlpha = Number(ui.evoCemAlpha?.value ?? 0.7);
   const cemSigmaFloor = Number(ui.evoCemSigmaFloor?.value ?? 0.05);
   const cemMask = String(ui.evoCemMask?.value || "cell");
+  const autoFirst = String(ui.evoAutoFirst?.value || "cem_delta");
+  const autoPatience = Math.max(1, Math.floor(Number(ui.evoAutoPatience?.value ?? 5)));
+  const autoMinDelta = Number(ui.evoAutoMinDelta?.value ?? 0);
+  const autoMaxSwitches = Math.max(0, Math.floor(Number(ui.evoAutoMaxSwitches?.value ?? 20)));
   const huge = Number(ui.evoHuge?.value ?? 1e9);
 
   const fitnessWeights = {};
@@ -2082,6 +2614,22 @@ function _evoConfigFromUi() {
     out.cem_sigma_floor = Number.isFinite(cemSigmaFloor) ? cemSigmaFloor : 0.05;
     out.cem_mask = cemMask;
   }
+  if (algo === "auto_switch") {
+    out.auto_first = String(autoFirst || "cem_delta");
+    out.auto_patience = Number.isFinite(autoPatience) ? autoPatience : 5;
+    out.auto_min_improve_pct = Number.isFinite(autoMinDelta) ? autoMinDelta : 0;
+    out.auto_min_delta = out.auto_min_improve_pct;
+    out.auto_max_switches = Number.isFinite(autoMaxSwitches) ? autoMaxSwitches : 20;
+
+    out.mutation_rate = Number.isFinite(mutationRate) ? mutationRate : 0.15;
+    out.sigma_scale = Number.isFinite(sigmaScale) ? sigmaScale : 0.25;
+    out.sigma_bias = Number.isFinite(sigmaBias) ? sigmaBias : 0.25;
+
+    out.cem_sigma_init = Number.isFinite(cemSigma) ? cemSigma : 0.5;
+    out.cem_alpha = Number.isFinite(cemAlpha) ? cemAlpha : 0.7;
+    out.cem_sigma_floor = Number.isFinite(cemSigmaFloor) ? cemSigmaFloor : 0.05;
+    out.cem_mask = cemMask;
+  }
   
   // Include target layers patterns (if specified)
   if (evoTargetPatterns && evoTargetPatterns.length > 0) {
@@ -2113,6 +2661,7 @@ function _applyPayloadToEditor(payloadObj, sourceLabel) {
     syncLayerSelect();
     _setCurrentFile(sourceLabel || "loaded");
     saveToLocalStorage();
+    _evoOnEditorPayloadChanged();
   } catch (e) {
     alert(String(e?.message || e));
   }
@@ -2130,9 +2679,10 @@ async function _evoStart() {
   const payload = _evoBasePayloadFromUi();
   const config = _evoConfigFromUi();
   
-  // Debug: log the weights being sent to backend
-  console.log("DEBUG: Starting evolution with config:", config);
-  console.log("DEBUG: Measurement weights being sent:", config.fitness_weights?.measurements);
+  if (EVO_DEBUG) {
+    console.log("DEBUG: Starting evolution with config:", config);
+    console.log("DEBUG: Measurement weights being sent:", config.fitness_weights?.measurements);
+  }
   
   _evoSetStatus("Starting…");
   const res = await _rtPostJson("/api/evolution/start", { payload, config });
@@ -2142,12 +2692,20 @@ async function _evoStart() {
 }
 
 async function _evoStop() {
-  _evoStopLocal();
+  let stopErr = "";
   try {
     await _rtPostJson("/api/evolution/stop", {});
-  } catch {
+  } catch (e) {
+    stopErr = String(e?.message || e);
   }
-  _evoSetStatus("Stopping…");
+  _evoSetStatus(stopErr ? `Stop failed: ${stopErr}` : "Stopping…");
+
+  if (evoTimer) {
+    clearTimeout(evoTimer);
+    evoTimer = null;
+  }
+  if (!evoRunning) evoRunning = true;
+  await _evoPollOnce();
 }
 
 function _evoDrawPlot(st) {
@@ -2162,24 +2720,28 @@ function _evoDrawPlot(st) {
   const baseline = st?.baseline || {};
   const baseFit = Number(baseline?.fitness);
 
-  const sFitness = Array.isArray(series?.fitness) ? series.fitness : [];
-  const sBest = Array.isArray(series?.best) ? series.best : [];
-  const sMean = Array.isArray(series?.mean) ? series.mean : [];
-  const sOff = Number(series?.offset) || 0;
-
   const hBest = Array.isArray(history?.best) ? history.best : [];
+  const hMedian = Array.isArray(history?.median) ? history.median : [];
   const hMean = Array.isArray(history?.mean) ? history.mean : [];
   const hP10 = Array.isArray(history?.p10) ? history.p10 : [];
   const hP90 = Array.isArray(history?.p90) ? history.p90 : [];
 
-  const useSeries = sFitness.length || sBest.length || sMean.length;
+  const best = (() => {
+    if (!hBest || !hBest.length) return [];
+    const out = [];
+    let m = -Infinity;
+    for (let i = 0; i < hBest.length; i++) {
+      const v = Number(hBest[i]);
+      if (Number.isFinite(v)) m = Math.max(m, v);
+      out.push(m);
+    }
+    return out;
+  })();
+  const median = (hMedian.length ? hMedian : hMean);
+  const p10 = hP10;
+  const p90 = hP90;
 
-  const best = useSeries ? sBest : hBest;
-  const mean = useSeries ? sMean : hMean;
-  const p10 = useSeries ? [] : hP10;
-  const p90 = useSeries ? [] : hP90;
-
-  const n = Math.max(best.length, mean.length, p10.length, p90.length);
+  const n = best.length ? best.length : Math.max(best.length, median.length, p10.length, p90.length);
   if (!n) {
     ctx.fillStyle = "rgba(255,255,255,.65)";
     ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
@@ -2189,9 +2751,14 @@ function _evoDrawPlot(st) {
 
   let mn = Infinity;
   let mx = -Infinity;
-  const scan = [best, mean, p10, p90];
+  const scan = [];
+  if (best.length) scan.push(best);
+  if (median.length) scan.push(median);
   if (Number.isFinite(baseFit)) scan.push([baseFit]);
-  if (useSeries && sFitness.length) scan.push(sFitness);
+  if (!scan.length) {
+    scan.push(best, median, p10, p90);
+    if (useSeries && sFitness.length) scan.push(sFitness);
+  }
   for (const s of scan) {
     for (const v of s) {
       const vv = Number(v);
@@ -2223,8 +2790,7 @@ function _evoDrawPlot(st) {
 
   ctx.fillStyle = "rgba(255,255,255,.55)";
   ctx.font = "11px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial";
-  const xLabel = useSeries ? "eval" : "generation";
-  ctx.fillText(xLabel, padL + plotW - (useSeries ? 28 : 64), padT + plotH + 16);
+  ctx.fillText("generation", padL + plotW - 64, padT + plotH + 16);
   ctx.save();
   ctx.translate(12, padT + plotH / 2);
   ctx.rotate(-Math.PI / 2);
@@ -2235,8 +2801,8 @@ function _evoDrawPlot(st) {
   ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
   ctx.fillText(_stepsFmt(mx), padL + 6, padT + 10);
   ctx.fillText(_stepsFmt(mn), padL + 6, padT + plotH);
-  ctx.fillText(useSeries ? String(sOff) : "0", padL, padT + plotH + 16);
-  ctx.fillText(useSeries ? String(sOff + Math.max(0, n - 1)) : String(Math.max(0, n - 1)), padL + plotW - 18, padT + plotH + 16);
+  ctx.fillText("0", padL, padT + plotH + 16);
+  ctx.fillText(String(Math.max(0, n - 1)), padL + plotW - 18, padT + plotH + 16);
 
   function yOf(v) {
     const t = (Number(v) - mn) / (mx - mn);
@@ -2252,15 +2818,56 @@ function _evoDrawPlot(st) {
     ctx.lineWidth = lw;
     ctx.beginPath();
     const m = Math.min(n, arr.length);
+    let started = false;
     for (let i = 0; i < m; i++) {
       const v = Number(arr[i]);
       if (!Number.isFinite(v)) continue;
       const x = xOf(i);
       const y = yOf(v);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
+    if (started) ctx.stroke();
+  }
+
+  function drawLineSegment(arr, i0, i1, color, lw) {
+    if (!arr || !arr.length) return;
+    const a0 = Math.max(0, Math.min(arr.length - 1, Math.floor(i0)));
+    const a1 = Math.max(0, Math.min(arr.length, Math.floor(i1)));
+    if (a1 - a0 <= 0) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    let started = false;
+    for (let i = a0; i < a1; i++) {
+      const v = Number(arr[i]);
+      if (!Number.isFinite(v)) continue;
+      const x = xOf(i);
+      const y = yOf(v);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (started) ctx.stroke();
+  }
+
+  function drawVLine(x, color, dash) {
+    if (!Number.isFinite(x)) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(Array.isArray(dash) ? dash : []);
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
     ctx.stroke();
+    ctx.setLineDash([]);
   }
 
   function drawHLine(y, color, dash) {
@@ -2302,23 +2909,200 @@ function _evoDrawPlot(st) {
     drawHLine(yOf(baseFit), "rgba(255,255,255,.30)", [4, 3]);
   }
 
-  if (useSeries && sFitness.length) {
-    drawLine(sFitness, "rgba(255,255,255,.18)", 1);
+  const segsRaw = st?.auto?.segments;
+  const segs = Array.isArray(segsRaw) ? segsRaw.filter(s => s && typeof s === "object") : [];
+  if (segs.length >= 1 && n > 1) {
+    for (let si = 0; si < segs.length; si++) {
+      const s0 = segs[si];
+      const s1 = segs[si + 1];
+      const g0 = Math.max(0, Math.floor(Number(s0?.start_gen ?? 0)));
+      const g1 = s1 ? Math.max(g0 + 1, Math.floor(Number(s1?.start_gen ?? n))) : n;
+      const algo = String(s0?.algo || "").toLowerCase();
+      const fill = algo === "affine" ? "rgba(52,199,89,.08)" : "rgba(10,132,255,.08)";
+
+      const x0 = xOf(Math.min(Math.max(0, g0), n - 1));
+      const x1 = g1 >= n ? (padL + plotW) : xOf(Math.min(Math.max(0, g1), n - 1));
+      const w = Math.max(0, x1 - x0);
+      if (w > 0) {
+        ctx.fillStyle = fill;
+        ctx.fillRect(x0, padT, w, plotH);
+      }
+
+      if (si > 0) {
+        const xSw = xOf(Math.min(Math.max(0, g0), n - 1));
+        drawVLine(xSw, "rgba(255,255,255,.28)", [3, 4]);
+      }
+    }
   }
 
-  drawLine(mean, "rgba(255,255,255,.65)", 2);
+  drawLine(median, "rgba(255,255,255,.65)", 2);
+
   drawLine(best, "#0a84ff", 2);
+
   drawLine(p10, "rgba(255,255,255,.25)", 1);
   drawLine(p90, "rgba(255,255,255,.25)", 1);
 
   ctx.fillStyle = "rgba(255,255,255,.55)";
   ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
   const curBest = Number(best[best.length - 1] ?? NaN);
-  const curMean = Number(mean[mean.length - 1] ?? NaN);
+  const curMedian = Number(median[median.length - 1] ?? NaN);
   const dBest = Number.isFinite(baseFit) && Number.isFinite(curBest) ? curBest - baseFit : NaN;
   const baseTxt = Number.isFinite(baseFit) ? `  base=${_stepsFmt(baseFit)}` : "";
   const dTxt = Number.isFinite(dBest) ? `  Δbest=${_stepsFmt(dBest)}` : "";
-  ctx.fillText(`best=${_stepsFmt(curBest)}  mean=${_stepsFmt(curMean)}${baseTxt}${dTxt}`, padL + 6, padT + 14);
+  ctx.fillText(`best=${_stepsFmt(curBest)}  median=${_stepsFmt(curMedian)}${baseTxt}${dTxt}`, padL + 6, padT + 14);
+}
+
+function _evoDrawImprovementPlot(st) {
+  if (!ui.evoImpCanvas) return;
+  const p = _stepsPrepPlotCanvas(ui.evoImpCanvas, 900, 110);
+  if (!p) return;
+  const { ctx, W, H } = p;
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(255,255,255,.02)";
+  ctx.fillRect(0, 0, W, H);
+
+  const padL = 48;
+  const padR = 10;
+  const padT = 10;
+  const padB = 22;
+  const plotW = Math.max(1, W - padL - padR);
+  const plotH = Math.max(1, H - padT - padB);
+
+  const history = st?.history || {};
+  const bestRaw = Array.isArray(history?.best) ? history.best : [];
+  if (!bestRaw || bestRaw.length < 2) {
+    ctx.fillStyle = "rgba(255,255,255,.65)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+    ctx.fillText("Δ% per gen: (need 2+ points)", 10, 18);
+    return;
+  }
+
+  const best = bestRaw.map((x) => Number(x));
+  const runningBest = [];
+  let rb = -Infinity;
+  for (let i = 0; i < best.length; i++) {
+    const v = best[i];
+    if (Number.isFinite(v)) rb = Math.max(rb, v);
+    runningBest.push(rb);
+  }
+
+  const eps = 1e-9;
+  const imp = [NaN];
+  for (let i = 1; i < runningBest.length; i++) {
+    const a = Number(runningBest[i - 1]);
+    const b = Number(runningBest[i]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      imp.push(NaN);
+      continue;
+    }
+    const denom = Math.max(Math.abs(a), eps);
+    imp.push(100 * ((b - a) / denom));
+  }
+
+  const win = 10;
+  const impAvg = [];
+  let sum = 0;
+  let cnt = 0;
+  const q = [];
+  for (let i = 0; i < imp.length; i++) {
+    const v = Number(imp[i]);
+    q.push(v);
+    if (Number.isFinite(v)) {
+      sum += v;
+      cnt += 1;
+    }
+    while (q.length > win) {
+      const x = q.shift();
+      if (Number.isFinite(x)) {
+        sum -= x;
+        cnt -= 1;
+      }
+    }
+    impAvg.push(cnt ? (sum / cnt) : NaN);
+  }
+
+  let mn = Infinity;
+  let mx = -Infinity;
+  for (const v of imp) {
+    const vv = Number(v);
+    if (!Number.isFinite(vv)) continue;
+    mn = Math.min(mn, vv);
+    mx = Math.max(mx, vv);
+  }
+  for (const v of impAvg) {
+    const vv = Number(v);
+    if (!Number.isFinite(vv)) continue;
+    mn = Math.min(mn, vv);
+    mx = Math.max(mx, vv);
+  }
+  if (!Number.isFinite(mn) || !Number.isFinite(mx) || mn === mx) {
+    mn = -1;
+    mx = 1;
+  }
+  const pad = 0.15 * (mx - mn);
+  mn -= pad;
+  mx += pad;
+
+  function xOf(i, n) {
+    return padL + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+  }
+  function yOf(v) {
+    const t = (Number(v) - mn) / (mx - mn);
+    return padT + (1 - t) * plotH;
+  }
+
+  ctx.strokeStyle = "rgba(255,255,255,.15)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.stroke();
+
+  if (mn < 0 && mx > 0) {
+    const y0 = yOf(0);
+    ctx.strokeStyle = "rgba(255,255,255,.12)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y0);
+    ctx.lineTo(padL + plotW, y0);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawLine(arr, color, lw) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    const n = arr.length;
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      const v = Number(arr[i]);
+      if (!Number.isFinite(v)) continue;
+      const x = xOf(i, n);
+      const y = yOf(v);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (started) ctx.stroke();
+  }
+
+  drawLine(imp, "rgba(180,180,180,.65)", 1);
+  drawLine(impAvg, "rgba(255,255,255,.95)", 2);
+
+  ctx.fillStyle = "rgba(255,255,255,.8)";
+  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+  ctx.fillText("Δ% best/gen (rolling avg)", padL + 6, padT + 12);
+
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+  ctx.fillText(`${_stepsFmt(mx)}%`, 6, padT + 10);
+  ctx.fillText(`${_stepsFmt(mn)}%`, 6, padT + plotH);
 }
 
 function _evoRenderTop(top) {
@@ -2409,6 +3193,7 @@ function _evoRenderTop(top) {
 
 function _evoApplyStatus(st) {
   evoLastStatus = st;
+  evoJobId = String(st?.job_id || evoJobId || "");
   const prog = st?.progress || {};
   const gen = prog?.generation;
   const v = prog?.variant;
@@ -2416,39 +3201,102 @@ function _evoApplyStatus(st) {
   const total = prog?.evaluations_total;
   const running = !!st?.running;
   const err = st?.error;
+  const auto = st?.auto || {};
+  const autoActive = auto?.active_algo;
+  const autoPlateau = auto?.plateau_count;
+  const autoLastSwitch = auto?.last_switch_gen;
+  const autoSwitches = auto?.switches;
+  const autoPat = auto?.patience_gens ?? auto?.patience;
+  const autoMinPct = auto?.min_improve_pct ?? auto?.min_delta;
+  const autoWinPct = auto?.window_improve_pct;
   const baseFit = Number(st?.baseline?.fitness);
   const curBest = Number(st?.series?.best?.[st?.series?.best?.length - 1] ?? st?.history?.best?.[st?.history?.best?.length - 1] ?? NaN);
+  const topNow = Array.isArray(st?.top) ? st.top : [];
+  if (topNow.length) evoLastTop = topNow;
+  const topForUi = topNow.length ? topNow : (Array.isArray(evoLastTop) ? evoLastTop : []);
   const pct = total ? Math.max(0, Math.min(100, (100 * Number(done || 0)) / Number(total))) : 0;
+
+  _evoSetPanelLocked(running, st?.cfg);
   
   // Debug log for baseline and top candidate fitness
-  if (st?.baseline) {
-    console.log("Baseline fitness:", baseFit);
-    console.log("Baseline metrics:", st.baseline.metrics);
-  }
-  if (st?.top && st.top.length > 0) {
-    console.log("Top candidate fitness:", st.top[0].fitness);
-    console.log("Top candidate metrics:", st.top[0].metrics);
+  if (EVO_DEBUG) {
+    if (st?.baseline) {
+      console.log("Baseline fitness:", baseFit);
+      console.log("Baseline metrics:", st.baseline.metrics);
+    }
+    if (st?.top && st.top.length > 0) {
+      console.log("Top candidate fitness:", st.top[0].fitness);
+      console.log("Top candidate metrics:", st.top[0].metrics);
+    }
   }
   const baseTxt = Number.isFinite(baseFit) ? `  base=${_stepsFmt(baseFit)}` : "";
   const bestTxt = Number.isFinite(curBest) ? `  best=${_stepsFmt(curBest)}` : "";
+  const dBest = Number.isFinite(baseFit) && Number.isFinite(curBest) ? curBest - baseFit : NaN;
+  const dTxt = Number.isFinite(dBest) ? `  Δ=${_stepsFmt(dBest)}` : "";
+  const pctTxt = Number.isFinite(baseFit) && Number.isFinite(curBest) && Math.abs(baseFit) > 1e-12
+    ? `  Δ%=${_stepsFmt(100 * (dBest / baseFit))}%`
+    : "";
+
+  const startedAt = Number(prog?.started_at);
+  const nowS = Date.now() / 1000;
+  const elapsed = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, nowS - startedAt) : NaN;
+  const elapsedTxt = Number.isFinite(elapsed) ? `  t=${_stepsFmt(elapsed)}s` : "";
+  const rate = Number.isFinite(elapsed) && elapsed > 0 ? (Number(done || 0) / elapsed) : NaN;
+  const rateTxt = Number.isFinite(rate) ? `  eval/s=${_stepsFmt(rate)}` : "";
+  const fmtPct = (v) => {
+    const vv = Number(v);
+    if (!Number.isFinite(vv)) return "?";
+    return `${_stepsFmt(100 * vv)}%`;
+  };
+  const autoTxt = autoActive
+    ? `  auto=${String(autoActive)} win=${fmtPct(autoWinPct)}<${fmtPct(autoMinPct)} for ${String(autoPat ?? "?")}g switches=${String(autoSwitches ?? 0)} last=${String(autoLastSwitch ?? "-")}`
+    : "";
   const msg = err
     ? `error: ${err}`
     : running
-      ? `running gen=${gen} variant=${v}  eval=${done}/${total} (${_stepsFmt(pct)}%)${bestTxt}${baseTxt}`
-      : "idle";
+      ? `running gen=${gen} variant=${v}  eval=${done}/${total} (${_stepsFmt(pct)}%)${bestTxt}${baseTxt}${dTxt}${pctTxt}${elapsedTxt}${rateTxt}${autoTxt}`
+      : (Number.isFinite(curBest) ? `idle${bestTxt}${baseTxt}${dTxt}${pctTxt}${elapsedTxt}${rateTxt}${autoTxt}` : "idle");
   _evoSetStatus(msg);
   _evoDrawPlot(st || {});
-  _evoRenderTop(st?.top || []);
+  _evoDrawImprovementPlot(st || {});
+  _evoRenderTop(topForUi || []);
 }
 
 async function _evoPollOnce() {
-  const st = await _rtPostJson("/api/evolution/status", {});
-  _evoApplyStatus(st);
-  evoRunning = !!st?.running;
+  let st = null;
+  let hadErr = false;
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const t = ctrl ? setTimeout(() => {
+    try { ctrl.abort(); } catch {}
+  }, 8000) : null;
+
+  try {
+    st = await _rtPostJson("/api/evolution/status", {}, ctrl ? { signal: ctrl.signal } : undefined);
+  } catch (e) {
+    hadErr = true;
+    const msg = String(e?.message || e);
+    _evoSetStatus(msg);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+
+  if (st) {
+    try {
+      _evoApplyStatus(st);
+    } catch (e) {
+      hadErr = true;
+      _evoSetStatus(`UI error: ${String(e?.message || e)}`);
+    }
+    evoRunning = !!st?.running;
+    if (!evoRunning) _evoStopLocal();
+  }
+
   if (evoRunning) {
-    evoTimer = setTimeout(_evoPollOnce, 400);
-  } else {
-    _evoStopLocal();
+    if (evoTimer) {
+      clearTimeout(evoTimer);
+      evoTimer = null;
+    }
+    evoTimer = setTimeout(_evoPollOnce, hadErr ? 1000 : 400);
   }
 }
 
@@ -2460,6 +3308,7 @@ function _evoRenderNow() {
   }
   _evoSetStatus("ready");
   _evoDrawPlot({});
+  _evoDrawImprovementPlot({});
   _evoRenderTop([]);
 }
 
@@ -2624,6 +3473,40 @@ const OPS_GROUPS_COLLAPSED_KEY = "grid_layer_editor_ops_groups_collapsed_v1";
 const RT_VIZ_COLS_KEY = "grid_layer_editor_rt_viz_cols_v1";
 let dirtySinceLastSave = false;
 
+let serverDocLoaded = false;
+let serverDocPath = "";
+let serverDocHasAutosave = false;
+let _docAutosaveTimer = null;
+let _docAutosaveInFlight = false;
+let _docAutosaveQueued = false;
+let _docSuppressAutosave = false;
+let _docOpSerial = 0;
+let _docAutosaveAbortCtrl = null;
+
+function _docBumpOpSerial() {
+  _docOpSerial += 1;
+  return _docOpSerial;
+}
+
+function _docIsStale(token) {
+  return token !== _docOpSerial;
+}
+
+function _docCancelPendingAutosave() {
+  if (_docAutosaveTimer) {
+    clearTimeout(_docAutosaveTimer);
+    _docAutosaveTimer = null;
+  }
+  _docAutosaveQueued = false;
+}
+
+function _docResetLocalDocState() {
+  serverDocLoaded = false;
+  serverDocPath = "";
+  currentFileName = "";
+  _updateCurrentFileInfo();
+}
+
 let currentFileName = "";
 
 function _setCurrentFile(label) {
@@ -2633,9 +3516,70 @@ function _setCurrentFile(label) {
 
 function _updateCurrentFileInfo() {
   if (!ui.currentFileInfo) return;
-  const name = currentFileName || "untitled";
+  const name = currentFileName || (serverDocLoaded ? (serverDocPath || "(unsaved)") : "(no document)");
   const star = dirtySinceLastSave ? " *" : "";
-  ui.currentFileInfo.textContent = `${name}${star}`;
+  const extra = !serverDocLoaded && serverDocHasAutosave ? " (autosave available)" : "";
+  ui.currentFileInfo.textContent = `${name}${star}${extra}`;
+}
+
+async function _docPost(path, bodyObj) {
+  return await _rtPostJson(path, bodyObj || {});
+}
+
+async function _docRefreshStatus() {
+  try {
+    const obj = await _rtGetJson("/api/doc/status");
+    serverDocLoaded = !!obj?.loaded;
+    serverDocPath = String(obj?.path || "");
+    serverDocHasAutosave = !!obj?.has_autosave;
+    if (!serverDocLoaded) {
+      currentFileName = "";
+    } else {
+      currentFileName = serverDocPath || "(unsaved)";
+      dirtySinceLastSave = !!obj?.dirty;
+    }
+    _updateCurrentFileInfo();
+  } catch {
+  }
+}
+
+function _docScheduleAutosave() {
+  if (_docSuppressAutosave) return;
+  if (_docAutosaveTimer) {
+    clearTimeout(_docAutosaveTimer);
+    _docAutosaveTimer = null;
+  }
+  _docAutosaveTimer = setTimeout(() => {
+    _docAutosaveTimer = null;
+    void _docAutosaveNow();
+  }, 350);
+}
+
+async function _docAutosaveNow() {
+  if (_docAutosaveInFlight) {
+    _docAutosaveQueued = true;
+    return;
+  }
+  _docAutosaveInFlight = true;
+  const token = _docOpSerial;
+  try {
+    const payload_text = serializeState(state);
+    const path = serverDocPath || "";
+    const out = await _rtPostJson("/api/doc/autosave", { payload_text, path });
+    if (_docIsStale(token)) return;
+    serverDocLoaded = true;
+    serverDocPath = String(out?.path || serverDocPath || "");
+    currentFileName = serverDocPath || "(unsaved)";
+    serverDocHasAutosave = true;
+    _updateCurrentFileInfo();
+  } catch {
+  } finally {
+    _docAutosaveInFlight = false;
+    if (_docAutosaveQueued) {
+      _docAutosaveQueued = false;
+      void _docAutosaveNow();
+    }
+  }
 }
 
 function _resetAllForNewFile() {
@@ -2663,7 +3607,7 @@ function _resetAllForNewFile() {
   _rtClearSurvival();
   if (ui.rtVizGrid) ui.rtVizGrid.innerHTML = "";
   if (ui.rtWatchList) ui.rtWatchList.innerHTML = "";
-  if (ui.rtStatus) ui.rtStatus.textContent = "";
+  if (ui.rtStatus) ui.rtStatus.textContent = "Load a gridstate first";
   
   // Reset evolution state
   evoRunning = false;
@@ -2676,6 +3620,160 @@ function _resetAllForNewFile() {
     if (ctx) ctx.clearRect(0, 0, ui.evoCanvas.width, ui.evoCanvas.height);
   }
   _evoResetMeasurementWeights();
+  _evoSetPanelLocked(false, null);
+
+  setTimeout(() => {
+    try {
+      _rtRenderNow();
+    } catch {
+    }
+    try {
+      _evoRenderNow();
+    } catch {
+    }
+  }, 0);
+}
+
+async function _docClearActive() {
+  try {
+    const st = await _docPost("/api/doc/clear", {});
+    serverDocLoaded = !!st?.loaded;
+    serverDocPath = String(st?.path || "");
+    serverDocHasAutosave = !!st?.has_autosave;
+    dirtySinceLastSave = !!st?.dirty;
+    currentFileName = "";
+    _updateCurrentFileInfo();
+  } catch {
+  }
+}
+
+function _docApplyPayloadText(text, infoLabel) {
+  _docSuppressAutosave = true;
+  try {
+    const parsed = JSON.parse(text);
+    state = parseState(text);
+    ui.HInput.value = String(state.H);
+    ui.WInput.value = String(state.W);
+    selectedLayer = state.layers[0]?.name || "";
+    _tryApplyEmbeddedMeasurementsConfig(parsed);
+    _tryApplyEmbeddedLayerOpsConfig(parsed);
+    renderFunctionsSpecsTable();
+    renderLayerOpsTable();
+    _syncLetOpsWithLayers();
+    applyAutoFitZoom();
+    syncLayerSelect();
+    if (isManageScreenActive()) {
+      renderLayersTable();
+      updateBulkAddPreview();
+      updateBulkDeleteInfo();
+    }
+    _evoOnEditorPayloadChanged();
+    if (typeof infoLabel === "string") {
+      _setCurrentFile(infoLabel);
+    } else {
+      _setCurrentFile("");
+    }
+  } finally {
+    _docSuppressAutosave = false;
+  }
+}
+
+async function _docRecoverIfWanted(token) {
+  const t = token == null ? _docOpSerial : token;
+  await _docRefreshStatus();
+  if (_docIsStale(t)) return;
+  if (serverDocLoaded) return;
+  if (!serverDocHasAutosave) return;
+  const ok = confirm("An autosave is available on the server. Recover it?");
+  if (!ok) return;
+  const out = await _docPost("/api/doc/recover", {});
+  if (_docIsStale(t)) return;
+  const payloadText = String(out?.payload_text || "");
+  if (!payloadText.trim()) return;
+  currentFileName = "";
+  _resetAllForNewFile();
+  _docApplyPayloadText(payloadText);
+  if (isRuntimeScreenActive()) {
+    await _rtEnsureSyncedFromEditor(true, "doc:recover");
+    if (_docIsStale(t)) return;
+  }
+  await _docRefreshStatus();
+  if (_docIsStale(t)) return;
+  dirtySinceLastSave = !!out?.dirty;
+  _updateCurrentFileInfo();
+}
+
+async function _docOpenPrompt(token) {
+  const t = token == null ? _docOpSerial : token;
+  console.log("_docOpenPrompt start, token:", t, "serial:", _docOpSerial);
+  
+  // Fetch file list
+  let out;
+  try {
+    out = await _rtGetJson("/api/doc/list");
+    console.log("Got file list:", out?.files?.length, "files");
+  } catch (e) {
+    console.error("Failed to fetch file list:", e);
+    throw e;
+  }
+  
+  if (_docIsStale(t)) {
+    console.log("Open cancelled: stale after list, token:", t, "serial:", _docOpSerial);
+    return;
+  }
+  
+  const files = Array.isArray(out?.files) ? out.files : [];
+  const names = files.map((x) => String(x?.name || "").trim()).filter((x) => x);
+  if (!names.length) {
+    alert("No documents found in documents/");
+    return;
+  }
+  
+  // Show picker modal
+  console.log("Showing picker modal...");
+  const name = await _docModalPick("Open document", names, "");
+  console.log("Modal returned:", name);
+  
+  if (!name) {
+    console.log("Open cancelled: no file selected");
+    return;
+  }
+  
+  // Check staleness again
+  if (_docIsStale(t)) {
+    console.log("Open cancelled: stale after pick, token:", t, "serial:", _docOpSerial);
+    return;
+  }
+  
+  // Open the file on server
+  console.log("Opening file on server:", name);
+  let resp;
+  try {
+    resp = await _docPost("/api/doc/open", { name });
+    console.log("Server response ok:", resp?.ok);
+  } catch (e) {
+    console.error("Failed to open file:", e);
+    throw e;
+  }
+  
+  const payloadText = String(resp?.payload_text || "");
+  if (!payloadText.trim()) {
+    throw new Error("Server returned empty payload for: " + name);
+  }
+  
+  // Apply the loaded document
+  console.log("Applying payload, length:", payloadText.length);
+  _resetAllForNewFile();
+  _docResetLocalDocState();
+  _docApplyPayloadText(payloadText, name);
+  if (isRuntimeScreenActive()) {
+    await _rtEnsureSyncedFromEditor(true, `doc:${name}`);
+    if (_docIsStale(t)) return;
+  }
+  await _docRefreshStatus();
+  dirtySinceLastSave = false;
+  _updateCurrentFileInfo();
+  console.log("Opened successfully:", name);
 }
 
 let inspectSummaryLastLayer = "";
@@ -2693,17 +3791,9 @@ const bulkSelectedLayers = new Set();
 
 const opTargetsSelected = new Set();
 
-const DEFAULT_MEASUREMENTS = [
-  { name: "inflammation", expr: "mean(cytokine, where=(circulation==1))" },
-  { name: "glucose_per_circ_cell", expr: "sum(glucose, where=(circulation==1)) / count(where=(circulation==1))" },
-  { name: "protein_per_circ_cell", expr: "sum(amino_acids, where=(circulation==1)) / count(where=(circulation==1))" },
-  { name: "toxins_per_circ_cell", expr: "sum(toxins, where=(circulation==1)) / count(where=(circulation==1))" },
-  { name: "bacterial_infection", expr: "mean(bacterial_antigen, where=(circulation==1))" },
-];
-
 const DEFAULT_LAYER_OPS = [];
 
-let fnMeasurements = DEFAULT_MEASUREMENTS.map((x) => ({ ...x }));
+let fnMeasurements = [];
 let fnLastFocusedExprInput = null;
 
 let layerOps = DEFAULT_LAYER_OPS.map((x) => ({ ...x }));
@@ -2752,123 +3842,9 @@ const OPS_INSERTER_FUNCS = [
   { value: "min_layers", snippet: "min_layers(\"*\")" },
   { value: "max_layers", snippet: "max_layers(\"*\")" },
 ];
+
 function loadFunctionsCfg() {
-  try {
-    const raw = localStorage.getItem(FUNCTIONS_CFG_KEY);
-    if (!raw) return;
-    const o = JSON.parse(raw);
-    if (o && typeof o === "object") {
-      if (Array.isArray(o.measurements)) {
-        fnMeasurements = o.measurements
-          .filter((m) => m && typeof m === "object")
-          .map((m) => ({ name: String(m.name || ""), expr: String(m.expr || "") }))
-          .filter((m) => m.name);
-      }
-      if (Array.isArray(o.layer_ops)) {
-        layerOps = o.layer_ops
-          .filter((x) => x && typeof x === "object")
-          .map((x) => {
-            const rawType = String(x.type || "op").trim();
-            const knownTypes = ["let", "foreach", "transport", "diffusion", "divide_cells", "pathway"];
-            const type = knownTypes.includes(rawType) ? rawType : "op";
-            
-            if (type === "foreach") {
-              const steps = Array.isArray(x.steps) ? x.steps : [];
-              const stepsTextRaw = typeof x.stepsText === "string" ? x.stepsText : "";
-              const stepsText = stepsTextRaw.trim().startsWith("for")
-                ? stepsTextRaw
-                : _forEachStepToR({ match: String(x.match || "*"), steps });
-              return {
-                type,
-                name: String(x.name || ""),
-                group: String(x.group || ""),
-                enabled: x.enabled !== false,
-                match: String(x.match || ""),
-                require_match: !!x.require_match,
-                steps,
-                stepsText,
-              };
-            }
-            
-            if (type === "transport" || type === "diffusion") {
-              return {
-                type,
-                name: String(x.name || ""),
-                group: String(x.group || ""),
-                enabled: x.enabled !== false,
-                molecules: x.molecules || "molecule_*",
-                molecule_prefix: x.molecule_prefix || "molecule_",
-                protein_prefix: x.protein_prefix || "protein_",
-                cell_layer: x.cell_layer || "cell",
-                cell_mode: x.cell_mode || "eq",
-                cell_value: x.cell_value ?? 1,
-                dirs: Array.isArray(x.dirs) ? x.dirs : ["north", "south", "east", "west"],
-                per_pair_rate: x.per_pair_rate ?? 1.0,
-                rate: x.rate ?? 0.2,
-                rate_layer: x.rate_layer || null,
-                seed: x.seed ?? 0,
-              };
-            }
-            
-            if (type === "divide_cells") {
-              return {
-                type,
-                name: String(x.name || ""),
-                group: String(x.group || ""),
-                enabled: x.enabled !== false,
-                cell_layer: x.cell_layer || "cell",
-                cell_value: x.cell_value ?? 1,
-                empty_value: x.empty_value ?? 0,
-                trigger_layer: x.trigger_layer || "protein_divider",
-                threshold: x.threshold ?? 50,
-                split_fraction: x.split_fraction ?? 0.5,
-                max_radius: x.max_radius ?? null,
-                layer_prefixes: Array.isArray(x.layer_prefixes) ? x.layer_prefixes : ["molecule", "protein", "rna", "damage", "gene"],
-                seed: x.seed ?? 0,
-              };
-            }
-            
-            if (type === "pathway") {
-              return {
-                type,
-                name: String(x.name || ""),
-                group: String(x.group || ""),
-                enabled: x.enabled !== false,
-                pathway_name: String(x.pathway_name || x.name || ""),
-                inputs: Array.isArray(x.inputs) ? x.inputs : [],
-                outputs: Array.isArray(x.outputs) ? x.outputs : [],
-                num_enzymes: x.num_enzymes ?? 3,
-                cell_layer: x.cell_layer || "cell",
-                cell_value: x.cell_value ?? 1,
-                efficiency: x.efficiency ?? 1.0,
-                seed: x.seed ?? 0,
-              };
-            }
-            
-            const out = {
-              type,
-              name: String(x.name || ""),
-              group: String(x.group || ""),
-              enabled: x.enabled !== false,
-              expr: String(x.expr || ""),
-            };
-            if (type === "let") return { ...out, var: String(x.var || "") };
-            return { ...out, target: String(x.target || "") };
-          })
-          .filter((x) => {
-            if (x.type === "foreach") return x.match && Array.isArray(x.steps);
-            if (x.type === "transport" || x.type === "diffusion") return true;
-            if (x.type === "divide_cells") return true;
-            if (x.type === "pathway") return x.pathway_name && Array.isArray(x.inputs) && x.inputs.length > 0;
-            return x.expr && (x.type === "let" ? x.var : x.target);
-          });
-      }
-      if (!fnMeasurements.length) fnMeasurements = DEFAULT_MEASUREMENTS.map((x) => ({ ...x }));
-      if (!layerOps.length) layerOps = DEFAULT_LAYER_OPS.map((x) => ({ ...x }));
-    }
-  } catch {
-    // ignore
-  }
+  return;
 }
 
 function updateAssignOpUi() {
@@ -2911,17 +3887,7 @@ function isRandomAssignOpType(opType) {
 }
 
 function saveFunctionsCfg() {
-  try {
-    localStorage.setItem(
-      FUNCTIONS_CFG_KEY,
-      JSON.stringify({
-        measurements: fnMeasurements,
-        layer_ops: layerOps,
-      })
-    );
-  } catch {
-    // ignore
-  }
+  return;
 }
 
 function buildFunctionsConfigJson() {
@@ -3511,10 +4477,42 @@ function validateLayerOpStep(step, knownVars) {
   if (!e) return { ok: false, text: "Missing expr" };
 
   if (type === "op") {
-    const t = String(step?.target || "").trim();
-    if (!t) return { ok: false, text: "Missing target" };
-    const meta = layerList.find((l) => l.name === t);
-    if (!meta) return { ok: false, text: `Unknown target: ${t}` };
+    const tRaw = String(step?.target || "").trim();
+    if (!tRaw) return { ok: false, text: "Missing target" };
+    const layerNames = layerList.map((l) => String(l?.name || "")).filter((x) => x);
+    const parts = tRaw.split(",").map((s) => String(s || "").trim()).filter((s) => s);
+    if (!parts.length) return { ok: false, text: "Missing target" };
+
+    let matchedTotal = 0;
+    for (const p0 of parts) {
+      const p = String(p0 || "").trim();
+      if (!p) continue;
+      if (p.startsWith("glob:")) {
+        const glob = p.slice("glob:".length).trim();
+        try {
+          const rx = new RegExp(_globToRegexSourceWithGroups(glob));
+          const n = layerNames.filter((nm) => rx.test(nm)).length;
+          if (n <= 0) return { ok: false, text: `Unknown target: ${p}` };
+          matchedTotal += n;
+        } catch {
+          return { ok: false, text: `Unknown target: ${p}` };
+        }
+      } else if (_isGlobLikePattern(p)) {
+        try {
+          const rx = new RegExp(_globToRegexSourceWithGroups(p));
+          const n = layerNames.filter((nm) => rx.test(nm)).length;
+          if (n <= 0) return { ok: false, text: `Unknown target: ${p}` };
+          matchedTotal += n;
+        } catch {
+          return { ok: false, text: `Unknown target: ${p}` };
+        }
+      } else {
+        const meta = layerList.find((l) => l.name === p);
+        if (!meta) return { ok: false, text: `Unknown target: ${p}` };
+        matchedTotal += 1;
+      }
+    }
+    if (matchedTotal > 1) return { ok: true, text: `OK (targets: ${matchedTotal})` };
   } else {
     const v = String(step?.var || "").trim();
     if (!v) return { ok: false, text: "Missing var" };
@@ -3784,6 +4782,7 @@ function renderFunctionsSpecsTable() {
       saveFunctionsCfg();
       markDirty();
       saveToLocalStorage();
+      _evoScheduleMeasurementsSync();
     });
     tdName.appendChild(name);
 
@@ -3814,6 +4813,7 @@ function renderFunctionsSpecsTable() {
       markDirty();
       saveToLocalStorage();
       updateStatus();
+      _evoScheduleMeasurementsSync();
     });
 
     const tdDel = document.createElement("td");
@@ -3822,11 +4822,11 @@ function renderFunctionsSpecsTable() {
     del.textContent = "Remove";
     del.addEventListener("click", () => {
       fnMeasurements.splice(i, 1);
-      if (!fnMeasurements.length) fnMeasurements = DEFAULT_MEASUREMENTS.map((x) => ({ ...x }));
       saveFunctionsCfg();
       markDirty();
       saveToLocalStorage();
       renderFunctionsSpecsTable();
+      _evoScheduleMeasurementsSync();
     });
     tdDel.appendChild(del);
 
@@ -4547,8 +5547,38 @@ function validateLayerOpExpr(target, expr) {
   const t = String(target || "").trim();
   if (!t) return { ok: false, text: "Missing target" };
   const layerList = Array.isArray(state?.layers) ? state.layers : [];
-  const meta = layerList.find((l) => l.name === t);
-  if (!meta) return { ok: false, text: `Unknown target: ${t}` };
+  const layerNames = layerList.map((l) => String(l?.name || "")).filter((x) => x);
+  const parts = t.split(",").map((s) => String(s || "").trim()).filter((s) => s);
+  let matchedTotal = 0;
+  for (const p0 of parts) {
+    const p = String(p0 || "").trim();
+    if (!p) continue;
+    if (p.startsWith("glob:")) {
+      const glob = p.slice("glob:".length).trim();
+      try {
+        const rx = new RegExp(_globToRegexSourceWithGroups(glob));
+        const n = layerNames.filter((nm) => rx.test(nm)).length;
+        if (n <= 0) return { ok: false, text: `Unknown target: ${p}` };
+        matchedTotal += n;
+      } catch {
+        return { ok: false, text: `Unknown target: ${p}` };
+      }
+    } else if (_isGlobLikePattern(p)) {
+      try {
+        const rx = new RegExp(_globToRegexSourceWithGroups(p));
+        const n = layerNames.filter((nm) => rx.test(nm)).length;
+        if (n <= 0) return { ok: false, text: `Unknown target: ${p}` };
+        matchedTotal += n;
+      } catch {
+        return { ok: false, text: `Unknown target: ${p}` };
+      }
+    } else {
+      const meta = layerList.find((l) => l.name === p);
+      if (!meta) return { ok: false, text: `Unknown target: ${p}` };
+      matchedTotal += 1;
+    }
+  }
+  if (matchedTotal <= 0) return { ok: false, text: `Unknown target: ${t}` };
 
   const e = String(expr || "").trim();
   if (!e) return { ok: false, text: "Missing expr" };
@@ -4950,21 +5980,27 @@ function renderLayerOpsTable() {
       syncLayerSelect();
     });
 
-    const target = document.createElement("select");
+    const target = document.createElement("input");
     target.className = "input input--tiny";
+    target.placeholder = "molecule_*";
+    target.title = "Target layer name, glob pattern, or comma-separated list. Examples: molecule_*, glob:protein_*, gene_a,gene_b";
+    target.value = String(op.target || layerList[0]?.name || "");
+
+    const targetListId = `opsTargetList_${i}`;
+    const targetDatalist = document.createElement("datalist");
+    targetDatalist.id = targetListId;
     for (const l of layerList) {
       const opt = document.createElement("option");
       opt.value = l.name;
-      opt.textContent = l.name;
-      target.appendChild(opt);
+      targetDatalist.appendChild(opt);
     }
-    target.value = String(op.target || layerList[0]?.name || "");
-    target.addEventListener("change", () => {
+    target.setAttribute("list", targetListId);
+    target.addEventListener("input", () => {
       layerOps[i].target = target.value;
       saveFunctionsCfg();
       markDirty();
       saveToLocalStorage();
-      renderLayerOpsTable();
+      updateStatus();
     });
 
     const moleculesInput = document.createElement("input");
@@ -5008,7 +6044,12 @@ function renderLayerOpsTable() {
       const outputs = Array.isArray(op.outputs) ? op.outputs.join(", ") : "";
       fx.innerHTML = `<strong>${op.pathway_name || "pathway"}</strong><br>${inputs} → ${outputs}<br>${op.num_enzymes || 1} enzymes`;
       tdTarget.appendChild(fx);
-    } else tdTarget.appendChild(target);
+    } else {
+      const wrapT = document.createElement("div");
+      wrapT.appendChild(target);
+      wrapT.appendChild(targetDatalist);
+      tdTarget.appendChild(wrapT);
+    }
 
     const tdExpr = document.createElement("td");
     const expr = isTransport || isDiffusion || isDivide || isPathway ? null : document.createElement("textarea");
@@ -5799,13 +6840,7 @@ let layersGroupByPrefix = true;
 const collapsedGroups = new Set();
 
 function tryLoadFromLocalStorage() {
-  try {
-    const text = localStorage.getItem(STORAGE_KEY);
-    if (!text) return null;
-    return parseState(text);
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 function updateBulkAddPreview() {
@@ -6066,38 +7101,35 @@ function computeBatchTargets() {
   return { targets };
 }
 
+function _opTargetsGetVisibleLayers() {
+  const q = String(ui.opTargetFilter?.value || "").trim();
+
+  let filteredLayers = [];
+  if (q) {
+    const pattern = q.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    const regex = new RegExp(pattern, "i");
+    filteredLayers = state.layers.filter((l) => regex.test(String(l.name)));
+  } else {
+    filteredLayers = [...state.layers];
+  }
+
+  const selectedLayerNames = new Set(opTargetsSelected);
+  const filteredLayerNames = new Set(filteredLayers.map((l) => l.name));
+  const missingSelectedLayers = state.layers.filter(
+    (l) => selectedLayerNames.has(l.name) && !filteredLayerNames.has(l.name)
+  );
+
+  const layers = [...filteredLayers, ...missingSelectedLayers];
+  layers.sort((a, b) => a.name.localeCompare(b.name));
+  return layers;
+}
+
 function renderOpTargetsList() {
   if (!ui.opTargetsList) return;
 
   pruneOpTargetsSelected();
   const isRandom = isRandomAssignOpType(ui.opType?.value);
-  const q = String(ui.opTargetFilter?.value || "").trim();
-  
-  // Get all layers that match the search filter
-  let filteredLayers = [];
-  if (q) {
-    // Convert wildcard pattern to regex
-    const pattern = q.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-    const regex = new RegExp(pattern, 'i'); // Removed ^ and $ to allow partial matches
-    filteredLayers = state.layers.filter((l) => regex.test(String(l.name)));
-  } else {
-    filteredLayers = [...state.layers];
-  }
-  
-  // Add any selected layers that didn't match the filter
-  const selectedLayerNames = new Set(opTargetsSelected);
-  const filteredLayerNames = new Set(filteredLayers.map(l => l.name));
-  
-  // Find selected layers that aren't already in the filtered list
-  const missingSelectedLayers = state.layers.filter(l => 
-    selectedLayerNames.has(l.name) && !filteredLayerNames.has(l.name)
-  );
-  
-  // Combine filtered layers with missing selected layers
-  const layers = [...filteredLayers, ...missingSelectedLayers];
-  
-  // Sort alphabetically for consistent display
-  layers.sort((a, b) => a.name.localeCompare(b.name));
+  const layers = _opTargetsGetVisibleLayers();
 
   ui.opTargetsList.innerHTML = "";
   for (const l of layers) {
@@ -6142,19 +7174,14 @@ function renderOpTargetsList() {
 }
 
 function saveToLocalStorage() {
-  try {
-    localStorage.setItem(STORAGE_KEY, serializeState(state));
-    dirtySinceLastSave = false;
-    _updateCurrentFileInfo();
-  } catch {
-    // ignore
-  }
+  _docScheduleAutosave();
 }
 
 function markDirty() {
   dirtySinceLastSave = true;
   inspectSummaryDirty = true;
   _updateCurrentFileInfo();
+  _docScheduleAutosave();
 }
 
 function _syncInspectModeUi() {
@@ -6191,6 +7218,11 @@ function pruneBulkSelectedLayers() {
 
 function isManageScreenActive() {
   const p = document.querySelector('.screenPanel[data-screen="manage"]');
+  return !!p && p.classList.contains("screenPanel--active");
+}
+
+function isRuntimeScreenActive() {
+  const p = document.querySelector('.screenPanel[data-screen="runtime"]');
   return !!p && p.classList.contains("screenPanel--active");
 }
 
@@ -6693,50 +7725,69 @@ function draw(state, layerName) {
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, cssW, cssH);
 
-  const meta = state.layers.find((l) => l.name === layerName);
-  const a = state.data[layerName];
-  if (!meta || !a) return;
+  const _drawLayer = (targetCtx, nm, alpha) => {
+    const meta = state.layers.find((l) => l.name === nm);
+    const a = state.data[nm];
+    if (!meta || !a) return;
 
-  if (meta.kind === "categorical") {
-    const tint = hexToRgb(meta.color);
-    for (let y = 0; y < state.H; y++) {
-      for (let x = 0; x < state.W; x++) {
-        const v = Math.round(a[y * state.W + x]);
-        if (v === 0) {
-          ctx.fillStyle = "rgb(0,0,0)";
-        } else {
-          const c = palette[((v % palette.length) + palette.length) % palette.length];
-          const alpha = 0.70;
-          const r = Math.round((1 - alpha) * c[0] + alpha * tint.r);
-          const g = Math.round((1 - alpha) * c[1] + alpha * tint.g);
-          const b = Math.round((1 - alpha) * c[2] + alpha * tint.b);
-          ctx.fillStyle = `rgb(${r},${g},${b})`;
+    targetCtx.save();
+    targetCtx.globalAlpha = clamp(Number(alpha), 0, 1);
+
+    if (meta.kind === "categorical") {
+      const tint = hexToRgb(meta.color);
+      for (let y = 0; y < state.H; y++) {
+        for (let x = 0; x < state.W; x++) {
+          const v = Math.round(a[y * state.W + x]);
+          if (v === 0) {
+            targetCtx.fillStyle = "rgb(0,0,0)";
+          } else {
+            const c = palette[((v % palette.length) + palette.length) % palette.length];
+            const alpha2 = 0.70;
+            const r = Math.round((1 - alpha2) * c[0] + alpha2 * tint.r);
+            const g = Math.round((1 - alpha2) * c[1] + alpha2 * tint.g);
+            const b = Math.round((1 - alpha2) * c[2] + alpha2 * tint.b);
+            targetCtx.fillStyle = `rgb(${r},${g},${b})`;
+          }
+          targetCtx.fillRect(x * zoom, y * zoom, zoom, zoom);
         }
-        ctx.fillRect(x * zoom, y * zoom, zoom, zoom);
+      }
+    } else {
+      let mn = Infinity,
+        mx = -Infinity;
+      for (let i = 0; i < a.length; i++) {
+        const v = meta.kind === "counts" ? clampCounts(a[i]) : a[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      const denom = mx - mn === 0 ? 1e-6 : mx - mn;
+      const col = hexToRgb(meta.color);
+      for (let y = 0; y < state.H; y++) {
+        for (let x = 0; x < state.W; x++) {
+          const raw = meta.kind === "counts" ? clampCounts(a[y * state.W + x]) : a[y * state.W + x];
+          const v = (raw - mn) / denom;
+          const t = clamp(v, 0, 1);
+          const r = Math.round(col.r * t);
+          const g = Math.round(col.g * t);
+          const b = Math.round(col.b * t);
+          targetCtx.fillStyle = `rgb(${r},${g},${b})`;
+          targetCtx.fillRect(x * zoom, y * zoom, zoom, zoom);
+        }
       }
     }
-  } else {
-    let mn = Infinity,
-      mx = -Infinity;
-    for (let i = 0; i < a.length; i++) {
-      const v = meta.kind === "counts" ? clampCounts(a[i]) : a[i];
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
-    }
-    const denom = mx - mn === 0 ? 1e-6 : mx - mn;
-    const col = hexToRgb(meta.color);
-    for (let y = 0; y < state.H; y++) {
-      for (let x = 0; x < state.W; x++) {
-        const raw = meta.kind === "counts" ? clampCounts(a[y * state.W + x]) : a[y * state.W + x];
-        const v = (raw - mn) / denom;
-        const t = clamp(v, 0, 1);
-        const r = Math.round(col.r * t);
-        const g = Math.round(col.g * t);
-        const b = Math.round(col.b * t);
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(x * zoom, y * zoom, zoom, zoom);
-      }
-    }
+
+    targetCtx.restore();
+  };
+
+  _drawLayer(ctx, layerName, 1);
+
+  const pl = String(paintLayer || "").trim();
+  if (
+    paintOverlayEnabled &&
+    pl &&
+    pl !== String(layerName || "").trim() &&
+    state.layers.some((l) => l.name === pl)
+  ) {
+    _drawLayer(ctx, pl, paintOverlayAlpha);
   }
 
   if (showGrid && zoom >= 6) {
@@ -7051,6 +8102,50 @@ function fillRect(state, layerName, y0, x0, y1, x1, value) {
 let state = makeDemoState(64, 96, 0);
 let selectedLayer = "cell_type";
 
+const PAINT_LAYER_KEY = "grid_layer_editor_paint_layer_v1";
+const PAINT_OVERLAY_ENABLED_KEY = "grid_layer_editor_paint_overlay_enabled_v1";
+const PAINT_OVERLAY_ALPHA_KEY = "grid_layer_editor_paint_overlay_alpha_v1";
+
+let paintLayer = "";
+let paintOverlayEnabled = true;
+let paintOverlayAlpha = 0.45;
+
+function _initPaintOverlayControls() {
+  try {
+    paintLayer = String(localStorage.getItem(PAINT_LAYER_KEY) || "");
+  } catch {}
+  try {
+    const v = String(localStorage.getItem(PAINT_OVERLAY_ENABLED_KEY) || "");
+    if (v === "0" || v === "1") paintOverlayEnabled = v === "1";
+  } catch {}
+  try {
+    const a = Number(localStorage.getItem(PAINT_OVERLAY_ALPHA_KEY));
+    if (Number.isFinite(a)) paintOverlayAlpha = clamp(a, 0, 1);
+  } catch {}
+
+  if (ui.paintOverlayEnabled) {
+    ui.paintOverlayEnabled.checked = !!paintOverlayEnabled;
+    ui.paintOverlayEnabled.addEventListener("change", () => {
+      paintOverlayEnabled = !!ui.paintOverlayEnabled.checked;
+      try {
+        localStorage.setItem(PAINT_OVERLAY_ENABLED_KEY, paintOverlayEnabled ? "1" : "0");
+      } catch {}
+    });
+  }
+
+  if (ui.paintOverlayAlpha) {
+    ui.paintOverlayAlpha.value = String(paintOverlayAlpha);
+    ui.paintOverlayAlpha.addEventListener("input", () => {
+      const v = Number(ui.paintOverlayAlpha.value);
+      if (!Number.isFinite(v)) return;
+      paintOverlayAlpha = clamp(v, 0, 1);
+      try {
+        localStorage.setItem(PAINT_OVERLAY_ALPHA_KEY, String(paintOverlayAlpha));
+      } catch {}
+    });
+  }
+}
+
 function _inspectPopulateHistMaskLayerSelect() {
   if (!ui.inspectHistMaskLayer || !ui.inspectHistMaskLayer.parentNode) return;
   
@@ -7101,6 +8196,32 @@ function syncLayerSelect() {
     searchable.input.className = "input input--tiny";
     ui.layerSelect.replaceWith(searchable.wrapper);
     ui.layerSelect = searchable.input;
+  }
+
+  // Workspace paint target layer
+  if (ui.paintLayerSelect && ui.paintLayerSelect.parentNode) {
+    const paintable = state.layers
+      .filter((l) => l && (l.kind === "categorical" || l.kind === "counts"))
+      .map((l) => String(l.name || ""))
+      .filter((nm) => nm);
+    const avail = new Set(paintable);
+    if (!paintLayer) paintLayer = selectedLayer;
+    if (paintLayer && !avail.has(String(paintLayer))) paintLayer = paintable[0] || selectedLayer;
+
+    const searchable = makeSearchableSelect(
+      paintable,
+      paintLayer,
+      "Paint layer...",
+      (val) => {
+        paintLayer = String(val || "");
+        try {
+          localStorage.setItem(PAINT_LAYER_KEY, String(paintLayer || ""));
+        } catch {}
+      }
+    );
+    searchable.input.className = "input";
+    ui.paintLayerSelect.replaceWith(searchable.wrapper);
+    ui.paintLayerSelect = searchable.input;
   }
 
   // Bulk operations mask layer
@@ -7167,6 +8288,10 @@ function syncLayerSelect() {
   ui.layerSelect.value = selectedLayer;
 
   _inspectPopulateHistMaskLayerSelect();
+
+  if (!evoLocked) {
+    _evoRenderTargetLayersUI();
+  }
 
   if (!state.layers.some((l) => l.name === ui.maskLayer.value)) {
     ui.maskLayer.value = state.layers[0]?.name || "";
@@ -7506,12 +8631,15 @@ function updatePanels() {
     if (ui.activeLayerColor.value !== c) ui.activeLayerColor.value = c;
   }
 
-  const isPaintable = meta.kind === "categorical" || meta.kind === "counts";
-  ui.editMode.disabled = !isPaintable;
-  ui.paintValue.disabled = !isPaintable;
-  ui.brushRadius.disabled = !isPaintable;
-  ui.toggleEraser.disabled = !isPaintable;
-  ui.editMode.parentElement.parentElement.style.opacity = isPaintable ? "1" : "0.55";
+  const editMode = String(ui.editMode?.value || "brush");
+  const paintTarget = String(paintLayer || selectedLayer || "").trim();
+  const paintMeta = state.layers.find((l) => l.name === paintTarget) || meta;
+  const isPaintable = !!paintMeta && (paintMeta.kind === "categorical" || paintMeta.kind === "counts");
+  ui.editMode.disabled = false;
+  ui.brushRadius.disabled = false;
+  ui.paintValue.disabled = !isPaintable || editMode === "clone";
+  ui.toggleEraser.disabled = !isPaintable || editMode === "clone";
+  ui.editMode.parentElement.parentElement.style.opacity = (isPaintable || editMode === "clone") ? "1" : "0.55";
 
   _ensureInspectSummaryUpToDate();
 }
@@ -8675,8 +9803,16 @@ function setActiveScreen(name) {
   }
 
   if (name === "evolution") {
+    if (!evoLocked) {
+      _evoSyncMeasurementsFromEditor();
+    }
     _evoRenderTargetLayersUI();
-    setTimeout(() => _evoRenderNow(), 0);
+    setTimeout(() => {
+      if (!evoTimer) {
+        evoRunning = true;
+        void _evoPollOnce();
+      }
+    }, 0);
   }
 }
 
@@ -9157,15 +10293,7 @@ if (ui.fnAddRowBtn) {
     markDirty();
     saveToLocalStorage();
     renderFunctionsSpecsTable();
-  });
-}
-if (ui.fnResetBtn) {
-  ui.fnResetBtn.addEventListener("click", () => {
-    fnMeasurements = DEFAULT_MEASUREMENTS.map((x) => ({ ...x }));
-    saveFunctionsCfg();
-    markDirty();
-    saveToLocalStorage();
-    renderFunctionsSpecsTable();
+    _evoScheduleMeasurementsSync();
   });
 }
 
@@ -9657,14 +10785,7 @@ if (ui.opTargetFilter) {
 
 if (ui.opTargetsSelectAll) {
   ui.opTargetsSelectAll.addEventListener("click", () => {
-    const q = String(ui.opTargetFilter?.value || "").trim();
-    
-    let layers = state.layers;
-    if (q) {
-      const pattern = q.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-      const regex = new RegExp(`^${pattern}$`, 'i');
-      layers = state.layers.filter((l) => regex.test(String(l.name)));
-    }
+    const layers = _opTargetsGetVisibleLayers();
     const isRandom = isRandomAssignOpType(ui.opType?.value);
     for (const l of layers) {
       if (isRandom && l.kind === "categorical") continue;
@@ -9731,61 +10852,217 @@ if (ui.bulkDeleteBtn) {
 }
 
 ui.saveBtn.addEventListener("click", () => {
-  const text = serializeState(state);
-  download("gridstate.json", text);
-  dirtySinceLastSave = false;
-  _updateCurrentFileInfo();
-  saveToLocalStorage();
+  void (async () => {
+    try {
+      await _docAutosaveNow();
+      let name = null;
+      if (!serverDocPath) {
+        name = await _docModalText("Save as", "untitled.json", "relative to documents/", "Save");
+        if (!name) return;
+      }
+      await _docPost("/api/doc/save", name ? { name } : {});
+      dirtySinceLastSave = false;
+      await _docRefreshStatus();
+    } catch (e) {
+      alert(String(e?.message || e));
+    }
+  })();
 });
 
+if (ui.saveAsBtn) {
+  ui.saveAsBtn.addEventListener("click", () => {
+    void (async () => {
+      try {
+        await _docAutosaveNow();
+        const base = serverDocPath ? String(serverDocPath).split("/").pop() : "";
+        const defName = base && base.trim() ? base : "untitled.json";
+        const name = await _docModalText("Save as", defName, "relative to documents/", "Save");
+        if (!name) return;
+        await _docPost("/api/doc/save", { name });
+        dirtySinceLastSave = false;
+        await _docRefreshStatus();
+      } catch (e) {
+        alert(String(e?.message || e));
+      }
+    })();
+  });
+}
+
+if (ui.downloadBtn) {
+  ui.downloadBtn.addEventListener("click", () => {
+    const text = serializeState(state);
+    const base = serverDocPath ? String(serverDocPath).split("/").pop() : "";
+    const nm = base && base.trim() ? base : "gridstate.json";
+    download(nm, text);
+  });
+}
+
+if (ui.deleteBtn) {
+  ui.deleteBtn.addEventListener("click", () => {
+    void (async () => {
+      try {
+        const token = _docBumpOpSerial();
+        _docCancelPendingAutosave();
+        const ls = await _rtGetJson("/api/doc/list");
+        if (_docIsStale(token)) return;
+        const files = Array.isArray(ls?.files) ? ls.files : [];
+        const names = files
+          .map((f) => (f && typeof f === "object" ? String(f.name || "").trim() : ""))
+          .filter((x) => !!x);
+        if (names.length === 0) {
+          alert("No documents to delete.");
+          return;
+        }
+        const picked = await _docModalPick("Delete file", names, "");
+        if (_docIsStale(token)) return;
+        if (!picked) return;
+
+        const ok = await _docModalConfirm(
+          "Confirm delete",
+          `Delete '${picked}'? This cannot be undone.`,
+          "Delete",
+        );
+        if (!ok) return;
+
+        const wasCurrent = !!serverDocPath && String(serverDocPath) === String(picked);
+        await _docPost("/api/doc/delete", { name: picked });
+
+        const ls2 = await _rtGetJson("/api/doc/list");
+        const files2 = Array.isArray(ls2?.files) ? ls2.files : [];
+        const names2 = files2
+          .map((f) => (f && typeof f === "object" ? String(f.name || "").trim() : ""))
+          .filter((x) => !!x);
+        if (names2.includes(String(picked))) {
+          throw new Error(
+            `Delete did not remove '${picked}'. Make sure you restarted runtime_server.py and that it has write permission to documents/.`,
+          );
+        }
+
+        if (wasCurrent) {
+          _resetAllForNewFile();
+        }
+        dirtySinceLastSave = wasCurrent ? true : dirtySinceLastSave;
+        await _docRefreshStatus();
+        if (wasCurrent && !serverDocLoaded) {
+          currentFileName = "(unsaved)";
+          _updateCurrentFileInfo();
+        }
+      } catch (e) {
+        alert(String(e?.message || e));
+      }
+    })();
+  });
+}
+
+if (ui.openBtn) {
+  ui.openBtn.addEventListener("click", () => {
+    console.log("Open button clicked, dirty:", dirtySinceLastSave);
+    void (async () => {
+      try {
+        // Check dirty BEFORE bumping serial (confirm is sync, won't cause races)
+        if (dirtySinceLastSave) {
+          const ok = confirm("You have unsaved changes. Continue and open another file?");
+          if (!ok) {
+            console.log("Open cancelled by user (dirty confirm)");
+            return;
+          }
+        }
+        // Now bump serial and cancel autosave
+        const token = _docBumpOpSerial();
+        console.log("Open: bumped serial to", token);
+        _docCancelPendingAutosave();
+        await _docOpenPrompt(token);
+        console.log("Open: _docOpenPrompt completed");
+      } catch (e) {
+        console.error("Open error:", e);
+        alert(String(e?.message || e));
+      }
+    })();
+  });
+}
+
 ui.demoBtn.addEventListener("click", () => {
-  const H = Number(ui.HInput.value);
-  const W = Number(ui.WInput.value);
-  
-  // Reset all state for new file
-  _resetAllForNewFile();
-  
-  state = makeDemoState(H, W, 0);
-  selectedLayer = "cell_type";
-  _setCurrentFile("demo");
-  
-  // Reset functions to defaults
-  fnMeasurements = [];
-  layerOps = [];
-  saveFunctionsCfg();
-  renderFunctionsSpecsTable();
-  renderLayerOpsTable();
-  
-  applyAutoFitZoom();
-  syncLayerSelect();
-  markDirty();
-  saveToLocalStorage();
+  void (async () => {
+    const H = Number(ui.HInput.value);
+    const W = Number(ui.WInput.value);
+    _docBumpOpSerial();
+    _docCancelPendingAutosave();
+    _docResetLocalDocState();
+    _resetAllForNewFile();
+    void _docClearActive();
+
+    state = makeDemoState(H, W, 0);
+    selectedLayer = "cell_type";
+    _setCurrentFile("");
+
+    fnMeasurements = [];
+    layerOps = [];
+    saveFunctionsCfg();
+    renderFunctionsSpecsTable();
+    renderLayerOpsTable();
+
+    applyAutoFitZoom();
+    syncLayerSelect();
+    if (isManageScreenActive()) {
+      renderLayersTable();
+      updateBulkAddPreview();
+      updateBulkDeleteInfo();
+    }
+    _evoOnEditorPayloadChanged();
+    markDirty();
+    saveToLocalStorage();
+
+    if (isRuntimeScreenActive()) {
+      try {
+        await _rtEnsureSyncedFromEditor(true, "doc:demo");
+      } catch (e) {
+        _rtSetStatus(String(e?.message || e));
+      }
+    }
+  })();
 });
 
 ui.newBtn.addEventListener("click", () => {
-  const H = Number(ui.HInput.value);
-  const W = Number(ui.WInput.value);
-  if (!confirm("Create a new blank grid? This will replace the current in-memory state.")) return;
-  
-  // Reset all state for new file
-  _resetAllForNewFile();
-  
-  state = makeEmptyState(H, W);
-  addLayer(state, { name: "cell_type", kind: "counts", init: "zeros", value: 0, seed: 0 });
-  selectedLayer = "cell_type";
-  _setCurrentFile("new");
-  
-  // Reset functions to defaults
-  fnMeasurements = [];
-  layerOps = [];
-  saveFunctionsCfg();
-  renderFunctionsSpecsTable();
-  renderLayerOpsTable();
-  
-  applyAutoFitZoom();
-  syncLayerSelect();
-  markDirty();
-  saveToLocalStorage();
+  void (async () => {
+    const H = Number(ui.HInput.value);
+    const W = Number(ui.WInput.value);
+    if (!confirm("Create a new blank grid? This will replace the current in-memory state.")) return;
+    _docBumpOpSerial();
+    _docCancelPendingAutosave();
+    _docResetLocalDocState();
+    _resetAllForNewFile();
+    void _docClearActive();
+
+    state = makeEmptyState(H, W);
+    addLayer(state, { name: "cell_type", kind: "counts", init: "zeros", value: 0, seed: 0 });
+    selectedLayer = "cell_type";
+    _setCurrentFile("");
+
+    fnMeasurements = [];
+    layerOps = [];
+    saveFunctionsCfg();
+    renderFunctionsSpecsTable();
+    renderLayerOpsTable();
+
+    applyAutoFitZoom();
+    syncLayerSelect();
+    if (isManageScreenActive()) {
+      renderLayersTable();
+      updateBulkAddPreview();
+      updateBulkDeleteInfo();
+    }
+    _evoOnEditorPayloadChanged();
+    markDirty();
+    saveToLocalStorage();
+
+    if (isRuntimeScreenActive()) {
+      try {
+        await _rtEnsureSyncedFromEditor(true, "doc:new");
+      } catch (e) {
+        _rtSetStatus(String(e?.message || e));
+      }
+    }
+  })();
 });
 
 ui.fileInput.addEventListener("change", async () => {
@@ -9793,27 +11070,41 @@ ui.fileInput.addEventListener("change", async () => {
   if (!f) return;
   const text = await f.text();
   try {
-    // Reset all state for new file
+    _docBumpOpSerial();
+    _docCancelPendingAutosave();
+    _docResetLocalDocState();
     _resetAllForNewFile();
-    
+    void _docClearActive();
+    _setCurrentFile("");
+
     const parsed = JSON.parse(text);
     state = parseState(text);
     ui.HInput.value = String(state.H);
     ui.WInput.value = String(state.W);
     selectedLayer = state.layers[0]?.name || "";
-    
-    // Apply embedded functions from file
+
     _tryApplyEmbeddedMeasurementsConfig(parsed);
     _tryApplyEmbeddedLayerOpsConfig(parsed);
-    
-    // Sync let ops with layers (create missing layers or remove orphaned ops)
     _syncLetOpsWithLayers();
-    
+
     applyAutoFitZoom();
     syncLayerSelect();
-    _setCurrentFile(f.name || "loaded");
+    if (isManageScreenActive()) {
+      renderLayersTable();
+      updateBulkAddPreview();
+      updateBulkDeleteInfo();
+    }
+    _evoOnEditorPayloadChanged();
     markDirty();
     saveToLocalStorage();
+
+    if (isRuntimeScreenActive()) {
+      try {
+        await _rtEnsureSyncedFromEditor(true, "doc:import");
+      } catch (e) {
+        _rtSetStatus(String(e?.message || e));
+      }
+    }
   } catch (e) {
     alert(String(e?.message || e));
   } finally {
@@ -9836,6 +11127,9 @@ ui.WInput.addEventListener("change", () => {
 let isDown = false;
 let rectStart = null;
 let lastCell = null;
+let cloneSrc = null;
+let cloneSrcValues = null;
+let cloneInfoLast = "";
 
 function eventToCell(ev) {
   const zoom = Number(ui.zoomInput.value);
@@ -9867,24 +11161,97 @@ function clearOverlay() {
   ctx.clearRect(0, 0, ui.overlay.width, ui.overlay.height);
 }
 
+function _cloneUpdateInfo() {
+  if (!ui.paintCloneInfo) return;
+  const mode = String(ui.editMode?.value || "brush");
+  let txt = "";
+  if (mode === "clone") {
+    if (cloneSrc) {
+      txt = `clone: src=(${cloneSrc.y},${cloneSrc.x})  alt+click to pick new source`;
+    } else {
+      txt = "clone: alt+click (or click) a source pixel, then paint to stamp";
+    }
+  }
+  if (txt !== cloneInfoLast) {
+    ui.paintCloneInfo.textContent = txt;
+    cloneInfoLast = txt;
+  }
+}
+
+function _cloneSetSource(y, x) {
+  const idx = y * state.W + x;
+  const values = {};
+  for (const l of state.layers) {
+    const nm = String(l?.name || "");
+    if (!nm) continue;
+    const a = state.data[nm];
+    if (!a) continue;
+    values[nm] = a[idx];
+  }
+  cloneSrc = { y, x };
+  cloneSrcValues = values;
+  _cloneUpdateInfo();
+}
+
+function _cloneApplyAtCell(y, x) {
+  if (!cloneSrcValues) return;
+  const r = Math.max(0, Math.floor(Number(ui.brushRadius?.value || 0)));
+  const r2 = r * r;
+  for (let yy = y - r; yy <= y + r; yy++) {
+    if (yy < 0 || yy >= state.H) continue;
+    for (let xx = x - r; xx <= x + r; xx++) {
+      if (xx < 0 || xx >= state.W) continue;
+      const dy = yy - y;
+      const dx = xx - x;
+      if (dy * dy + dx * dx > r2) continue;
+      const tIdx = yy * state.W + xx;
+      for (const l of state.layers) {
+        const nm = String(l?.name || "");
+        if (!nm) continue;
+        const a = state.data[nm];
+        if (!a) continue;
+        const v = cloneSrcValues[nm];
+        if (v === undefined) continue;
+        a[tIdx] = v;
+      }
+    }
+  }
+  markDirty();
+}
+
 function applyPaintAtCell(y, x) {
-  const meta = state.layers.find((l) => l.name === selectedLayer);
+  const targetLayer = String(paintLayer || selectedLayer || "").trim();
+  const meta = state.layers.find((l) => l.name === targetLayer);
   if (!meta || (meta.kind !== "categorical" && meta.kind !== "counts")) return;
 
   const value = ui.toggleEraser.checked ? 0 : meta.kind === "counts" ? clampCounts(ui.paintValue.value) : Math.round(Number(ui.paintValue.value));
   const r = Math.round(Number(ui.brushRadius.value));
-  paintCircle(state, selectedLayer, y, x, r, value);
+  paintCircle(state, targetLayer, y, x, r, value);
   markDirty();
 }
 
 ui.canvas.addEventListener("pointerdown", (ev) => {
   isDown = true;
   ui.canvas.setPointerCapture(ev.pointerId);
-  const meta = state.layers.find((l) => l.name === selectedLayer);
-  if (!meta || (meta.kind !== "categorical" && meta.kind !== "counts")) return;
-
   const { y, x } = eventToCell(ev);
   lastCell = { y, x };
+
+  const mode = String(ui.editMode?.value || "brush");
+  if (mode === "clone") {
+    if (ev.altKey || !cloneSrc) {
+      _cloneSetSource(y, x);
+      isDown = false;
+      rectStart = null;
+      clearOverlay();
+      return;
+    }
+    _cloneApplyAtCell(y, x);
+    return;
+  }
+
+  const targetLayer = String(paintLayer || selectedLayer || "").trim();
+  const meta = state.layers.find((l) => l.name === targetLayer);
+  if (!meta || (meta.kind !== "categorical" && meta.kind !== "counts")) return;
 
   if (ui.editMode.value === "rectangle") {
     rectStart = { y, x };
@@ -9898,8 +11265,10 @@ ui.canvas.addEventListener("pointermove", (ev) => {
   const { y, x } = eventToCell(ev);
   ui.cursorInfo.textContent = `(y,x): (${y}, ${x})`;
 
-  const mode = ui.inspectMode?.value || "cursor";
-  if (mode === "summary") {
+  _cloneUpdateInfo();
+
+  const inspectMode = ui.inspectMode?.value || "cursor";
+  if (inspectMode === "summary") {
     const meta = state.layers.find((l) => l.name === selectedLayer);
     const a = state.data[selectedLayer];
     if (ui.inspectCursorValue) {
@@ -9916,7 +11285,16 @@ ui.canvas.addEventListener("pointermove", (ev) => {
 
   if (!isDown) return;
 
-  const meta = state.layers.find((l) => l.name === selectedLayer);
+  const mode = String(ui.editMode?.value || "brush");
+  if (mode === "clone") {
+    if (lastCell && lastCell.y === y && lastCell.x === x) return;
+    lastCell = { y, x };
+    _cloneApplyAtCell(y, x);
+    return;
+  }
+
+  const targetLayer = String(paintLayer || selectedLayer || "").trim();
+  const meta = state.layers.find((l) => l.name === targetLayer);
   if (!meta || (meta.kind !== "categorical" && meta.kind !== "counts")) return;
 
   if (ui.editMode.value === "rectangle") {
@@ -9933,7 +11311,14 @@ ui.canvas.addEventListener("pointerup", (ev) => {
   isDown = false;
   ui.canvas.releasePointerCapture(ev.pointerId);
 
-  const meta = state.layers.find((l) => l.name === selectedLayer);
+  if (String(ui.editMode?.value || "brush") === "clone") {
+    rectStart = null;
+    clearOverlay();
+    return;
+  }
+
+  const targetLayer = String(paintLayer || selectedLayer || "").trim();
+  const meta = state.layers.find((l) => l.name === targetLayer);
   if (!meta || (meta.kind !== "categorical" && meta.kind !== "counts")) {
     rectStart = null;
     clearOverlay();
@@ -9944,7 +11329,7 @@ ui.canvas.addEventListener("pointerup", (ev) => {
 
   if (ui.editMode.value === "rectangle" && rectStart) {
     const value = ui.toggleEraser.checked ? 0 : meta.kind === "counts" ? clampCounts(ui.paintValue.value) : Math.round(Number(ui.paintValue.value));
-    fillRect(state, selectedLayer, rectStart.y, rectStart.x, y, x, value);
+    fillRect(state, targetLayer, rectStart.y, rectStart.x, y, x, value);
     markDirty();
   }
 
@@ -10000,24 +11385,48 @@ function _syncLetOpsWithLayers() {
 
 // init
 {
-  const loaded = tryLoadFromLocalStorage();
-  if (loaded) {
-    state = loaded;
-    selectedLayer = state.layers[0]?.name || "";
-  }
+  state = makeEmptyState(64, 96);
+  selectedLayer = "";
+
   _syncLetOpsWithLayers();
-  _setCurrentFile(loaded ? "localStorage" : "demo");
+  _setCurrentFile("");
   _inspectInitHistMaskControls();
+  _initPaintOverlayControls();
   syncLayerSelect();
   ui.HInput.value = String(state.H);
   ui.WInput.value = String(state.W);
   applyAutoFitZoom();
-  saveToLocalStorage();
-  setInterval(() => {
-    if (dirtySinceLastSave) saveToLocalStorage();
-  }, 1000);
+  _evoOnEditorPayloadChanged();
+  void (async () => {
+    const token = _docBumpOpSerial();
+    try {
+      await _docRefreshStatus();
+      if (_docIsStale(token)) return;
+      if (serverDocLoaded) {
+        const got = await _docPost("/api/doc/get", {});
+        if (_docIsStale(token)) return;
+        const txt = String(got?.payload_text || "");
+        if (txt.trim()) {
+          _docApplyPayloadText(txt);
+          await _docRefreshStatus();
+          return;
+        }
+      }
+      await _docRecoverIfWanted(token);
+      await _docRefreshStatus();
+    } catch {
+    }
+  })();
 }
 requestAnimationFrame(tick);
+
+// Warn user about unsaved changes before closing browser/tab (Google Docs-like)
+window.addEventListener("beforeunload", (e) => {
+  if (dirtySinceLastSave) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
 
 {
   const wrap = ui.canvasWrap || document.querySelector(".canvasWrap");
