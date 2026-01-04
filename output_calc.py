@@ -145,10 +145,11 @@ def _expr_required_layer_names(expr: str) -> List[str]:
 
 
 class _ExprEval:
-    def __init__(self, layers: Dict[str, np.ndarray], H: int, W: int):
+    def __init__(self, layers: Dict[str, np.ndarray], H: int, W: int, events: Optional[dict] = None):
         self.layers = layers
         self.H = H
         self.W = W
+        self.events = events if isinstance(events, dict) else {}
 
     def _as_array(self, v) -> np.ndarray:
         if isinstance(v, np.ndarray):
@@ -336,9 +337,68 @@ class _ExprEval:
             if not isinstance(node.func, ast.Name):
                 raise ValueError("Only simple function calls are allowed")
             fn = node.func.id
-            allowed = {"mean", "sum", "min", "max", "std", "var", "median", "quantile", "count"}
+            allowed = {
+                "mean",
+                "sum",
+                "min",
+                "max",
+                "std",
+                "var",
+                "median",
+                "quantile",
+                "count",
+                "event_last",
+                "event_total",
+                "op_last",
+                "op_total",
+            }
             if fn not in allowed:
                 raise ValueError(f"Unsupported function: {fn}")
+
+            if fn in ("event_last", "event_total", "op_last", "op_total"):
+                if node.keywords:
+                    raise ValueError(f"{fn}() does not take keyword args")
+                if len(node.args) != 1:
+                    raise ValueError(f"{fn}() requires exactly one argument")
+                key = self._eval_node(node.args[0])
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError(f"{fn}() key must be a non-empty string")
+                key = key.strip()
+
+                if fn == "event_last":
+                    last = self.events.get("last")
+                    if not isinstance(last, dict):
+                        last = {}
+                    try:
+                        return float(int(last.get(key) or 0))
+                    except Exception:
+                        return 0.0
+
+                if fn == "event_total":
+                    totals = self.events.get("totals")
+                    if not isinstance(totals, dict):
+                        totals = {}
+                    try:
+                        return float(int(totals.get(key) or 0))
+                    except Exception:
+                        return 0.0
+
+                if fn == "op_last":
+                    last = self.events.get("op_last")
+                    if not isinstance(last, dict):
+                        last = {}
+                    try:
+                        return float(int(last.get(key) or 0))
+                    except Exception:
+                        return 0.0
+
+                totals = self.events.get("op_totals")
+                if not isinstance(totals, dict):
+                    totals = {}
+                try:
+                    return float(int(totals.get(key) or 0))
+                except Exception:
+                    return 0.0
 
             kwargs = {kw.arg: self._eval_node(kw.value) for kw in node.keywords if kw.arg}
             where = kwargs.get("where")

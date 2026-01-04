@@ -36,6 +36,7 @@
             <button class="screenBtn" data-screen="assign">Assign values</button>
             <button class="screenBtn" data-screen="functions">Functions</button>
             <button class="screenBtn" data-screen="runtime">Runtime</button>
+            <button class="screenBtn" data-screen="profiling">Profiling</button>
             <button class="screenBtn" data-screen="evolution">Evolution</button>
           </div>
 
@@ -480,6 +481,18 @@
                         </div>
                       </div>
 
+                      <div class="row">
+                        <label class="label">Insert op event</label>
+                        <div class="three">
+                          <select id="fnInsertOpEventMode" class="input">
+                            <option value="op_last">op_last (this tick)</option>
+                            <option value="op_total">op_total (cumulative)</option>
+                          </select>
+                          <select id="fnInsertOpEvent" class="input"></select>
+                          <button id="fnInsertOpEventBtn" class="btn btn--secondary">Insert</button>
+                        </div>
+                      </div>
+
                       <div class="hr"></div>
 
                       <div class="row row--inline">
@@ -531,6 +544,7 @@
                           <button id="opsAddTransportBtn" class="btn btn--secondary">Add transport</button>
                           <button id="opsAddDiffusionBtn" class="btn btn--secondary">Add diffusion</button>
                           <button id="opsAddDivisionBtn" class="btn btn--secondary">Add division</button>
+                          <button id="opsAddPulseBtn" class="btn btn--secondary">Add transition pulse</button>
                           <button id="opsAddPathwayBtn" class="btn btn--secondary">Add pathway</button>
                         </div>
                       </div>
@@ -705,6 +719,99 @@
                         </div>
                       </div>
                     </div>
+                  </div>
+
+                  <div class="runtimeBlock">
+                    <div class="runtimeBlock__title">Cell trajectory</div>
+                    <div class="runtimeBlock__controls">
+                      <div id="rtTrajInfo" class="meta"></div>
+                      <label class="meta">Layer</label>
+                      <select id="rtTrajAddLayer" class="input input--tiny"></select>
+                      <button id="rtTrajAddLayerBtn" class="btn btn--secondary btn--tiny">Add</button>
+                      <label class="meta">Window (pts)</label>
+                      <input id="rtTrajWindow" class="input input--tiny" type="number" min="10" step="10" value="2000" />
+                      <label class="checkbox"><input id="rtTrajNormalize" type="checkbox" checked /> Normalize</label>
+                      <label class="checkbox"><input id="rtTrajLog" type="checkbox" /> Log</label>
+                      <button id="rtTrajClearBtn" class="btn btn--secondary btn--tiny">Clear</button>
+                    </div>
+                    <div class="runtimeTrajWrap">
+                      <canvas id="rtTrajCanvas" class="runtimeTrajCanvas"></canvas>
+                    </div>
+                    <div id="rtTrajList" class="runtimeTrajList"></div>
+                  </div>
+                </section>
+              </aside>
+            </div>
+          </div>
+
+          <div class="screenPanel" data-screen="profiling">
+            <div class="functionsLayout">
+              <aside class="toolsDock toolsDock--full">
+                <section class="panel">
+                  <div class="panel__title">Profiling</div>
+                  <div class="help">
+                    Run the current editor payload for N ticks and report which Layer Ops steps and measurement expressions are slowest.
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Ticks</label>
+                    <input id="profTicks" class="input" type="number" min="1" step="1" value="50" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Warmup ticks</label>
+                    <input id="profWarmup" class="input" type="number" min="0" step="1" value="5" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Repeats</label>
+                    <input id="profRepeats" class="input" type="number" min="1" step="1" value="1" />
+                  </div>
+
+                  <div class="row row--inline">
+                    <label class="checkbox"><input id="profEstimate" type="checkbox" checked /> Estimate speed</label>
+                    <label class="checkbox"><input id="profBreakdown" type="checkbox" checked /> Breakdown</label>
+                  </div>
+
+                  <div class="row">
+                    <button id="profRunBtn" class="btn btn--primary">Run profiling</button>
+                  </div>
+
+                  <div class="row row--inline">
+                    <div id="profStatus" class="meta"></div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="profSummary" class="meta"></div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="profNote" class="meta"></div>
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row row--inline">
+                    <div class="panel__title" style="font-size: 13px;">Slowest Layer Ops steps</div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="profLayerOpsTable" class="table"></div>
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row row--inline">
+                    <div class="panel__title" style="font-size: 13px;">Slowest measurements</div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="profMeasurementsTable" class="table"></div>
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row row--inline">
+                    <div class="panel__title" style="font-size: 13px;">Layer Ops by type</div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="profLayerOpsByType" class="meta"></div>
                   </div>
                 </section>
               </aside>

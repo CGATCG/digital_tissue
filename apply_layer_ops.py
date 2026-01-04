@@ -4,6 +4,7 @@ import fnmatch
 import json
 import time
 import functools
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -468,6 +469,21 @@ def apply_layer_ops_inplace(
     # Expand foreach steps into concrete op/let steps.
     steps = _expand_foreach_steps(steps, layer_names=sorted(layers.keys()))
 
+    transition_prev: Dict[str, np.ndarray] = {}
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        st_type = str(st.get("type") or "op").strip().lower()
+        if st_type != "pulse_on_transition":
+            continue
+        src0 = str(st.get("source_layer", "cell") or "").strip()
+        if not src0:
+            continue
+        if src0 in transition_prev:
+            continue
+        if src0 in layers:
+            transition_prev[src0] = np.rint(layers[src0].reshape(H, W)).astype(np.int64)
+
     def _refs_layer_name(obj: Any, layer_name: str) -> bool:
         if isinstance(obj, dict):
             for v in obj.values():
@@ -604,6 +620,22 @@ def apply_layer_ops_inplace(
         "divisions": 0,
     }
 
+    op_events: Dict[str, int] = {}
+
+    def _inc_op_event(key: str, dv: int) -> None:
+        try:
+            dv_i = int(dv)
+        except Exception:
+            dv_i = 0
+        if dv_i == 0:
+            return
+        cur = op_events.get(key, 0)
+        try:
+            cur_i = int(cur)
+        except Exception:
+            cur_i = 0
+        op_events[key] = int(cur_i + dv_i)
+
     def _is_identifier(name: str) -> bool:
         import re
 
@@ -737,7 +769,14 @@ def apply_layer_ops_inplace(
 
     opt_env_cache = bool(cfg.get("opt_env_cache") or cfg.get("optimize_env_cache"))
     opt_expr_cache = bool(cfg.get("opt_expr_cache") or cfg.get("optimize_expr_cache"))
-    opt_diffusion_buffers = bool(cfg.get("opt_diffusion_buffers") or cfg.get("optimize_diffusion_buffers"))
+    opt_diffusion_buffers_raw = cfg.get("opt_diffusion_buffers")
+    if opt_diffusion_buffers_raw is None:
+        opt_diffusion_buffers_raw = cfg.get("optimize_diffusion_buffers")
+    opt_diffusion_buffers = True if opt_diffusion_buffers_raw is None else bool(opt_diffusion_buffers_raw)
+    opt_transport_buffers_raw = cfg.get("opt_transport_buffers")
+    if opt_transport_buffers_raw is None:
+        opt_transport_buffers_raw = cfg.get("optimize_transport_buffers")
+    opt_transport_buffers = True if opt_transport_buffers_raw is None else bool(opt_transport_buffers_raw)
     env_cache: Optional[Dict[str, Any]] = None
 
     def _env_get() -> Dict[str, Any]:
@@ -783,11 +822,22 @@ def apply_layer_ops_inplace(
             raise ValueError(f"Invalid dir {d!r} (expected one of north/south/east/west)")
         return s
 
+    zeros_counts2d = np.zeros((H, W), dtype=np.int64)
+
     def _counts2d_or_zeros(name: str) -> np.ndarray:
         arr = layers.get(name)
         if arr is None:
-            return np.zeros((H, W), dtype=np.int64)
+            return zeros_counts2d
         return np.clip(np.rint(arr.reshape(H, W)), 0, None).astype(np.int64)
+
+    def _hash_u01_2d(idx_u32: np.ndarray, seed_u32: np.uint32) -> np.ndarray:
+        x = (idx_u32 ^ seed_u32).astype(np.uint32)
+        x ^= (x >> np.uint32(16))
+        x = (x * np.uint32(0x7FEB352D)).astype(np.uint32)
+        x ^= (x >> np.uint32(15))
+        x = (x * np.uint32(0x846CA68B)).astype(np.uint32)
+        x ^= (x >> np.uint32(16))
+        return (x.astype(np.float32) * np.float32(1.0 / 4294967296.0)).astype(np.float32)
 
     def _compute_edge_caps(
         is_cell: np.ndarray,
@@ -797,6 +847,7 @@ def apply_layer_ops_inplace(
         src_slice_x: slice,
         dst_slice_y: slice,
         dst_slice_x: slice,
+        out: Any = None,
     ) -> np.ndarray:
         cell_s = is_cell[src_slice_y, src_slice_x]
         cell_d = is_cell[dst_slice_y, dst_slice_x]
@@ -811,9 +862,13 @@ def apply_layer_ops_inplace(
                 np.where((~cell_s) & cell_d, i, 0),
             ),
         )
-        out = np.zeros((H, W), dtype=np.int64)
-        out[src_slice_y, src_slice_x] = np.asarray(slots, dtype=np.int64)
-        return out
+        if out is None:
+            out2 = np.zeros((H, W), dtype=np.int64)
+        else:
+            out2 = np.asarray(out, dtype=np.int64)
+            out2.fill(0)
+        out2[src_slice_y, src_slice_x] = np.asarray(slots, dtype=np.int64)
+        return out2
 
     applied = 0
     for i, step in enumerate(steps):
@@ -884,12 +939,19 @@ def apply_layer_ops_inplace(
             rate2d = np.where(non_cell, rate2d, 0.0).astype(np.float32)
 
             seed = step.get("seed")
+            diffusion_mode = str(step.get("diffusion_mode") or step.get("mode") or "").strip().lower()
+            det_flag = step.get("deterministic")
+            use_stochastic = bool(step.get("stochastic") or step.get("binomial") or diffusion_mode in ("stochastic", "binomial"))
+            if det_flag is not None:
+                use_stochastic = not bool(det_flag)
+
             rng_diff = rng
-            if seed is not None:
-                try:
-                    rng_diff = np.random.default_rng(int(seed) + seed_offset_i + 1000003 * i)
-                except Exception as e:
-                    raise ValueError(f"Step #{i}: diffusion invalid seed {seed!r}: {e}") from e
+            if use_stochastic:
+                if seed is not None:
+                    try:
+                        rng_diff = np.random.default_rng(int(seed) + seed_offset_i + 1000003 * i)
+                    except Exception as e:
+                        raise ValueError(f"Step #{i}: diffusion invalid seed {seed!r}: {e}") from e
 
             openN = np.zeros((H, W), dtype=bool)
             openS = np.zeros((H, W), dtype=bool)
@@ -939,6 +1001,21 @@ def apply_layer_ops_inplace(
             pW = (dt0 * gW).astype(np.float32)
             pMove = np.clip(pN + pS + pE + pW, 0.0, 1.0).astype(np.float32)
 
+            idx_u32 = None
+            det_seed_u32_base = np.uint32(0)
+            if not use_stochastic:
+                idx_u32 = np.arange(int(H * W), dtype=np.uint32).reshape(H, W)
+                det_seed_raw = seed
+                if det_seed_raw is None:
+                    det_seed_raw = base_seed_raw
+                det_seed_i = 0
+                if det_seed_raw is not None and str(det_seed_raw).strip() != "":
+                    try:
+                        det_seed_i = int(det_seed_raw)
+                    except Exception:
+                        det_seed_i = 0
+                det_seed_u32_base = np.uint32(det_seed_i + seed_offset_i + 1000003 * i)
+
             qN_buf = None
             qS_buf = None
             qE_buf = None
@@ -950,6 +1027,29 @@ def apply_layer_ops_inplace(
                 qE_buf = np.zeros((H, W), dtype=np.float32)
                 pRem_buf = np.zeros((H, W), dtype=np.float32)
                 inflow_buf = np.zeros((H, W), dtype=np.int64)
+
+            qN0 = qN_buf if qN_buf is not None else np.zeros((H, W), dtype=np.float32)
+            np.divide(pN, pMove, out=qN0, where=pMove > 0)
+            np.clip(qN0, 0.0, 1.0, out=qN0)
+
+            pRem0 = pRem_buf if pRem_buf is not None else np.maximum(np.float32(0.0), pMove - pN)
+            if pRem_buf is not None:
+                np.subtract(pMove, pN, out=pRem0)
+                np.maximum(pRem0, np.float32(0.0), out=pRem0)
+
+            qS0 = qS_buf if qS_buf is not None else np.zeros((H, W), dtype=np.float32)
+            np.divide(pS, pRem0, out=qS0, where=pRem0 > 0)
+            np.clip(qS0, 0.0, 1.0, out=qS0)
+
+            if pRem_buf is not None:
+                np.subtract(pRem0, pS, out=pRem0)
+                np.maximum(pRem0, np.float32(0.0), out=pRem0)
+            else:
+                pRem0 = np.maximum(np.float32(0.0), pRem0 - pS)
+
+            qE0 = qE_buf if qE_buf is not None else np.zeros((H, W), dtype=np.float32)
+            np.divide(pE, pRem0, out=qE0, where=pRem0 > 0)
+            np.clip(qE0, 0.0, 1.0, out=qE0)
 
             t_setup_done = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
             if profile_layer_ops and profile_step_names_requested:
@@ -966,40 +1066,43 @@ def apply_layer_ops_inplace(
 
                 m_old = np.clip(np.rint(layers[mol_name].reshape(H, W)), 0, None).astype(np.int64)
 
-                n_out = rng_diff.binomial(m_old, pMove).astype(np.int64)
-
-                qN = qN_buf if qN_buf is not None else np.zeros((H, W), dtype=np.float32)
-                if qN_buf is not None:
-                    qN.fill(0)
-                np.divide(pN, pMove, out=qN, where=pMove > 0)
-                np.clip(qN, 0.0, 1.0, out=qN)
-                outN = rng_diff.binomial(n_out, qN).astype(np.int64)
-
-                rem = n_out - outN
-                pRem = pRem_buf if pRem_buf is not None else np.maximum(np.float32(0.0), pMove - pN)
-                if pRem_buf is not None:
-                    np.subtract(pMove, pN, out=pRem)
-                    np.maximum(pRem, np.float32(0.0), out=pRem)
-                qS = qS_buf if qS_buf is not None else np.zeros((H, W), dtype=np.float32)
-                if qS_buf is not None:
-                    qS.fill(0)
-                np.divide(pS, pRem, out=qS, where=pRem > 0)
-                np.clip(qS, 0.0, 1.0, out=qS)
-                outS = rng_diff.binomial(rem, qS).astype(np.int64)
-
-                rem = rem - outS
-                if pRem_buf is not None:
-                    np.subtract(pRem, pS, out=pRem)
-                    np.maximum(pRem, np.float32(0.0), out=pRem)
+                if use_stochastic:
+                    n_out = rng_diff.binomial(m_old, pMove).astype(np.int64)
+                    outN = rng_diff.binomial(n_out, qN0).astype(np.int64)
+                    rem = n_out - outN
+                    outS = rng_diff.binomial(rem, qS0).astype(np.int64)
+                    rem = rem - outS
+                    outE = rng_diff.binomial(rem, qE0).astype(np.int64)
+                    outW = (rem - outE).astype(np.int64)
                 else:
-                    pRem = np.maximum(np.float32(0.0), pRem - pS)
-                qE = qE_buf if qE_buf is not None else np.zeros((H, W), dtype=np.float32)
-                if qE_buf is not None:
-                    qE.fill(0)
-                np.divide(pE, pRem, out=qE, where=pRem > 0)
-                np.clip(qE, 0.0, 1.0, out=qE)
-                outE = rng_diff.binomial(rem, qE).astype(np.int64)
-                outW = (rem - outE).astype(np.int64)
+                    mh = np.uint32(zlib.crc32(str(mol_name).encode("utf-8")) & 0xFFFFFFFF)
+                    s0 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0xA341316C))
+                    s1 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0xC8013EA4))
+                    s2 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0xAD90777D))
+                    s3 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0x7E95761E))
+                    u0 = _hash_u01_2d(idx_u32, s0)
+                    u1 = _hash_u01_2d(idx_u32, s1)
+                    u2 = _hash_u01_2d(idx_u32, s2)
+                    u3 = _hash_u01_2d(idx_u32, s3)
+
+                    n_out_f = (m_old.astype(np.float32) * pMove) + u0
+                    n_out = np.floor(n_out_f).astype(np.int64)
+                    np.minimum(n_out, m_old, out=n_out)
+
+                    outN_f = (n_out.astype(np.float32) * qN0) + u1
+                    outN = np.floor(outN_f).astype(np.int64)
+                    np.minimum(outN, n_out, out=outN)
+                    rem = n_out - outN
+
+                    outS_f = (rem.astype(np.float32) * qS0) + u2
+                    outS = np.floor(outS_f).astype(np.int64)
+                    np.minimum(outS, rem, out=outS)
+                    rem = rem - outS
+
+                    outE_f = (rem.astype(np.float32) * qE0) + u3
+                    outE = np.floor(outE_f).astype(np.int64)
+                    np.minimum(outE, rem, out=outE)
+                    outW = (rem - outE).astype(np.int64)
 
                 inflow = inflow_buf if inflow_buf is not None else np.zeros((H, W), dtype=np.int64)
                 if inflow_buf is not None:
@@ -1016,6 +1119,112 @@ def apply_layer_ops_inplace(
 
                 if profile_layer_ops and profile_step_names_requested:
                     _step_prof_add(step_key, "molecule_s", time.perf_counter() - t_mol0)
+
+            applied += 1
+            if profile_layer_ops and profile_step_names_requested:
+                _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+            if profile_layer_ops:
+                _prof_add(step_type, time.perf_counter() - t_step0)
+            continue
+
+        if step_type == "pulse_on_transition":
+            t0_step = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
+            _step_prof_add(step_key, "calls", 1)
+
+            source_layer = str(step.get("source_layer", "cell") or "").strip()
+            if not source_layer:
+                raise ValueError(f"Step #{i}: pulse_on_transition missing 'source_layer'")
+            if source_layer not in layers:
+                raise ValueError(f"Step #{i}: pulse_on_transition unknown source_layer '{source_layer}'")
+
+            try:
+                from_value = int(step.get("from_value"))
+            except Exception as e:
+                raise ValueError(f"Step #{i}: pulse_on_transition invalid from_value: {e}") from e
+            try:
+                to_value = int(step.get("to_value"))
+            except Exception as e:
+                raise ValueError(f"Step #{i}: pulse_on_transition invalid to_value: {e}") from e
+
+            target_layer = str(step.get("target_layer") or "").strip()
+            if not target_layer:
+                raise ValueError(f"Step #{i}: pulse_on_transition missing 'target_layer'")
+            if target_layer not in layers:
+                raise ValueError(f"Step #{i}: pulse_on_transition unknown target_layer '{target_layer}'")
+
+            value_expr = step.get("value_expr", step.get("target_expr"))
+            value_expr_s = str(value_expr or "").strip() if isinstance(value_expr, str) else ""
+
+            value_raw = step.get("target_value", step.get("pulse_value", step.get("value", 100)))
+            target_value_f = 100.0
+            if not value_expr_s:
+                try:
+                    target_value_f = float(value_raw)
+                except Exception as e:
+                    raise ValueError(f"Step #{i}: pulse_on_transition invalid target_value {value_raw!r}: {e}") from e
+
+            prev_i = transition_prev.get(source_layer)
+            if prev_i is None:
+                prev_i = np.rint(layers[source_layer].reshape(H, W)).astype(np.int64)
+                transition_prev[source_layer] = prev_i
+            cur_i = np.rint(layers[source_layer].reshape(H, W)).astype(np.int64)
+            m = (prev_i == int(from_value)) & (cur_i == int(to_value))
+            if not np.any(m):
+                applied += 1
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+                if profile_layer_ops:
+                    _prof_add(step_type, time.perf_counter() - t_step0)
+                continue
+
+            tgt2d = layers[target_layer].reshape(H, W)
+            if not bool(getattr(tgt2d, "flags", None) and tgt2d.flags.writeable):
+                tgt2d = np.array(tgt2d, dtype=np.float32, copy=True)
+
+            if kinds.get(target_layer) == "counts":
+                if value_expr_s:
+                    env = _env_get() if opt_env_cache else make_env()
+                    try:
+                        v2d = _eval_expr_fast(value_expr_s, env) if opt_expr_cache else _eval_expr(value_expr_s, env)
+                    except Exception as e:
+                        raise ValueError(
+                            f"Step #{i} (type='pulse_on_transition') failed for value_expr: {value_expr_s!r}; error: {e}"
+                        ) from e
+                    if np.asarray(v2d).size == 1:
+                        v2d = np.full((H, W), float(np.asarray(v2d).reshape(-1)[0]), dtype=np.float32)
+                    elif getattr(v2d, "shape", None) != (H, W):
+                        raise ValueError(
+                            f"Step #{i}: pulse_on_transition value_expr result has shape {tuple(getattr(v2d, 'shape', ()))}, expected {(H, W)}"
+                        )
+                    vv = np.clip(np.rint(np.asarray(v2d, dtype=np.float32)), 0, None).astype(np.float32)
+                    tgt2d[m] = vv[m]
+                else:
+                    v = np.float32(int(max(0, int(round(target_value_f)))))
+                    tgt2d[m] = v
+            else:
+                if value_expr_s:
+                    env = _env_get() if opt_env_cache else make_env()
+                    try:
+                        v2d = _eval_expr_fast(value_expr_s, env) if opt_expr_cache else _eval_expr(value_expr_s, env)
+                    except Exception as e:
+                        raise ValueError(
+                            f"Step #{i} (type='pulse_on_transition') failed for value_expr: {value_expr_s!r}; error: {e}"
+                        ) from e
+                    if np.asarray(v2d).size == 1:
+                        v2d = np.full((H, W), float(np.asarray(v2d).reshape(-1)[0]), dtype=np.float32)
+                    elif getattr(v2d, "shape", None) != (H, W):
+                        raise ValueError(
+                            f"Step #{i}: pulse_on_transition value_expr result has shape {tuple(getattr(v2d, 'shape', ()))}, expected {(H, W)}"
+                        )
+                    vv = np.asarray(v2d, dtype=np.float32)
+                    tgt2d[m] = vv[m]
+                else:
+                    v = np.float32(target_value_f)
+                    tgt2d[m] = v
+
+            layers[target_layer] = np.asarray(tgt2d, dtype=np.float32).reshape(H * W)
+            _env_update_layer(target_layer)
+            dirty_layers.add(target_layer)
 
             applied += 1
             if profile_layer_ops and profile_step_names_requested:
@@ -1072,6 +1281,7 @@ def apply_layer_ops_inplace(
                     raise ValueError(f"Step #{i}: divide_cells invalid max_radius {max_radius_raw!r}: {e}") from e
                 if max_radius < 1:
                     max_radius = 1
+            max_radius = min(int(max_radius), int(max(H, W)))
 
             prefixes_raw = step.get("layer_prefixes", None)
             if prefixes_raw is None:
@@ -1082,6 +1292,18 @@ def apply_layer_ops_inplace(
                     raise ValueError(f"Step #{i}: divide_cells layer_prefixes must be a non-empty list")
             else:
                 raise ValueError(f"Step #{i}: divide_cells layer_prefixes must be a non-empty list")
+
+            exclude_raw = step.get("exclude_layers", step.get("excluded_layers", None))
+            exclude_layers: list[str] = []
+            if isinstance(exclude_raw, list):
+                exclude_layers = [
+                    str(x).strip()
+                    for x in exclude_raw
+                    if isinstance(x, (str, int, float)) and str(x).strip()
+                ]
+            elif isinstance(exclude_raw, str) and exclude_raw.strip():
+                exclude_layers = [s.strip() for s in exclude_raw.split(",") if s.strip()]
+            exclude_set = set(exclude_layers)
 
             seed = step.get("seed")
             rng_div = rng
@@ -1106,6 +1328,30 @@ def apply_layer_ops_inplace(
 
             available = np.array(is_empty, dtype=bool)
 
+            prefer_mask_layer = None
+            if "prefer_mask_layer" in step:
+                prefer_mask_layer = step.get("prefer_mask_layer")
+            else:
+                if "morphology" in layers or "morphology" in vars2d:
+                    prefer_mask_layer = "morphology"
+
+            prefer_allowed = None
+            if prefer_mask_layer is not None and str(prefer_mask_layer).strip() != "":
+                pl = str(prefer_mask_layer).strip()
+                prefer_value_raw = step.get("prefer_mask_value", 1)
+                try:
+                    prefer_value = int(prefer_value_raw)
+                except Exception as e:
+                    raise ValueError(f"Step #{i}: divide_cells invalid prefer_mask_value {prefer_value_raw!r}: {e}") from e
+
+                if pl in layers:
+                    p2d = np.rint(layers[pl].reshape(H, W)).astype(np.int64)
+                elif pl in vars2d:
+                    p2d = np.rint(vars2d[pl]).astype(np.int64)
+                else:
+                    raise ValueError(f"Step #{i}: divide_cells unknown prefer_mask_layer '{pl}'")
+                prefer_allowed = p2d == prefer_value
+
             target_mask_layer = step.get("target_mask_layer", None)
             if target_mask_layer is not None and str(target_mask_layer).strip() != "":
                 ml = str(target_mask_layer).strip()
@@ -1124,9 +1370,63 @@ def apply_layer_ops_inplace(
 
                 available &= m2d == mask_value
 
+            if not np.any(available):
+                applied += 1
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+                if profile_layer_ops:
+                    _prof_add(step_type, time.perf_counter() - t_step0)
+                continue
+
             sources = np.argwhere(div_mask)
 
+            n_sources = int(sources.shape[0])
+            n_avail = int(np.count_nonzero(available))
+            max_divisions_raw = step.get("max_divisions", None)
+            if max_divisions_raw is None or str(max_divisions_raw).strip() == "":
+                max_divisions = min(n_sources, n_avail, 512)
+            else:
+                try:
+                    max_divisions = int(max_divisions_raw)
+                except Exception as e:
+                    raise ValueError(f"Step #{i}: divide_cells invalid max_divisions {max_divisions_raw!r}: {e}") from e
+                if max_divisions < 0:
+                    max_divisions = 0
+                max_divisions = min(int(max_divisions), int(n_sources), int(n_avail))
+
+            if max_divisions <= 0:
+                applied += 1
+                if profile_layer_ops and profile_step_names_requested:
+                    _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
+                if profile_layer_ops:
+                    _prof_add(step_type, time.perf_counter() - t_step0)
+                continue
+
+            if n_sources > max_divisions:
+                pick = rng_div.choice(np.arange(n_sources, dtype=np.int64), size=int(max_divisions), replace=False)
+                sources = sources[pick]
+
             def _find_nearest_available(src_y: int, src_x: int):
+                if prefer_allowed is not None:
+                    for r in range(1, max_radius + 1):
+                        y0 = max(0, src_y - r)
+                        y1 = min(H - 1, src_y + r)
+                        x0 = max(0, src_x - r)
+                        x1 = min(W - 1, src_x + r)
+                        sub_pref = available[y0 : y1 + 1, x0 : x1 + 1] & prefer_allowed[y0 : y1 + 1, x0 : x1 + 1]
+                        if not np.any(sub_pref):
+                            continue
+                        ys, xs = np.nonzero(sub_pref)
+                        ys = ys + y0
+                        xs = xs + x0
+                        dy = ys - int(src_y)
+                        dx = xs - int(src_x)
+                        d2 = (dy * dy + dx * dx).astype(np.int64)
+                        md2 = int(d2.min())
+                        ties = np.where(d2 == md2)[0]
+                        pick = int(ties[0]) if ties.size == 1 else int(rng_div.choice(ties))
+                        return int(ys[pick]), int(xs[pick]), md2
+
                 for r in range(1, max_radius + 1):
                     y0 = max(0, src_y - r)
                     y1 = min(H - 1, src_y + r)
@@ -1194,12 +1494,22 @@ def apply_layer_ops_inplace(
             for nm in layers.keys():
                 if nm == cell_layer:
                     continue
+                if nm in exclude_set:
+                    continue
                 if any(str(nm).startswith(pfx) for pfx in layer_prefixes):
                     if kinds.get(nm) == "categorical":
                         continue
                     split_layers.append(nm)
 
+            copy_layers = [nm for nm in layers.keys() if nm != cell_layer and nm not in exclude_set]
+            split_set = set(split_layers)
+
             updated = {}
+            for nm in copy_layers:
+                arr2d = layers[nm].reshape(H, W)
+                if not bool(getattr(arr2d, "flags", None) and arr2d.flags.writeable):
+                    arr2d = np.array(arr2d, dtype=np.float32, copy=True)
+                updated[nm] = arr2d
 
             div_success = 0
             for win_si, ty, tx in assignments:
@@ -1212,28 +1522,26 @@ def apply_layer_ops_inplace(
                 is_empty[ty, tx] = False
                 div_success += 1
 
-                for nm in split_layers:
-                    arr2d = layers[nm].reshape(H, W)
+                for nm in copy_layers:
+                    arr2d = updated[nm]
                     kind = kinds.get(nm)
-                    if str(nm).startswith("damage"):
-                        v = float(arr2d[sy, sx])
-                        arr2d[ty, tx] = np.float32(v)
-                        updated[nm] = arr2d
-                        continue
-                    if kind == "counts":
-                        v = int(np.clip(np.rint(arr2d[sy, sx]), 0, None))
-                        moved = int(v * split_fraction)
-                        if moved < 0:
-                            moved = 0
-                        if moved > v:
-                            moved = v
-                        arr2d[sy, sx] = np.float32(v - moved)
-                        arr2d[ty, tx] = np.float32(np.clip(np.rint(arr2d[ty, tx]), 0, None) + moved)
+                    if nm in split_set and kind != "categorical":
+                        if kind == "counts":
+                            v = int(np.clip(np.rint(arr2d[sy, sx]), 0, None))
+                            moved = int(v * split_fraction)
+                            if moved < 0:
+                                moved = 0
+                            if moved > v:
+                                moved = v
+                            arr2d[sy, sx] = np.float32(v - moved)
+                            arr2d[ty, tx] = np.float32(moved)
+                        else:
+                            v = float(arr2d[sy, sx])
+                            moved = v * split_fraction
+                            arr2d[sy, sx] = np.float32(v - moved)
+                            arr2d[ty, tx] = np.float32(moved)
                     else:
-                        v = float(arr2d[sy, sx])
-                        moved = v * split_fraction
-                        arr2d[sy, sx] = np.float32(v - moved)
-                        arr2d[ty, tx] = np.float32(float(arr2d[ty, tx]) + moved)
+                        arr2d[ty, tx] = arr2d[sy, sx]
                     updated[nm] = arr2d
 
             for nm, arr2d in updated.items():
@@ -1246,6 +1554,7 @@ def apply_layer_ops_inplace(
             dirty_layers.add(cell_layer)
             if div_success:
                 step_events["divisions"] = int(step_events.get("divisions", 0) + int(div_success))
+                _inc_op_event(step_name or step_key, int(div_success))
             applied += 1
             if profile_layer_ops and profile_step_names_requested:
                 _step_prof_add(step_key, "total_s", time.perf_counter() - t0_step)
@@ -1302,6 +1611,12 @@ def apply_layer_ops_inplace(
                     f"Step #{i}: transport per_pair_rate must be in [0, 1] (got {per_pair_rate!r})"
                 )
 
+            transport_mode = str(step.get("transport_mode") or step.get("mode") or "").strip().lower()
+            det_flag = step.get("deterministic")
+            use_stochastic = bool(step.get("stochastic") or step.get("hypergeometric") or transport_mode in ("stochastic", "hypergeometric"))
+            if det_flag is not None:
+                use_stochastic = not bool(det_flag)
+
             seed = step.get("seed")
             rng_transport = rng
             if seed is not None:
@@ -1309,6 +1624,44 @@ def apply_layer_ops_inplace(
                     rng_transport = np.random.default_rng(int(seed) + seed_offset_i + 1000003 * i)
                 except Exception as e:
                     raise ValueError(f"Step #{i}: transport invalid seed {seed!r}: {e}") from e
+
+            idx_u32 = None
+            det_seed_u32_base = np.uint32(0)
+            if not use_stochastic:
+                idx_u32 = np.arange(int(H * W), dtype=np.uint32).reshape(H, W)
+                det_seed_raw = seed
+                if det_seed_raw is None:
+                    det_seed_raw = base_seed_raw
+                det_seed_i = 0
+                if det_seed_raw is not None and str(det_seed_raw).strip() != "":
+                    try:
+                        det_seed_i = int(det_seed_raw)
+                    except Exception:
+                        det_seed_i = 0
+                det_seed_u32_base = np.uint32(det_seed_i + seed_offset_i + 1000003 * i)
+
+            capN_buf = None
+            capS_buf = None
+            capE_buf = None
+            capW_buf = None
+            inflow_buf = None
+            C_buf = None
+            rem_cap_buf = None
+            rem_move_buf = None
+            ratio_f_buf = None
+            out_f_buf = None
+            if opt_transport_buffers:
+                capN_buf = np.zeros((H, W), dtype=np.int64)
+                capS_buf = np.zeros((H, W), dtype=np.int64)
+                capE_buf = np.zeros((H, W), dtype=np.int64)
+                capW_buf = np.zeros((H, W), dtype=np.int64)
+                inflow_buf = np.zeros((H, W), dtype=np.int64)
+                C_buf = np.zeros((H, W), dtype=np.int64)
+                rem_cap_buf = np.zeros((H, W), dtype=np.int64)
+                rem_move_buf = np.zeros((H, W), dtype=np.int64)
+                if not use_stochastic:
+                    ratio_f_buf = np.zeros((H, W), dtype=np.float32)
+                    out_f_buf = np.zeros((H, W), dtype=np.float32)
 
             t_setup_done = time.perf_counter() if (profile_layer_ops and profile_step_names_requested) else 0.0
             if profile_layer_ops and profile_step_names_requested:
@@ -1327,10 +1680,15 @@ def apply_layer_ops_inplace(
                 if molecule_prefix and mol_name.startswith(molecule_prefix):
                     suffix = mol_name[len(molecule_prefix) :]
 
-                capN = np.zeros((H, W), dtype=np.int64)
-                capS = np.zeros((H, W), dtype=np.int64)
-                capE = np.zeros((H, W), dtype=np.int64)
-                capW = np.zeros((H, W), dtype=np.int64)
+                capN = capN_buf if capN_buf is not None else np.zeros((H, W), dtype=np.int64)
+                capS = capS_buf if capS_buf is not None else np.zeros((H, W), dtype=np.int64)
+                capE = capE_buf if capE_buf is not None else np.zeros((H, W), dtype=np.int64)
+                capW = capW_buf if capW_buf is not None else np.zeros((H, W), dtype=np.int64)
+                if capN_buf is not None:
+                    capN.fill(0)
+                    capS.fill(0)
+                    capE.fill(0)
+                    capW.fill(0)
 
                 if "north" in dirs:
                     e = _counts2d_or_zeros(f"{protein_prefix}north_exporter_{suffix}")
@@ -1343,6 +1701,7 @@ def apply_layer_ops_inplace(
                         src_slice_x=slice(0, W),
                         dst_slice_y=slice(0, H - 1),
                         dst_slice_x=slice(0, W),
+                        out=capN,
                     )
                 if "south" in dirs:
                     e = _counts2d_or_zeros(f"{protein_prefix}south_exporter_{suffix}")
@@ -1355,6 +1714,7 @@ def apply_layer_ops_inplace(
                         src_slice_x=slice(0, W),
                         dst_slice_y=slice(1, H),
                         dst_slice_x=slice(0, W),
+                        out=capS,
                     )
                 if "east" in dirs:
                     e = _counts2d_or_zeros(f"{protein_prefix}east_exporter_{suffix}")
@@ -1367,6 +1727,7 @@ def apply_layer_ops_inplace(
                         src_slice_x=slice(0, W - 1),
                         dst_slice_y=slice(0, H),
                         dst_slice_x=slice(1, W),
+                        out=capE,
                     )
                 if "west" in dirs:
                     e = _counts2d_or_zeros(f"{protein_prefix}west_exporter_{suffix}")
@@ -1379,31 +1740,107 @@ def apply_layer_ops_inplace(
                         src_slice_x=slice(1, W),
                         dst_slice_y=slice(0, H),
                         dst_slice_x=slice(0, W - 1),
+                        out=capW,
                     )
 
                 if per_pair_rate < 1.0:
-                    capN = rng_transport.binomial(capN, per_pair_rate).astype(np.int64)
-                    capS = rng_transport.binomial(capS, per_pair_rate).astype(np.int64)
-                    capE = rng_transport.binomial(capE, per_pair_rate).astype(np.int64)
-                    capW = rng_transport.binomial(capW, per_pair_rate).astype(np.int64)
+                    if use_stochastic:
+                        capN = rng_transport.binomial(capN, per_pair_rate).astype(np.int64)
+                        capS = rng_transport.binomial(capS, per_pair_rate).astype(np.int64)
+                        capE = rng_transport.binomial(capE, per_pair_rate).astype(np.int64)
+                        capW = rng_transport.binomial(capW, per_pair_rate).astype(np.int64)
+                    else:
+                        mh = np.uint32(zlib.crc32(str(mol_name).encode("utf-8")) & 0xFFFFFFFF)
+                        sR0 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0x243F6A88))
+                        sR1 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0x85A308D3))
+                        sR2 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0x13198A2E))
+                        sR3 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0x03707344))
+                        uR0 = _hash_u01_2d(idx_u32, sR0)
+                        uR1 = _hash_u01_2d(idx_u32, sR1)
+                        uR2 = _hash_u01_2d(idx_u32, sR2)
+                        uR3 = _hash_u01_2d(idx_u32, sR3)
+
+                        capN = np.floor(capN.astype(np.float32) * np.float32(per_pair_rate) + uR0).astype(np.int64)
+                        capS = np.floor(capS.astype(np.float32) * np.float32(per_pair_rate) + uR1).astype(np.int64)
+                        capE = np.floor(capE.astype(np.float32) * np.float32(per_pair_rate) + uR2).astype(np.int64)
+                        capW = np.floor(capW.astype(np.float32) * np.float32(per_pair_rate) + uR3).astype(np.int64)
 
                 m_old = np.clip(np.rint(layers[mol_name].reshape(H, W)), 0, None).astype(np.int64)
 
-                C = capN + capS + capE + capW
+                C = C_buf if C_buf is not None else (capN + capS + capE + capW)
+                if C_buf is not None:
+                    np.add(capN, capS, out=C)
+                    np.add(C, capE, out=C)
+                    np.add(C, capW, out=C)
+
                 n_move = np.minimum(m_old, C)
 
-                outN = rng_transport.hypergeometric(capN, C - capN, n_move).astype(np.int64)
-                rem_move = n_move - outN
-                rem_cap = C - capN
+                if use_stochastic:
+                    outN = rng_transport.hypergeometric(capN, C - capN, n_move).astype(np.int64)
+                    rem_move = n_move - outN
+                    rem_cap = C - capN
 
-                outS = rng_transport.hypergeometric(capS, rem_cap - capS, rem_move).astype(np.int64)
-                rem_move = rem_move - outS
-                rem_cap = rem_cap - capS
+                    outS = rng_transport.hypergeometric(capS, rem_cap - capS, rem_move).astype(np.int64)
+                    rem_move = rem_move - outS
+                    rem_cap = rem_cap - capS
 
-                outE = rng_transport.hypergeometric(capE, rem_cap - capE, rem_move).astype(np.int64)
-                outW = (rem_move - outE).astype(np.int64)
+                    outE = rng_transport.hypergeometric(capE, rem_cap - capE, rem_move).astype(np.int64)
+                    outW = (rem_move - outE).astype(np.int64)
+                else:
+                    mh = np.uint32(zlib.crc32(str(mol_name).encode("utf-8")) & 0xFFFFFFFF)
+                    s0 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0xA341316C))
+                    s1 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0xC8013EA4))
+                    s2 = np.uint32(det_seed_u32_base ^ mh ^ np.uint32(0xAD90777D))
+                    u0 = _hash_u01_2d(idx_u32, s0)
+                    u1 = _hash_u01_2d(idx_u32, s1)
+                    u2 = _hash_u01_2d(idx_u32, s2)
 
-                inflow = np.zeros((H, W), dtype=np.int64)
+                    ratio_f = ratio_f_buf if ratio_f_buf is not None else np.zeros((H, W), dtype=np.float32)
+                    out_f = out_f_buf if out_f_buf is not None else np.zeros((H, W), dtype=np.float32)
+
+                    ratio_f.fill(np.float32(0.0))
+                    np.divide(capN, C, out=ratio_f, where=C > 0)
+                    np.multiply(n_move, ratio_f, out=out_f)
+                    np.add(out_f, u0, out=out_f)
+                    outN = np.floor(out_f).astype(np.int64)
+                    maxN = np.minimum(capN, n_move)
+                    minN = np.maximum(np.int64(0), n_move - (C - capN))
+                    np.maximum(outN, minN, out=outN)
+                    np.minimum(outN, maxN, out=outN)
+
+                    rem_move = rem_move_buf if rem_move_buf is not None else (n_move - outN)
+                    if rem_move_buf is not None:
+                        np.subtract(n_move, outN, out=rem_move)
+                    rem_cap = rem_cap_buf if rem_cap_buf is not None else (C - capN)
+                    if rem_cap_buf is not None:
+                        np.subtract(C, capN, out=rem_cap)
+
+                    ratio_f.fill(np.float32(0.0))
+                    np.divide(capS, rem_cap, out=ratio_f, where=rem_cap > 0)
+                    np.multiply(rem_move, ratio_f, out=out_f)
+                    np.add(out_f, u1, out=out_f)
+                    outS = np.floor(out_f).astype(np.int64)
+                    maxS = np.minimum(capS, rem_move)
+                    minS = np.maximum(np.int64(0), rem_move - (rem_cap - capS))
+                    np.maximum(outS, minS, out=outS)
+                    np.minimum(outS, maxS, out=outS)
+                    np.subtract(rem_move, outS, out=rem_move)
+                    np.subtract(rem_cap, capS, out=rem_cap)
+
+                    ratio_f.fill(np.float32(0.0))
+                    np.divide(capE, rem_cap, out=ratio_f, where=rem_cap > 0)
+                    np.multiply(rem_move, ratio_f, out=out_f)
+                    np.add(out_f, u2, out=out_f)
+                    outE = np.floor(out_f).astype(np.int64)
+                    maxE = np.minimum(capE, rem_move)
+                    minE = np.maximum(np.int64(0), rem_move - (rem_cap - capE))
+                    np.maximum(outE, minE, out=outE)
+                    np.minimum(outE, maxE, out=outE)
+                    outW = (rem_move - outE).astype(np.int64)
+
+                inflow = inflow_buf if inflow_buf is not None else np.zeros((H, W), dtype=np.int64)
+                if inflow_buf is not None:
+                    inflow.fill(0)
                 inflow[1:, :] += outS[0 : H - 1, :]
                 inflow[0 : H - 1, :] += outN[1:, :]
                 inflow[:, 1:] += outE[:, 0 : W - 1]
@@ -1636,7 +2073,7 @@ def apply_layer_ops_inplace(
 
         if step_type not in ("op", "let"):
             raise ValueError(
-                f"Step #{i}: invalid type {step_type!r} (expected 'op', 'let', 'transport', 'diffusion', 'divide_cells', or 'pathway')"
+                f"Step #{i}: invalid type {step_type!r} (expected 'op', 'let', 'transport', 'diffusion', 'divide_cells', 'pathway', or 'pulse_on_transition')"
             )
 
         expr = str(step.get("expr") or "").strip()
@@ -1802,6 +2239,7 @@ def apply_layer_ops_inplace(
                     step_name = str(step.get("name") or "").strip()
                     deaths = int(((old_i == 1) & (out_i == 0)).sum())
                     if deaths:
+                        _inc_op_event(step_name or step_key, deaths)
                         if step_name == "atp_starvation_death":
                             step_events["starvation_deaths"] = int(step_events.get("starvation_deaths", 0) + deaths)
                         elif step_name == "cell_death":
@@ -1870,6 +2308,25 @@ def apply_layer_ops_inplace(
     _inc_total("starvation_deaths", step_events.get("starvation_deaths", 0))
     _inc_total("damage_deaths", step_events.get("damage_deaths", 0))
     _inc_total("divisions", step_events.get("divisions", 0))
+
+    event_counters["op_last"] = {k: int(v) for k, v in op_events.items()}
+    op_totals = event_counters.get("op_totals")
+    if not isinstance(op_totals, dict):
+        op_totals = {}
+        event_counters["op_totals"] = op_totals
+    for k, v in op_events.items():
+        try:
+            dv_i = int(v)
+        except Exception:
+            dv_i = 0
+        if dv_i == 0:
+            continue
+        cur = op_totals.get(k, 0)
+        try:
+            cur_i = int(cur)
+        except Exception:
+            cur_i = 0
+        op_totals[k] = int(cur_i + dv_i)
 
     return applied
 

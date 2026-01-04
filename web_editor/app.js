@@ -85,6 +85,9 @@ const ui = {
   fnInsertLayerBtn: $("fnInsertLayerBtn"),
   fnInsertFn: $("fnInsertFn"),
   fnInsertFnBtn: $("fnInsertFnBtn"),
+  fnInsertOpEventMode: $("fnInsertOpEventMode"),
+  fnInsertOpEvent: $("fnInsertOpEvent"),
+  fnInsertOpEventBtn: $("fnInsertOpEventBtn"),
   fnAddRowBtn: $("fnAddRowBtn"),
   fnSpecsTable: $("fnSpecsTable"),
 
@@ -98,6 +101,7 @@ const ui = {
   opsAddTransportBtn: $("opsAddTransportBtn"),
   opsAddDiffusionBtn: $("opsAddDiffusionBtn"),
   opsAddDivisionBtn: $("opsAddDivisionBtn"),
+  opsAddPulseBtn: $("opsAddPulseBtn"),
   opsAddPathwayBtn: $("opsAddPathwayBtn"),
   opsResetBtn: $("opsResetBtn"),
   opsTestBtn: $("opsTestBtn"),
@@ -159,9 +163,31 @@ const ui = {
   rtHistMaskOp: $("rtHistMaskOp"),
   rtHistMaskValue: $("rtHistMaskValue"),
   rtHistCanvas: $("rtHistCanvas"),
+  rtTrajInfo: $("rtTrajInfo"),
+  rtTrajAddLayer: $("rtTrajAddLayer"),
+  rtTrajAddLayerBtn: $("rtTrajAddLayerBtn"),
+  rtTrajWindow: $("rtTrajWindow"),
+  rtTrajNormalize: $("rtTrajNormalize"),
+  rtTrajLog: $("rtTrajLog"),
+  rtTrajClearBtn: $("rtTrajClearBtn"),
+  rtTrajCanvas: $("rtTrajCanvas"),
+  rtTrajList: $("rtTrajList"),
   rtVizCols: $("rtVizCols"),
   rtHeatMaskEnabled: $("rtHeatMaskEnabled"),
   rtVizGrid: $("rtVizGrid"),
+
+  profTicks: $("profTicks"),
+  profWarmup: $("profWarmup"),
+  profRepeats: $("profRepeats"),
+  profEstimate: $("profEstimate"),
+  profBreakdown: $("profBreakdown"),
+  profRunBtn: $("profRunBtn"),
+  profStatus: $("profStatus"),
+  profSummary: $("profSummary"),
+  profNote: $("profNote"),
+  profLayerOpsTable: $("profLayerOpsTable"),
+  profMeasurementsTable: $("profMeasurementsTable"),
+  profLayerOpsByType: $("profLayerOpsByType"),
 
   evoBase: $("evoBase"),
   evoAlgo: $("evoAlgo"),
@@ -1164,6 +1190,15 @@ const rtMeasRows = new Map();
 let rtLastEvents = null;
 const rtEventRows = new Map();
 
+let rtTrajSelected = null;
+let rtTrajSelectedAtTick = 0;
+let rtTrajBirthTick = null;
+let rtTrajDeathTick = null;
+let rtTrajLastCellVal = null;
+const rtTrajSeries = new Map();
+const rtTrajRows = new Map();
+let rtTrajColorIdx = 0;
+
 let rtHistLayer = "";
 let rtHistBins = 60;
 let rtHistLogY = false;
@@ -1232,6 +1267,161 @@ function _evoSetStatus(s) {
   if (ui.evoStatus) ui.evoStatus.textContent = String(s || "");
 }
 
+function _profSetStatus(s) {
+  if (ui.profStatus) ui.profStatus.textContent = String(s || "");
+}
+
+function _profSetSummary(s) {
+  if (ui.profSummary) ui.profSummary.textContent = String(s || "");
+}
+
+function _profSetNote(s) {
+  if (ui.profNote) ui.profNote.textContent = String(s || "");
+}
+
+function _profClearOutputs() {
+  _profSetSummary("");
+  _profSetNote("");
+  if (ui.profLayerOpsTable) ui.profLayerOpsTable.innerHTML = "";
+  if (ui.profMeasurementsTable) ui.profMeasurementsTable.innerHTML = "";
+  if (ui.profLayerOpsByType) ui.profLayerOpsByType.textContent = "";
+}
+
+function _profRenderSimpleTable(containerEl, headers, rows) {
+  if (!containerEl) return;
+  const wrap = document.createElement("div");
+  wrap.className = "table";
+  const t = document.createElement("table");
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const h of headers) {
+    const th = document.createElement("th");
+    th.textContent = String(h);
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  t.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    for (const cell of row) {
+      const td = document.createElement("td");
+      td.textContent = String(cell);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  t.appendChild(tbody);
+  wrap.appendChild(t);
+  containerEl.innerHTML = "";
+  containerEl.appendChild(wrap);
+}
+
+function _profRenderLayerOpsSteps(steps) {
+  if (!ui.profLayerOpsTable) return;
+  const list = Array.isArray(steps) ? steps : [];
+  const top = list.slice(0, 40);
+  const rows = top.map((r) => {
+    const step = String(r?.step || "");
+    const calls = Number(r?.calls ?? 0);
+    const totalMs = Number(r?.total_ms ?? 0);
+    const msPerCall = Number(r?.ms_per_call ?? 0);
+    return [
+      step,
+      Number.isFinite(calls) ? String(Math.round(calls)) : "0",
+      Number.isFinite(totalMs) ? _stepsFmt(totalMs) : "–",
+      Number.isFinite(msPerCall) ? _stepsFmt(msPerCall) : "–",
+    ];
+  });
+  _profRenderSimpleTable(ui.profLayerOpsTable, ["Step", "Calls", "Total (ms)", "ms/call"], rows);
+}
+
+function _profRenderMeasurements(measRows) {
+  if (!ui.profMeasurementsTable) return;
+  const list = Array.isArray(measRows) ? measRows : [];
+  const top = list.slice(0, 40);
+  const rows = top.map((r) => {
+    const name = String(r?.name || "");
+    const totalMs = Number(r?.total_ms ?? 0);
+    return [name, Number.isFinite(totalMs) ? _stepsFmt(totalMs) : "–"];
+  });
+  _profRenderSimpleTable(ui.profMeasurementsTable, ["Measurement", "Total (ms)"], rows);
+}
+
+function _profRenderLayerOpsByType(byTypeMs) {
+  if (!ui.profLayerOpsByType) return;
+  const bt = byTypeMs && typeof byTypeMs === "object" ? byTypeMs : {};
+  const entries = Object.entries(bt)
+    .filter(([k, v]) => typeof k === "string" && k && typeof v === "number" && Number.isFinite(v))
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
+  ui.profLayerOpsByType.textContent = entries.map(([k, v]) => `${k}: ${_stepsFmt(v)} ms`).join("   ");
+}
+
+let profRunning = false;
+
+function _profTicksValue() {
+  const v = Number(ui.profTicks?.value);
+  if (!Number.isFinite(v)) return 50;
+  return Math.max(1, Math.floor(v));
+}
+
+function _profWarmupValue() {
+  const v = Number(ui.profWarmup?.value);
+  if (!Number.isFinite(v)) return 5;
+  return Math.max(0, Math.floor(v));
+}
+
+function _profRepeatsValue() {
+  const v = Number(ui.profRepeats?.value);
+  if (!Number.isFinite(v)) return 1;
+  return Math.max(1, Math.floor(v));
+}
+
+async function _profRun() {
+  if (profRunning) return;
+  profRunning = true;
+  try {
+    _profSetStatus("Running…");
+    _profClearOutputs();
+    const txt = serializeState(state);
+    const payload = JSON.parse(txt);
+    const ticks = _profTicksValue();
+    const warmup = _profWarmupValue();
+    const repeats = _profRepeatsValue();
+    const estimate = !!ui.profEstimate?.checked;
+    const breakdown = !!ui.profBreakdown?.checked;
+
+    const out = await _rtPostJson("/api/profile/run", { payload, ticks, warmup, repeats, estimate, breakdown });
+
+    const parts = [];
+    if (out?.estimate && typeof out.estimate === "object") {
+      const ms = Number(out.estimate.ms_per_tick ?? NaN);
+      if (Number.isFinite(ms)) parts.push(`estimate ${_stepsFmt(ms)} ms/tick`);
+    }
+    if (out?.breakdown && typeof out.breakdown === "object") {
+      const ms = Number(out.breakdown.ms_per_tick ?? NaN);
+      if (Number.isFinite(ms)) parts.push(`breakdown ${_stepsFmt(ms)} ms/tick`);
+    }
+    _profSetSummary(parts.join("   "));
+    _profSetNote(String(out?.note || ""));
+
+    const b = out?.breakdown && typeof out.breakdown === "object" ? out.breakdown : null;
+    const lop = b?.layer_ops && typeof b.layer_ops === "object" ? b.layer_ops : null;
+    const meas = b?.measurements && typeof b.measurements === "object" ? b.measurements : null;
+
+    _profRenderLayerOpsSteps(lop?.steps);
+    _profRenderMeasurements(meas?.by_name);
+    _profRenderLayerOpsByType(lop?.by_type_ms);
+
+    _profSetStatus("Done");
+  } catch (e) {
+    _profSetStatus(String(e?.message || e));
+  } finally {
+    profRunning = false;
+  }
+}
+
 function _rtMeasWindowN() {
   const n = Math.floor(Number(ui.rtMeasWindow?.value ?? 300));
   if (!Number.isFinite(n)) return 300;
@@ -1247,6 +1437,253 @@ function _rtClearMeasurements() {
     const p = _stepsPrepPlotCanvas(ui.rtMeasCanvas, 900, 180);
     if (p) p.ctx.clearRect(0, 0, p.W, p.H);
   }
+}
+
+function _rtTrajWindowN() {
+  const n = Math.floor(Number(ui.rtTrajWindow?.value ?? 2000));
+  if (!Number.isFinite(n)) return 2000;
+  return Math.max(10, Math.min(200000, n));
+}
+
+function _rtTrajColor(i) {
+  const palette = ["#4caf50", "#2196f3", "#ff9800", "#e91e63", "#9c27b0", "#00bcd4", "#ffc107", "#8bc34a"];
+  return palette[i % palette.length];
+}
+
+function _rtTrajSetInfo() {
+  if (!ui.rtTrajInfo) return;
+  if (!rtTrajSelected) {
+    ui.rtTrajInfo.textContent = "Click the overlay to select a cell/pixel";
+    return;
+  }
+  const bt = rtTrajBirthTick == null ? "–" : String(rtTrajBirthTick);
+  const dt = rtTrajDeathTick == null ? "–" : String(rtTrajDeathTick);
+  ui.rtTrajInfo.textContent = `x=${rtTrajSelected.x} y=${rtTrajSelected.y}  selected@${rtTrajSelectedAtTick}  birth=${bt}  death=${dt}`;
+}
+
+function _rtTrajPopulateLayerSelect() {
+  if (!ui.rtTrajAddLayer) return;
+  ui.rtTrajAddLayer.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = "(select layer)";
+  ui.rtTrajAddLayer.appendChild(opt0);
+  if (!rtMeta || !Array.isArray(rtMeta.layers)) return;
+  for (const m of rtMeta.layers) {
+    const nm = String(m?.name || "");
+    if (!nm) continue;
+    const opt = document.createElement("option");
+    opt.value = nm;
+    opt.textContent = nm;
+    ui.rtTrajAddLayer.appendChild(opt);
+  }
+}
+
+function _rtTrajEnsureRow(name) {
+  if (!ui.rtTrajList) return null;
+  const key = String(name);
+  const existing = rtTrajRows.get(key);
+  if (existing) return existing;
+
+  const row = document.createElement("div");
+  row.className = "runtimeTrajRow";
+
+  const sw = document.createElement("div");
+  sw.className = "runtimeTrajSwatch";
+  row.appendChild(sw);
+
+  const nm = document.createElement("div");
+  nm.className = "runtimeTrajName";
+  nm.textContent = key;
+  row.appendChild(nm);
+
+  const val = document.createElement("div");
+  val.className = "runtimeTrajVal";
+  val.textContent = "–";
+  row.appendChild(val);
+
+  const del = document.createElement("button");
+  del.className = "btn btn--danger btn--tiny";
+  del.textContent = "Remove";
+  del.addEventListener("click", () => {
+    rtTrajSeries.delete(key);
+    rtTrajRows.delete(key);
+    row.remove();
+    _rtTrajRender();
+  });
+  row.appendChild(del);
+
+  ui.rtTrajList.appendChild(row);
+  const obj = { row, sw, nm, val };
+  rtTrajRows.set(key, obj);
+  return obj;
+}
+
+function _rtTrajAddSeries(name) {
+  const nm = String(name || "").trim();
+  if (!nm) return;
+  if (rtTrajSeries.has(nm)) return;
+  const color = _rtTrajColor(rtTrajColorIdx++);
+  rtTrajSeries.set(nm, { hist: [], ticks: [], color });
+  const row = _rtTrajEnsureRow(nm);
+  if (row) row.sw.style.background = color;
+  _rtTrajRender();
+}
+
+function _rtTrajTickToX(tick, t0, t1, padL, plotW) {
+  const denom = t1 - t0;
+  if (!Number.isFinite(tick)) return null;
+  if (denom <= 0) return padL;
+  const u = (tick - t0) / denom;
+  return padL + Math.max(0, Math.min(1, u)) * plotW;
+}
+
+function _rtTrajDrawPlot() {
+  if (!ui.rtTrajCanvas) return;
+  const p = _stepsPrepPlotCanvas(ui.rtTrajCanvas, 900, 240);
+  if (!p) return;
+  const { ctx, W, H } = p;
+  ctx.clearRect(0, 0, W, H);
+
+  const padL = 40;
+  const padR = 10;
+  const padT = 10;
+  const padB = 18;
+  const plotW = Math.max(10, W - padL - padR);
+  const plotH = Math.max(10, H - padT - padB);
+
+  ctx.strokeStyle = "rgba(255,255,255,.12)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.rect(padL, padT, plotW, plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.font = "11px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText("tick", padL + plotW - 22, padT + plotH + 14);
+
+  const normalize = !!ui.rtTrajNormalize?.checked;
+  const useLog = !!ui.rtTrajLog?.checked;
+
+  const all = [...rtTrajSeries.entries()];
+  if (!all.length) return;
+
+  let tMin = Infinity;
+  let tMax = -Infinity;
+  for (const [, s] of all) {
+    if (!s || !Array.isArray(s.ticks) || !s.ticks.length) continue;
+    tMin = Math.min(tMin, s.ticks[0]);
+    tMax = Math.max(tMax, s.ticks[s.ticks.length - 1]);
+  }
+  if (!Number.isFinite(tMin) || !Number.isFinite(tMax)) return;
+  if (tMax === tMin) tMax = tMin + 1;
+
+  function drawVLineAtTick(tick, color, dash) {
+    const x = _rtTrajTickToX(tick, tMin, tMax, padL, plotW);
+    if (x == null) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(Array.isArray(dash) ? dash : []);
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+    ctx.restore();
+  }
+  if (rtTrajBirthTick != null) drawVLineAtTick(rtTrajBirthTick, "rgba(50,215,75,.65)", [4, 4]);
+  if (rtTrajDeathTick != null) drawVLineAtTick(rtTrajDeathTick, "rgba(255,69,58,.65)", [4, 4]);
+
+  for (const [name, s] of all) {
+    const hist0 = s?.hist || [];
+    const ticks0 = s?.ticks || [];
+    if (!hist0.length || !ticks0.length || hist0.length !== ticks0.length) continue;
+
+    let mn = Infinity;
+    let mx = -Infinity;
+    for (let i = 0; i < hist0.length; i++) {
+      const raw = hist0[i];
+      const v = useLog ? Math.log1p(Math.max(0, raw)) : raw;
+      if (!Number.isFinite(v)) continue;
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+    if (!Number.isFinite(mn) || !Number.isFinite(mx)) continue;
+    if (mx === mn) {
+      mx = mn + 1e-6;
+    }
+    const denom = normalize ? (mx - mn === 0 ? 1e-6 : mx - mn) : 1;
+
+    ctx.strokeStyle = s.color || "#fff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < hist0.length; i++) {
+      const raw = hist0[i];
+      const v0 = useLog ? Math.log1p(Math.max(0, raw)) : raw;
+      if (!Number.isFinite(v0)) continue;
+      const t = normalize ? (v0 - mn) / denom : v0;
+      const u = normalize ? Math.max(0, Math.min(1, t)) : Math.max(0, Math.min(1, t));
+      const x = _rtTrajTickToX(ticks0[i], tMin, tMax, padL, plotW);
+      const y = padT + (1 - u) * plotH;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+}
+
+function _rtTrajRender() {
+  _rtTrajSetInfo();
+  _rtTrajDrawPlot();
+}
+
+function _rtTrajSampleFrame() {
+  if (!rtTrajSelected || !rtMeta) return;
+  const H = rtMeta.H;
+  const W = rtMeta.W;
+  const x = rtTrajSelected.x;
+  const y = rtTrajSelected.y;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const idx = y * W + x;
+
+  const cellArr = rtLastArrays.get("cell");
+  if (cellArr && cellArr.length === H * W) {
+    const v = cellArr[idx];
+    const alive = v !== 0;
+    if (rtTrajLastCellVal == null) {
+      rtTrajLastCellVal = v;
+      if (alive) rtTrajBirthTick = rtTick;
+    } else {
+      const wasAlive = rtTrajLastCellVal !== 0;
+      if (!wasAlive && alive) rtTrajBirthTick = rtTick;
+      if (wasAlive && !alive) rtTrajDeathTick = rtTick;
+      rtTrajLastCellVal = v;
+    }
+  }
+
+  const winN = _rtTrajWindowN();
+  for (const [name, s] of rtTrajSeries.entries()) {
+    const arr = rtLastArrays.get(name);
+    if (!arr || arr.length !== H * W) continue;
+    const raw = arr[idx];
+    const vv = typeof raw === "number" && Number.isFinite(raw) ? raw : NaN;
+    s.hist.push(vv);
+    s.ticks.push(rtTick);
+    while (s.hist.length > winN) {
+      s.hist.shift();
+      s.ticks.shift();
+    }
+    const row = rtTrajRows.get(name);
+    if (row) row.val.textContent = Number.isFinite(vv) ? _stepsFmt(vv) : "–";
+  }
+
+  _rtTrajRender();
 }
 
 function _rtMeasColor(i) {
@@ -1648,6 +2085,7 @@ function _rtGetRequestedLayerNames() {
   if (hl) out.add(hl);
   const hm = String(rtHistMaskLayer || "").trim();
   if (hm) out.add(hm);
+  for (const nm of rtTrajSeries.keys()) out.add(String(nm));
   if (rtMeta && rtMeta.layers && rtMeta.layers.some((m) => String(m?.name || "") === "cell")) out.add("cell");
   return [...out];
 }
@@ -2361,6 +2799,7 @@ function _rtApplyFrame(frame) {
   _rtRenderOverlay();
   _rtRenderHistogram();
   _rtRenderSurvival();
+  _rtTrajSampleFrame();
   if (!drawn) {
     _rtSetStatus(`tick=${rtTick}  drawn=0/${rtWatch.length} (no layer buffers drawn)`);
   } else if (firstDbg) {
@@ -2403,12 +2842,20 @@ async function _rtResetWithPayload(payloadObj, sourceLabel = "") {
   _rtClearMeasurements();
   _rtClearEvents();
   _rtClearSurvival();
+  rtTrajBirthTick = null;
+  rtTrajDeathTick = null;
+  rtTrajLastCellVal = null;
+  for (const s of rtTrajSeries.values()) {
+    s.hist = [];
+    s.ticks = [];
+  }
   rtTick = Number(res.tick || 0);
   rtLoaded = true;
   // File tracking is now unified - no separate runtime source tracking
   _rtPopulateLayerSelect();
   _rtPopulateHistLayerSelect();
   _rtPopulateHistMaskLayerSelect();
+  _rtTrajPopulateLayerSelect();
 
   const avail = new Set(rtMeta.layers.map((m) => String(m.name)));
 
@@ -2444,6 +2891,9 @@ async function _rtResetWithPayload(payloadObj, sourceLabel = "") {
   _rtRenderWatchList();
   _rtEnsureCanvasSizes();
   _rtSetStatus(`Ready. H=${rtMeta.H} W=${rtMeta.W}`);
+
+  _rtTrajSetInfo();
+  _rtTrajRender();
 
   try {
     await _rtCaptureBaseline();
@@ -2715,6 +3165,9 @@ function _evoDrawPlot(st) {
   const { ctx, W, H } = p;
   ctx.clearRect(0, 0, W, H);
 
+  const prog = st?.progress || {};
+  const totalGenerations = Math.max(0, Math.floor(Number(prog?.total_generations ?? 0)));
+
   const history = st?.history || {};
   const series = st?.series || {};
   const baseline = st?.baseline || {};
@@ -2748,6 +3201,10 @@ function _evoDrawPlot(st) {
     ctx.fillText("no evolution data yet", 10, 18);
     return;
   }
+
+  // Use a stable x-axis domain so the plot doesn't reflow/slide as generations accumulate.
+  // This keeps generation 0 (origin) consistently visible.
+  const xMaxGen = Math.max(1, (totalGenerations > 1 ? totalGenerations - 1 : 0), n - 1);
 
   let mn = Infinity;
   let mx = -Infinity;
@@ -2802,7 +3259,7 @@ function _evoDrawPlot(st) {
   ctx.fillText(_stepsFmt(mx), padL + 6, padT + 10);
   ctx.fillText(_stepsFmt(mn), padL + 6, padT + plotH);
   ctx.fillText("0", padL, padT + plotH + 16);
-  ctx.fillText(String(Math.max(0, n - 1)), padL + plotW - 18, padT + plotH + 16);
+  ctx.fillText(String(Math.max(0, xMaxGen)), padL + plotW - 18, padT + plotH + 16);
 
   function yOf(v) {
     const t = (Number(v) - mn) / (mx - mn);
@@ -2810,7 +3267,8 @@ function _evoDrawPlot(st) {
     return padT + (1 - u) * plotH;
   }
   function xOf(i) {
-    return padL + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+    const ii = Math.max(0, Math.min(xMaxGen, Number(i) || 0));
+    return padL + (xMaxGen <= 0 ? 0 : (ii / xMaxGen) * plotW);
   }
   function drawLine(arr, color, lw) {
     if (!arr || !arr.length) return;
@@ -2969,6 +3427,9 @@ function _evoDrawImprovementPlot(st) {
   const plotW = Math.max(1, W - padL - padR);
   const plotH = Math.max(1, H - padT - padB);
 
+  const prog = st?.progress || {};
+  const totalGenerations = Math.max(0, Math.floor(Number(prog?.total_generations ?? 0)));
+
   const history = st?.history || {};
   const bestRaw = Array.isArray(history?.best) ? history.best : [];
   if (!bestRaw || bestRaw.length < 2) {
@@ -3044,8 +3505,12 @@ function _evoDrawImprovementPlot(st) {
   mn -= pad;
   mx += pad;
 
-  function xOf(i, n) {
-    return padL + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+  // Match main plot: stable x-axis based on total_generations so origin doesn't drift.
+  const xMaxGen = Math.max(1, (totalGenerations > 1 ? totalGenerations - 1 : 0), best.length - 1);
+
+  function xOf(i) {
+    const ii = Math.max(0, Math.min(xMaxGen, Number(i) || 0));
+    return padL + (xMaxGen <= 0 ? 0 : (ii / xMaxGen) * plotW);
   }
   function yOf(v) {
     const t = (Number(v) - mn) / (mx - mn);
@@ -3080,7 +3545,7 @@ function _evoDrawImprovementPlot(st) {
     for (let i = 0; i < n; i++) {
       const v = Number(arr[i]);
       if (!Number.isFinite(v)) continue;
-      const x = xOf(i, n);
+      const x = xOf(i);
       const y = yOf(v);
       if (!started) {
         ctx.moveTo(x, y);
@@ -3528,14 +3993,26 @@ async function _docPost(path, bodyObj) {
 
 async function _docRefreshStatus() {
   try {
+    const prevServerDocPath = serverDocPath;
+    const prevCurrentFileName = currentFileName;
     const obj = await _rtGetJson("/api/doc/status");
     serverDocLoaded = !!obj?.loaded;
     serverDocPath = String(obj?.path || "");
     serverDocHasAutosave = !!obj?.has_autosave;
     if (!serverDocLoaded) {
-      currentFileName = "";
+      if (!prevCurrentFileName || prevCurrentFileName === prevServerDocPath || prevCurrentFileName === "(unsaved)") {
+        currentFileName = "";
+      }
     } else {
-      currentFileName = serverDocPath || "(unsaved)";
+      const docName = serverDocPath || "(unsaved)";
+      if (
+        !prevCurrentFileName ||
+        prevCurrentFileName === prevServerDocPath ||
+        prevCurrentFileName === "(unsaved)" ||
+        prevCurrentFileName === docName
+      ) {
+        currentFileName = docName;
+      }
       dirtySinceLastSave = !!obj?.dirty;
     }
     _updateCurrentFileInfo();
@@ -3563,13 +4040,23 @@ async function _docAutosaveNow() {
   _docAutosaveInFlight = true;
   const token = _docOpSerial;
   try {
+    const prevServerDocPath = serverDocPath;
+    const prevCurrentFileName = currentFileName;
     const payload_text = serializeState(state);
     const path = serverDocPath || "";
     const out = await _rtPostJson("/api/doc/autosave", { payload_text, path });
     if (_docIsStale(token)) return;
     serverDocLoaded = true;
     serverDocPath = String(out?.path || serverDocPath || "");
-    currentFileName = serverDocPath || "(unsaved)";
+    const docName = serverDocPath || "(unsaved)";
+    if (
+      !prevCurrentFileName ||
+      prevCurrentFileName === prevServerDocPath ||
+      prevCurrentFileName === "(unsaved)" ||
+      prevCurrentFileName === docName
+    ) {
+      currentFileName = docName;
+    }
     serverDocHasAutosave = true;
     _updateCurrentFileInfo();
   } catch {
@@ -3917,6 +4404,8 @@ function buildLayerOpsConfigJson() {
                   ? "diffusion"
                   : rawType === "divide_cells"
                     ? "divide_cells"
+                    : rawType === "pulse_on_transition"
+                      ? "pulse_on_transition"
                     : "op";
         if (type === "foreach") {
           return {
@@ -3973,6 +4462,16 @@ function buildLayerOpsConfigJson() {
                 .map((p) => String(p || "").trim())
                 .filter((p) => p)
             : null;
+          const excludeLayers = Array.isArray(x.exclude_layers)
+            ? x.exclude_layers
+                .map((p) => String(p || "").trim())
+                .filter((p) => p)
+            : typeof x.exclude_layers === "string"
+              ? String(x.exclude_layers || "")
+                  .split(",")
+                  .map((p) => String(p || "").trim())
+                  .filter((p) => p)
+              : null;
           return {
             type,
             name: String(x.name || "").trim(),
@@ -3986,8 +4485,38 @@ function buildLayerOpsConfigJson() {
             split_fraction: x.split_fraction == null || String(x.split_fraction).trim() === "" ? 0.5 : Number(x.split_fraction),
             max_radius: maxRadius,
             layer_prefixes: layerPrefixes && layerPrefixes.length ? layerPrefixes : ["molecule", "protein", "rna", "damage", "gene"],
+            exclude_layers: excludeLayers && excludeLayers.length ? excludeLayers : undefined,
             seed: seed,
           };
+        }
+        if (type === "pulse_on_transition") {
+          const src = String(x.source_layer ?? "cell").trim();
+          const tgt = String(x.target_layer ?? "replacement_factor").trim();
+          const fx = x.from_value == null || String(x.from_value).trim() === "" ? null : Math.floor(Number(x.from_value));
+          const tx = x.to_value == null || String(x.to_value).trim() === "" ? null : Math.floor(Number(x.to_value));
+          const expr = String(x.value_expr || "").trim();
+          const vraw = x.target_value == null || String(x.target_value).trim() === "" ? null : Number(x.target_value);
+          const out = {
+            type,
+            name: String(x.name || "").trim(),
+            group: String(x.group || "").trim(),
+            enabled: x.enabled !== false,
+            source_layer: src || "cell",
+            from_value: fx == null ? 1 : fx,
+            to_value: tx == null ? 0 : tx,
+            target_layer: tgt || "replacement_factor",
+          };
+          if (expr) out.value_expr = expr;
+          else out.target_value = vraw == null ? 100 : vraw;
+
+          if (x.pulse_cond_enabled) {
+            out.value_mode = "cond";
+            out.cond_layer = String(x.pulse_cond_layer || "").trim();
+            out.cond_value = x.pulse_cond_value == null ? 0 : Math.floor(Number(x.pulse_cond_value));
+            out.cond_true = String(x.pulse_cond_true || "").trim();
+            out.cond_false = String(x.pulse_cond_false || "").trim();
+          }
+          return out;
         }
         if (rawType === "pathway") {
           const seed = x.seed == null || String(x.seed).trim() === "" ? null : Math.floor(Number(x.seed));
@@ -4022,6 +4551,7 @@ function buildLayerOpsConfigJson() {
         if (x.type === "diffusion") return !!x.molecules && (x.rate != null || x.rate_layer);
         if (x.type === "divide_cells") return !!x.cell_layer && !!x.trigger_layer;
         if (x.type === "pathway") return !!x.pathway_name && Array.isArray(x.inputs) && x.inputs.length > 0;
+        if (x.type === "pulse_on_transition") return !!x.source_layer && !!x.target_layer;
         return x.expr && (x.type === "let" ? x.var : x.target);
       }),
   };
@@ -4052,7 +4582,7 @@ function _parseLayerOpsConfigObject(o) {
       .filter((x) => x && typeof x === "object")
       .map((x) => {
         const rawType = String(x.type || "op").trim();
-        const knownTypes = ["let", "foreach", "transport", "diffusion", "divide_cells", "pathway"];
+        const knownTypes = ["let", "foreach", "transport", "diffusion", "divide_cells", "pathway", "pulse_on_transition"];
         const type = knownTypes.includes(rawType) ? rawType : "op";
         if (type === "foreach") {
           const steps = Array.isArray(x.steps) ? x.steps : [];
@@ -4105,6 +4635,17 @@ function _parseLayerOpsConfigObject(o) {
                 .map((p) => String(p || "").trim())
                 .filter((p) => p)
             : null;
+          const excludeRaw = x.exclude_layers ?? x.excluded_layers;
+          const excludeLayers = Array.isArray(excludeRaw)
+            ? excludeRaw
+                .map((p) => String(p || "").trim())
+                .filter((p) => p)
+            : typeof excludeRaw === "string"
+              ? String(excludeRaw || "")
+                  .split(",")
+                  .map((p) => String(p || "").trim())
+                  .filter((p) => p)
+              : null;
           return {
             type,
             name: String(x.name || "").trim(),
@@ -4118,6 +4659,7 @@ function _parseLayerOpsConfigObject(o) {
             split_fraction: x.split_fraction == null ? 0.5 : Number(x.split_fraction),
             max_radius: x.max_radius == null ? null : Math.floor(Number(x.max_radius)),
             layer_prefixes: layerPrefixes && layerPrefixes.length ? layerPrefixes : ["molecule", "protein", "rna", "damage", "gene"],
+            exclude_layers: excludeLayers && excludeLayers.length ? excludeLayers : undefined,
             seed: x.seed == null ? null : Math.floor(Number(x.seed)),
           };
         }
@@ -4137,6 +4679,28 @@ function _parseLayerOpsConfigObject(o) {
             seed: x.seed == null ? null : Math.floor(Number(x.seed)),
           };
         }
+        if (type === "pulse_on_transition") {
+          const modeRaw = String(x.value_mode || "").trim().toLowerCase();
+          const condLayer = String(x.cond_layer || "").trim();
+          const condMode = modeRaw === "cond" || !!condLayer;
+          return {
+            type,
+            name: String(x.name || "").trim(),
+            group: String(x.group || "").trim(),
+            enabled: x.enabled !== false,
+            source_layer: String(x.source_layer ?? "cell"),
+            from_value: x.from_value == null ? 1 : Math.floor(Number(x.from_value)),
+            to_value: x.to_value == null ? 0 : Math.floor(Number(x.to_value)),
+            target_layer: String(x.target_layer ?? "replacement_factor"),
+            target_value: x.target_value == null ? 100 : Number(x.target_value),
+            value_expr: typeof x.value_expr === "string" ? String(x.value_expr || "") : "",
+            pulse_cond_enabled: condMode,
+            pulse_cond_layer: condLayer,
+            pulse_cond_value: x.cond_value == null ? 0 : Math.floor(Number(x.cond_value)),
+            pulse_cond_true: typeof x.cond_true === "string" ? String(x.cond_true || "") : "",
+            pulse_cond_false: typeof x.cond_false === "string" ? String(x.cond_false || "") : "",
+          };
+        }
         const base = {
           type,
           name: String(x.name || "").trim(),
@@ -4153,6 +4717,7 @@ function _parseLayerOpsConfigObject(o) {
         if (x.type === "diffusion") return !!x.molecules;
         if (x.type === "divide_cells") return !!x.cell_layer && !!x.trigger_layer;
         if (x.type === "pathway") return !!x.pathway_name && Array.isArray(x.inputs) && x.inputs.length > 0;
+        if (x.type === "pulse_on_transition") return !!x.source_layer && !!x.target_layer;
         return x.expr && (x.type === "let" ? x.var : x.target);
       });
     return next;
@@ -4220,6 +4785,47 @@ if (ui.opsDupGroupBtn) {
   });
 }
 
+ if (ui.opsAddPulseBtn) {
+  ui.opsAddPulseBtn.addEventListener("click", () => {
+    const layerList = Array.isArray(state?.layers) ? state.layers : [];
+    const defaultSrc = layerList.some((l) => l?.name === "cell") ? "cell" : layerList[0]?.name || "cell";
+    let targetLayer = layerList.some((l) => l?.name === "replacement_factor") ? "replacement_factor" : "";
+    if (!targetLayer) {
+      try {
+        addLayer(state, {
+          name: "replacement_factor",
+          kind: "continuous",
+          init: "zeros",
+          value: 0,
+          seed: 0,
+          color: "#EF4444",
+        });
+        targetLayer = "replacement_factor";
+      } catch (e) {
+        targetLayer = layerList[0]?.name || "replacement_factor";
+      }
+    }
+
+    _opsInsertAtFocused({
+      type: "pulse_on_transition",
+      enabled: true,
+      name: "",
+      group: "",
+      source_layer: defaultSrc,
+      from_value: 1,
+      to_value: 0,
+      target_layer: targetLayer,
+      target_value: 100,
+      value_expr: "",
+    });
+    saveFunctionsCfg();
+    markDirty();
+    saveToLocalStorage();
+    renderLayerOpsTable();
+    syncLayerSelect();
+  });
+ }
+
 if (ui.opsAddDivisionBtn) {
   ui.opsAddDivisionBtn.addEventListener("click", () => {
     const layerList = Array.isArray(state?.layers) ? state.layers : [];
@@ -4237,6 +4843,7 @@ if (ui.opsAddDivisionBtn) {
       threshold: 50,
       split_fraction: 0.5,
       max_radius: null,
+      exclude_layers: [],
       layer_prefixes: ["molecule", "protein", "rna", "damage", "gene"],
       seed: 0,
     });
@@ -4304,6 +4911,8 @@ function validateLayerOpStep(step, knownVars) {
             ? "diffusion"
             : rawType === "divide_cells"
               ? "divide_cells"
+              : rawType === "pulse_on_transition"
+                ? "pulse_on_transition"
               : "op";
 
   if (type === "foreach") {
@@ -4367,6 +4976,50 @@ function validateLayerOpStep(step, knownVars) {
     return { ok: true, text: "OK" };
   }
 
+  if (type === "pulse_on_transition") {
+    const src = String(step?.source_layer || "cell").trim();
+    if (!src) return { ok: false, text: "pulse_on_transition: Missing source_layer" };
+    const metaSrc = layerList.find((l) => l.name === src);
+    if (!metaSrc) return { ok: false, text: `pulse_on_transition: Unknown source_layer: ${src}` };
+
+    const tgt = String(step?.target_layer || "").trim();
+    if (!tgt) return { ok: false, text: "pulse_on_transition: Missing target_layer" };
+    const metaTgt = layerList.find((l) => l.name === tgt);
+    if (!metaTgt) return { ok: false, text: `pulse_on_transition: Unknown target_layer: ${tgt}` };
+
+    const fv = Number(step?.from_value);
+    if (!Number.isFinite(fv)) return { ok: false, text: "pulse_on_transition: from_value must be a number" };
+    const tv = Number(step?.to_value);
+    if (!Number.isFinite(tv)) return { ok: false, text: "pulse_on_transition: to_value must be a number" };
+
+    const ve = String(step?.value_expr || "").trim();
+    if (ve) {
+      const bal = _checkBalancedDelimiters(ve);
+      if (bal) return { ok: false, text: `pulse_on_transition: ${bal}` };
+      if (_hasDisallowedAttributeAccess(ve)) return { ok: false, text: "pulse_on_transition: Attribute access not allowed" };
+      if (_hasDisallowedKeywordArgsOrAssignment(ve)) return { ok: false, text: "pulse_on_transition: Keyword args / assignment not allowed" };
+      const ar = _checkAllowedFuncArity(ve);
+      if (ar) return { ok: false, text: `pulse_on_transition: ${ar}` };
+
+      const ids = _tokenizeIdentifiers(ve);
+      const layerSet = new Set(layerList.map((l) => l.name));
+      const unknown = [];
+      for (const id of ids) {
+        if (OPS_ALLOWED_FUNCS.has(id)) continue;
+        if (id === "True" || id === "False") continue;
+        if (layerSet.has(id)) continue;
+        if (knownVars.has(id)) continue;
+        unknown.push(id);
+      }
+      if (unknown.length) return { ok: false, text: `pulse_on_transition: Unknown (${unknown.length}): ${unknown.join(", ")}` };
+    } else {
+      const v = Number(step?.target_value ?? 100);
+      if (!Number.isFinite(v)) return { ok: false, text: "pulse_on_transition: target_value must be a number" };
+    }
+
+    return { ok: true, text: "OK" };
+  }
+
   if (type === "divide_cells") {
     const cellLayer = String(step?.cell_layer || "cell").trim();
     if (!cellLayer) return { ok: false, text: "divide_cells: Missing cell_layer" };
@@ -4393,6 +5046,11 @@ function validateLayerOpStep(step, knownVars) {
       if (!Number.isFinite(r) || r < 1) return { ok: false, text: "divide_cells: max_radius must be >= 1" };
     }
 
+    if (step?.max_divisions != null && String(step.max_divisions).trim() !== "") {
+      const md = Number(step.max_divisions);
+      if (!Number.isFinite(md) || md < 0) return { ok: false, text: "divide_cells: max_divisions must be >= 0" };
+    }
+
     if (step?.seed != null && String(step.seed).trim() !== "") {
       const s = Number(step.seed);
       if (!Number.isFinite(s)) return { ok: false, text: "divide_cells: seed must be a number" };
@@ -4401,6 +5059,21 @@ function validateLayerOpStep(step, knownVars) {
     const lp = step?.layer_prefixes;
     if (lp != null && !(Array.isArray(lp) && lp.every((x) => String(x || "").trim().length > 0))) {
       return { ok: false, text: "divide_cells: layer_prefixes must be an array of non-empty strings" };
+    }
+
+    const ex = step?.exclude_layers ?? step?.excluded_layers;
+    if (ex != null) {
+      if (!(Array.isArray(ex) && ex.every((x) => String(x || "").trim().length > 0))) {
+        return { ok: false, text: "divide_cells: exclude_layers must be an array of non-empty strings" };
+      }
+      const layerSet = new Set(layerList.map((l) => l.name));
+      const unknown = [];
+      for (const nm of ex) {
+        const s = String(nm || "").trim();
+        if (!s) continue;
+        if (!layerSet.has(s)) unknown.push(s);
+      }
+      if (unknown.length) return { ok: false, text: `divide_cells: exclude_layers unknown: ${unknown.join(", ")}` };
     }
 
     return { ok: true, text: "OK" };
@@ -4722,6 +5395,10 @@ const FN_ALLOWED_FUNCS = new Set([
   "median",
   "quantile",
   "count",
+  "event_last",
+  "event_total",
+  "op_last",
+  "op_total",
 ]);
 
 function validateMeasurementExpr(expr) {
@@ -5704,13 +6381,14 @@ function renderLayerOpsTable() {
     }
 
     const tr = document.createElement("tr");
-    
+
     // Track focus on this row
     const rowIndex = i;
     tr.addEventListener("focusin", () => {
       opsLastFocusedRowIndex = rowIndex;
     });
 
+    // Track focus on this row
     const tdOn = document.createElement("td");
     const on = document.createElement("input");
     on.type = "checkbox";
@@ -5727,26 +6405,24 @@ function renderLayerOpsTable() {
     const tdType = document.createElement("td");
     const typeSel = document.createElement("select");
     typeSel.className = "input input--tiny";
-    for (const k of ["op", "let", "foreach", "transport", "diffusion", "divide_cells", "pathway"]) {
+    for (const k of ["op", "let", "foreach", "transport", "diffusion", "divide_cells", "pulse_on_transition", "pathway"]) {
       const opt = document.createElement("option");
       opt.value = k;
-      opt.textContent = k === "divide_cells" ? "divide" : k;
+      opt.textContent = k === "divide_cells" ? "divide" : k === "pulse_on_transition" ? "pulse" : k;
       typeSel.appendChild(opt);
     }
+
     typeSel.value =
-      op.type === "let"
-        ? "let"
-        : op.type === "foreach"
-          ? "foreach"
-          : op.type === "transport"
-            ? "transport"
-            : op.type === "diffusion"
-              ? "diffusion"
-              : op.type === "divide_cells"
-                ? "divide_cells"
-                : op.type === "pathway"
-                  ? "pathway"
-                : "op";
+      op.type === "let" ||
+      op.type === "foreach" ||
+      op.type === "transport" ||
+      op.type === "diffusion" ||
+      op.type === "divide_cells" ||
+      op.type === "pulse_on_transition" ||
+      op.type === "pathway"
+        ? op.type
+        : "op";
+
     typeSel.addEventListener("change", () => {
       const nextType =
         typeSel.value === "let"
@@ -5759,154 +6435,126 @@ function renderLayerOpsTable() {
                 ? "diffusion"
                 : typeSel.value === "divide_cells"
                   ? "divide_cells"
-                  : typeSel.value === "pathway"
-                    ? "pathway"
-                : "op";
-      layerOps[i].type = nextType;
+                  : typeSel.value === "pulse_on_transition"
+                    ? "pulse_on_transition"
+                    : typeSel.value === "pathway"
+                      ? "pathway"
+                      : "op";
+
+      const keepEnabled = layerOps[i]?.enabled !== false;
+      const keepName = String(layerOps[i]?.name || "");
+      const keepGroup = String(layerOps[i]?.group || "");
+      const defaultLayer = layerList[0]?.name || "layer";
+
       if (nextType === "op") {
-        delete layerOps[i].molecules;
-        delete layerOps[i].molecule_prefix;
-        delete layerOps[i].protein_prefix;
-        delete layerOps[i].cell_layer;
-        delete layerOps[i].cell_mode;
-        delete layerOps[i].cell_value;
-        delete layerOps[i].dirs;
-        delete layerOps[i].per_pair_rate;
-        delete layerOps[i].seed;
-        delete layerOps[i].rate;
-        delete layerOps[i].rate_layer;
-        layerOps[i].target = String(layerOps[i].target || layerList[0]?.name || "layer").trim();
-        delete layerOps[i].var;
-        delete layerOps[i].match;
-        delete layerOps[i].steps;
-        delete layerOps[i].stepsText;
+        const target = String(layerOps[i]?.target || defaultLayer).trim() || defaultLayer;
+        layerOps[i] = { type: "op", enabled: keepEnabled, name: keepName, group: keepGroup, target, expr: target };
       } else if (nextType === "let") {
-        delete layerOps[i].molecules;
-        delete layerOps[i].molecule_prefix;
-        delete layerOps[i].protein_prefix;
-        delete layerOps[i].cell_layer;
-        delete layerOps[i].cell_mode;
-        delete layerOps[i].cell_value;
-        delete layerOps[i].dirs;
-        delete layerOps[i].per_pair_rate;
-        delete layerOps[i].seed;
-        delete layerOps[i].rate;
-        delete layerOps[i].rate_layer;
-        layerOps[i].var = String(layerOps[i].var || "tmp").trim() || "tmp";
-        delete layerOps[i].target;
-        delete layerOps[i].match;
-        delete layerOps[i].steps;
-        delete layerOps[i].stepsText;
-        delete layerOps[i].require_match;
+        layerOps[i] = { type: "let", enabled: keepEnabled, name: keepName, group: keepGroup, var: "tmp", expr: "0" };
+      } else if (nextType === "foreach") {
+        const stepsText = 'for (i in "gene_*") {\n  {i} <- {i}\n}';
+        const layerNames = state?.layers ? state.layers.map((l) => l.name) : [];
+        const c = _compileForEachR(stepsText, layerNames);
+        layerOps[i] = {
+          type: "foreach",
+          enabled: keepEnabled,
+          name: keepName,
+          group: keepGroup,
+          match: c.ok ? c.match : "gene_*",
+          require_match: false,
+          steps: c.ok ? c.steps : [],
+          stepsText,
+        };
+      } else if (nextType === "transport") {
+        const cellLayer = layerList.some((l) => l?.name === "cell") ? "cell" : defaultLayer;
+        layerOps[i] = {
+          type: "transport",
+          enabled: keepEnabled,
+          name: keepName,
+          group: keepGroup,
+          molecules: "molecule_*",
+          molecule_prefix: "molecule_",
+          protein_prefix: "protein_",
+          cell_layer: cellLayer,
+          cell_mode: "eq",
+          cell_value: 1,
+          dirs: ["north", "south", "east", "west"],
+          per_pair_rate: 1.0,
+          seed: 0,
+        };
+      } else if (nextType === "diffusion") {
+        const cellLayer = layerList.some((l) => l?.name === "cell") ? "cell" : defaultLayer;
+        layerOps[i] = {
+          type: "diffusion",
+          enabled: keepEnabled,
+          name: keepName,
+          group: keepGroup,
+          molecules: "molecule_*",
+          cell_layer: cellLayer,
+          cell_mode: "eq",
+          cell_value: 1,
+          rate: 0.2,
+          rate_layer: null,
+          seed: 0,
+        };
+      } else if (nextType === "divide_cells") {
+        const cellLayer = layerList.some((l) => l?.name === "cell") ? "cell" : defaultLayer;
+        const triggerLayer = layerList.some((l) => l?.name === "protein_divider") ? "protein_divider" : defaultLayer;
+        layerOps[i] = {
+          type: "divide_cells",
+          enabled: keepEnabled,
+          name: keepName,
+          group: keepGroup,
+          cell_layer: cellLayer,
+          cell_value: 1,
+          empty_value: 0,
+          trigger_layer: triggerLayer,
+          threshold: 50,
+          split_fraction: 0.5,
+          max_radius: null,
+          exclude_layers: [],
+          layer_prefixes: ["molecule", "protein", "rna", "damage", "gene"],
+          seed: 0,
+        };
+      } else if (nextType === "pulse_on_transition") {
+        const sourceLayer = layerList.some((l) => l?.name === "cell") ? "cell" : defaultLayer;
+        const targetLayer = layerList.some((l) => l?.name === "replacement_factor") ? "replacement_factor" : defaultLayer;
+        layerOps[i] = {
+          type: "pulse_on_transition",
+          enabled: keepEnabled,
+          name: keepName,
+          group: keepGroup,
+          source_layer: sourceLayer,
+          from_value: 1,
+          to_value: 0,
+          target_layer: targetLayer,
+          target_value: 100,
+          value_expr: "",
+        };
       } else {
-        if (nextType === "foreach") {
-          delete layerOps[i].molecules;
-          delete layerOps[i].molecule_prefix;
-          delete layerOps[i].protein_prefix;
-          delete layerOps[i].cell_layer;
-          delete layerOps[i].cell_mode;
-          delete layerOps[i].cell_value;
-          delete layerOps[i].dirs;
-          delete layerOps[i].per_pair_rate;
-          delete layerOps[i].seed;
-          delete layerOps[i].rate;
-          delete layerOps[i].rate_layer;
-          layerOps[i].match = String(layerOps[i].match || "gene_*").trim();
-          layerOps[i].require_match = !!layerOps[i].require_match;
-          if (!String(layerOps[i].stepsText || "").trim()) {
-            layerOps[i].stepsText = 'for (i in "gene_*") {\n  {i} <- {i}\n}';
-          }
-          const layerNames = state?.layers ? state.layers.map((l) => l.name) : [];
-          const c = _compileForEachR(layerOps[i].stepsText, layerNames);
-          if (c.ok) {
-            layerOps[i].match = c.match;
-            layerOps[i].steps = c.steps;
-          } else {
-            layerOps[i].steps = [];
-          }
-          delete layerOps[i].target;
-          delete layerOps[i].var;
-          delete layerOps[i].expr;
-        } else {
-          if (nextType === "transport") {
-            delete layerOps[i].target;
-            delete layerOps[i].var;
-            delete layerOps[i].expr;
-            delete layerOps[i].match;
-            delete layerOps[i].steps;
-            delete layerOps[i].stepsText;
-            delete layerOps[i].require_match;
-            layerOps[i].molecules = String(layerOps[i].molecules || "molecule_*").trim() || "molecule_*";
-            layerOps[i].molecule_prefix = String(layerOps[i].molecule_prefix ?? "molecule_");
-            layerOps[i].protein_prefix = String(layerOps[i].protein_prefix ?? "protein_");
-            layerOps[i].cell_layer = String(layerOps[i].cell_layer || "cell").trim() || "cell";
-            layerOps[i].cell_mode = "eq";
-            layerOps[i].cell_value = Number(layerOps[i].cell_value ?? 1);
-            layerOps[i].dirs = Array.isArray(layerOps[i].dirs) && layerOps[i].dirs.length ? layerOps[i].dirs : ["north", "south", "east", "west"];
-            layerOps[i].per_pair_rate = Number(layerOps[i].per_pair_rate ?? 1.0);
-            layerOps[i].seed = layerOps[i].seed == null ? 0 : Math.floor(Number(layerOps[i].seed));
-            delete layerOps[i].rate;
-            delete layerOps[i].rate_layer;
-          } else if (nextType === "diffusion") {
-            delete layerOps[i].target;
-            delete layerOps[i].var;
-            delete layerOps[i].expr;
-            delete layerOps[i].match;
-            delete layerOps[i].steps;
-            delete layerOps[i].stepsText;
-            delete layerOps[i].require_match;
-            delete layerOps[i].molecule_prefix;
-            delete layerOps[i].protein_prefix;
-            delete layerOps[i].dirs;
-            delete layerOps[i].per_pair_rate;
-            layerOps[i].molecules = String(layerOps[i].molecules || "molecule_*").trim() || "molecule_*";
-            layerOps[i].cell_layer = String(layerOps[i].cell_layer || "cell").trim() || "cell";
-            layerOps[i].cell_mode = "eq";
-            layerOps[i].cell_value = Number(layerOps[i].cell_value ?? 1);
-            layerOps[i].rate = layerOps[i].rate == null ? 0.2 : Number(layerOps[i].rate);
-            layerOps[i].rate_layer = layerOps[i].rate_layer == null ? null : String(layerOps[i].rate_layer || "").trim() || null;
-            layerOps[i].seed = layerOps[i].seed == null ? 0 : Math.floor(Number(layerOps[i].seed));
-          } else if (nextType === "divide_cells") {
-            delete layerOps[i].target;
-            delete layerOps[i].var;
-            delete layerOps[i].expr;
-            delete layerOps[i].match;
-            delete layerOps[i].steps;
-            delete layerOps[i].stepsText;
-            delete layerOps[i].require_match;
-            delete layerOps[i].molecules;
-            delete layerOps[i].molecule_prefix;
-            delete layerOps[i].protein_prefix;
-            delete layerOps[i].dirs;
-            delete layerOps[i].per_pair_rate;
-            delete layerOps[i].rate;
-            delete layerOps[i].rate_layer;
-            layerOps[i].cell_layer = String(layerOps[i].cell_layer || "cell").trim() || "cell";
-            layerOps[i].cell_value = Number(layerOps[i].cell_value ?? 1);
-            layerOps[i].empty_value = Number(layerOps[i].empty_value ?? 0);
-            layerOps[i].trigger_layer = String(layerOps[i].trigger_layer || "protein_divider").trim() || "protein_divider";
-            layerOps[i].threshold = layerOps[i].threshold == null ? 50 : Number(layerOps[i].threshold);
-            layerOps[i].split_fraction = layerOps[i].split_fraction == null ? 0.5 : Number(layerOps[i].split_fraction);
-            layerOps[i].max_radius = layerOps[i].max_radius == null ? null : Math.floor(Number(layerOps[i].max_radius));
-            if (!Array.isArray(layerOps[i].layer_prefixes) || !layerOps[i].layer_prefixes.length) {
-              layerOps[i].layer_prefixes = ["molecule", "protein", "rna", "damage", "gene"];
-            }
-            layerOps[i].seed = layerOps[i].seed == null ? 0 : Math.floor(Number(layerOps[i].seed));
-          } else {
-            layerOps[i].target = String(layerOps[i].target || layerList[0]?.name || "layer").trim();
-            delete layerOps[i].var;
-            delete layerOps[i].match;
-            delete layerOps[i].steps;
-            delete layerOps[i].stepsText;
-            delete layerOps[i].require_match;
-          }
-        }
+        layerOps[i] = {
+          type: "pathway",
+          enabled: keepEnabled,
+          name: keepName,
+          group: keepGroup,
+          pathway_name: "pathway",
+          inputs: [],
+          outputs: [],
+          num_enzymes: 3,
+          cell_layer: layerList.some((l) => l?.name === "cell") ? "cell" : defaultLayer,
+          cell_value: 1,
+          efficiency: 1.0,
+          seed: 0,
+        };
       }
+
       saveFunctionsCfg();
       markDirty();
       saveToLocalStorage();
       renderLayerOpsTable();
+      syncLayerSelect();
     });
+
     tdType.appendChild(typeSel);
 
     const tdName = document.createElement("td");
@@ -5944,6 +6592,7 @@ function renderLayerOpsTable() {
     const isTransport = op.type === "transport";
     const isDiffusion = op.type === "diffusion";
     const isDivide = op.type === "divide_cells";
+    const isPulse = op.type === "pulse_on_transition";
     const isPathway = op.type === "pathway";
     const varInput = document.createElement("input");
     varInput.className = "input input--tiny";
@@ -6036,6 +6685,11 @@ function renderLayerOpsTable() {
       fx.className = "meta";
       fx.textContent = "cell division";
       tdTarget.appendChild(fx);
+    } else if (isPulse) {
+      const fx = document.createElement("div");
+      fx.className = "meta";
+      fx.textContent = "transition pulse";
+      tdTarget.appendChild(fx);
     } else if (isPathway) {
       const fx = document.createElement("div");
       fx.className = "meta";
@@ -6052,8 +6706,8 @@ function renderLayerOpsTable() {
     }
 
     const tdExpr = document.createElement("td");
-    const expr = isTransport || isDiffusion || isDivide || isPathway ? null : document.createElement("textarea");
-    if (!(isTransport || isDiffusion || isDivide || isPathway)) {
+    const expr = isTransport || isDiffusion || isDivide || isPulse || isPathway ? null : document.createElement("textarea");
+    if (!(isTransport || isDiffusion || isDivide || isPulse || isPathway)) {
       expr.className = "input input--tiny input--formula";
       expr.value = op.type === "foreach" ? String(op.stepsText || "") : String(op.expr || "");
       expr.placeholder =
@@ -6394,6 +7048,24 @@ function renderLayerOpsTable() {
       });
       form.appendChild(mkField("Max radius", maxRad));
 
+      const maxDiv = document.createElement("input");
+      maxDiv.className = "input input--tiny";
+      maxDiv.type = "number";
+      maxDiv.step = "1";
+      maxDiv.min = "0";
+      maxDiv.placeholder = "(auto)";
+      maxDiv.value = op.max_divisions == null ? "" : String(op.max_divisions);
+      maxDiv.title = "Caps the number of divisions attempted per tick (prevents long stalls when many cells trigger at once). Blank = auto.";
+      maxDiv.addEventListener("input", () => {
+        const v = String(maxDiv.value || "").trim();
+        layerOps[i].max_divisions = v ? Math.floor(Number(v)) : null;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Max divisions", maxDiv));
+
       const prefixes = document.createElement("input");
       prefixes.className = "input input--tiny";
       prefixes.placeholder = "molecule, protein, rna, damage, gene";
@@ -6412,6 +7084,25 @@ function renderLayerOpsTable() {
       });
       form.appendChild(mkField("Layer prefixes", prefixes));
 
+      const excludeLayers = document.createElement("input");
+      excludeLayers.className = "input input--tiny";
+      excludeLayers.placeholder = "morphology, cell_stage";
+      excludeLayers.title = "Comma-separated list of layer names to NOT copy into the new daughter cell during division.";
+      excludeLayers.value = Array.isArray(op.exclude_layers) ? op.exclude_layers.join(", ") : "";
+      excludeLayers.addEventListener("input", () => {
+        const raw = String(excludeLayers.value || "");
+        const arr = raw
+          .split(",")
+          .map((s) => String(s || "").trim())
+          .filter((s) => s);
+        layerOps[i].exclude_layers = arr;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Exclude layers", excludeLayers));
+
       const seed = document.createElement("input");
       seed.className = "input input--tiny";
       seed.type = "number";
@@ -6427,6 +7118,270 @@ function renderLayerOpsTable() {
         updateStatus();
       });
       form.appendChild(mkField("Seed", seed));
+
+      tdExpr.appendChild(form);
+    } else if (isPulse) {
+      const form = document.createElement("div");
+      form.className = "opsTransport";
+
+      const hint = document.createElement("div");
+      hint.className = "opsTransportHint";
+      hint.textContent = "When a categorical layer changes from From → To in this tick, set a pulse value in a target layer at those pixels.";
+      form.appendChild(hint);
+
+      const mkField = (labelText, controlEl) => {
+        const row = document.createElement("div");
+        row.className = "opsTransportField";
+        const lab = document.createElement("div");
+        lab.className = "label";
+        lab.textContent = labelText;
+        row.appendChild(lab);
+        row.appendChild(controlEl);
+        return row;
+      };
+
+      const srcSel = document.createElement("select");
+      srcSel.className = "input input--tiny";
+      for (const l of layerList) {
+        const opt = document.createElement("option");
+        opt.value = l.name;
+        opt.textContent = l.name;
+        srcSel.appendChild(opt);
+      }
+      srcSel.value = String(op.source_layer || "cell");
+      srcSel.addEventListener("change", () => {
+        layerOps[i].source_layer = srcSel.value;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Source layer", srcSel));
+
+      const fromVal = document.createElement("input");
+      fromVal.className = "input input--tiny";
+      fromVal.type = "number";
+      fromVal.step = "1";
+      fromVal.value = String(op.from_value ?? 1);
+      fromVal.addEventListener("input", () => {
+        layerOps[i].from_value = Number(fromVal.value);
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("From value", fromVal));
+
+      const toVal = document.createElement("input");
+      toVal.className = "input input--tiny";
+      toVal.type = "number";
+      toVal.step = "1";
+      toVal.value = String(op.to_value ?? 0);
+      toVal.addEventListener("input", () => {
+        layerOps[i].to_value = Number(toVal.value);
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("To value", toVal));
+
+      const tgtSel = document.createElement("select");
+      tgtSel.className = "input input--tiny";
+      for (const l of layerList) {
+        const opt = document.createElement("option");
+        opt.value = l.name;
+        opt.textContent = l.name;
+        tgtSel.appendChild(opt);
+      }
+      tgtSel.value = String(op.target_layer || "replacement_factor");
+      tgtSel.addEventListener("change", () => {
+        layerOps[i].target_layer = tgtSel.value;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      form.appendChild(mkField("Target layer", tgtSel));
+
+      const valMode = document.createElement("select");
+      valMode.className = "input input--tiny";
+      const optConst = document.createElement("option");
+      optConst.value = "const";
+      optConst.textContent = "Constant";
+      valMode.appendChild(optConst);
+      const optExpr = document.createElement("option");
+      optExpr.value = "expr";
+      optExpr.textContent = "Expression";
+      valMode.appendChild(optExpr);
+      const optCond = document.createElement("option");
+      optCond.value = "cond";
+      optCond.textContent = "Conditional";
+      valMode.appendChild(optCond);
+
+      const constInput = document.createElement("input");
+      constInput.className = "input input--tiny";
+      constInput.type = "number";
+      constInput.step = "1";
+      constInput.value = String(op.target_value ?? 100);
+      constInput.addEventListener("input", () => {
+        layerOps[i].target_value = Number(constInput.value);
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+
+      const exprInput = document.createElement("textarea");
+      exprInput.className = "input input--tiny input--formula";
+      exprInput.spellcheck = false;
+      exprInput.placeholder = "e.g. 100 or clip(100*damage,0,100)";
+      exprInput.value = String(op.value_expr || "");
+      exprInput.addEventListener("focus", () => {
+        opsLastFocusedExprInput = exprInput;
+      });
+      exprInput.addEventListener("input", () => {
+        layerOps[i].value_expr = exprInput.value;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+
+      const condLayerSel = document.createElement("select");
+      condLayerSel.className = "input input--tiny";
+      for (const l of layerList) {
+        const opt = document.createElement("option");
+        opt.value = l.name;
+        opt.textContent = l.name;
+        condLayerSel.appendChild(opt);
+      }
+
+      const condValue = document.createElement("input");
+      condValue.className = "input input--tiny";
+      condValue.type = "number";
+      condValue.step = "1";
+
+      const trueExpr = document.createElement("input");
+      trueExpr.className = "input input--tiny";
+      trueExpr.placeholder = "Value if true (e.g. 100)";
+
+      const falseExpr = document.createElement("input");
+      falseExpr.className = "input input--tiny";
+      falseExpr.placeholder = "Value if false (e.g. 0 or target layer name)";
+
+      const buildConditionalExpr = () => {
+        const layer = String(layerOps[i].pulse_cond_layer || condLayerSel.value || "").trim();
+        const cvRaw = layerOps[i].pulse_cond_value;
+        const cv = Number.isFinite(Number(cvRaw)) ? String(Math.floor(Number(cvRaw))) : "0";
+        const t = String(layerOps[i].pulse_cond_true || "0").trim() || "0";
+        const f = String(layerOps[i].pulse_cond_false || "0").trim() || "0";
+        if (!layer) return "";
+        return `where(${layer}==${cv}, ${t}, ${f})`;
+      };
+
+      const syncConditionalStateToExpr = () => {
+        const ex = buildConditionalExpr();
+        if (!ex) return;
+        layerOps[i].value_expr = ex;
+        exprInput.value = ex;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      };
+
+      condLayerSel.addEventListener("change", () => {
+        layerOps[i].pulse_cond_layer = condLayerSel.value;
+        syncConditionalStateToExpr();
+      });
+      condValue.addEventListener("input", () => {
+        layerOps[i].pulse_cond_value = Number(condValue.value);
+        syncConditionalStateToExpr();
+      });
+      trueExpr.addEventListener("input", () => {
+        layerOps[i].pulse_cond_true = trueExpr.value;
+        syncConditionalStateToExpr();
+      });
+      falseExpr.addEventListener("input", () => {
+        layerOps[i].pulse_cond_false = falseExpr.value;
+        syncConditionalStateToExpr();
+      });
+
+      const condWrap = document.createElement("div");
+      condWrap.className = "opsTransport";
+      const condTop = document.createElement("div");
+      const condEq = document.createElement("div");
+      condEq.className = "meta";
+      condEq.style.alignSelf = "center";
+      condEq.textContent = "==";
+      condTop.className = "row row--inline";
+      condTop.style.gap = "6px";
+      condTop.appendChild(condLayerSel);
+      condTop.appendChild(condEq);
+      condTop.appendChild(condValue);
+      condWrap.appendChild(condTop);
+      const condVals = document.createElement("div");
+      condVals.className = "two two--equal";
+      condVals.appendChild(trueExpr);
+      condVals.appendChild(falseExpr);
+      condWrap.appendChild(condVals);
+
+      const valWrap = document.createElement("div");
+      valWrap.className = "two two--equal";
+      valWrap.appendChild(valMode);
+      const valSlot = document.createElement("div");
+      valWrap.appendChild(valSlot);
+
+      const syncMode = () => {
+        const haveExpr = String(layerOps[i].value_expr || "").trim().length > 0;
+        const wantCond = !!layerOps[i].pulse_cond_enabled;
+        valMode.value = wantCond ? "cond" : haveExpr ? "expr" : "const";
+        valSlot.innerHTML = "";
+        if (valMode.value === "cond") {
+          condLayerSel.value = String(layerOps[i].pulse_cond_layer || layerList[0]?.name || "");
+          condValue.value = String(layerOps[i].pulse_cond_value ?? 0);
+          trueExpr.value = String(layerOps[i].pulse_cond_true || String(layerOps[i].target_value ?? 100));
+          falseExpr.value = String(layerOps[i].pulse_cond_false || "0");
+          if (!String(layerOps[i].value_expr || "").trim()) syncConditionalStateToExpr();
+          valSlot.appendChild(condWrap);
+        } else if (valMode.value === "expr") {
+          valSlot.appendChild(exprInput);
+        } else {
+          valSlot.appendChild(constInput);
+        }
+      };
+      valMode.addEventListener("change", () => {
+        if (valMode.value === "cond") {
+          layerOps[i].pulse_cond_enabled = true;
+          if (!layerOps[i].pulse_cond_layer) layerOps[i].pulse_cond_layer = layerList[0]?.name || "";
+          if (layerOps[i].pulse_cond_value == null) layerOps[i].pulse_cond_value = 0;
+          if (layerOps[i].pulse_cond_true == null || String(layerOps[i].pulse_cond_true).trim() === "") {
+            layerOps[i].pulse_cond_true = String(layerOps[i].target_value ?? 100);
+          }
+          if (layerOps[i].pulse_cond_false == null || String(layerOps[i].pulse_cond_false).trim() === "") {
+            layerOps[i].pulse_cond_false = "0";
+          }
+          condLayerSel.value = String(layerOps[i].pulse_cond_layer || "");
+          condValue.value = String(layerOps[i].pulse_cond_value ?? 0);
+          trueExpr.value = String(layerOps[i].pulse_cond_true || "");
+          falseExpr.value = String(layerOps[i].pulse_cond_false || "");
+          syncConditionalStateToExpr();
+        } else if (valMode.value === "expr") {
+          layerOps[i].pulse_cond_enabled = false;
+          if (!String(layerOps[i].value_expr || "").trim()) layerOps[i].value_expr = "100";
+        } else {
+          layerOps[i].pulse_cond_enabled = false;
+          layerOps[i].value_expr = "";
+        }
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+        syncMode();
+      });
+      syncMode();
+      form.appendChild(mkField("Value", valWrap));
 
       tdExpr.appendChild(form);
     } else if (isPathway) {
@@ -6728,7 +7683,7 @@ function renderLayerOpsTable() {
     updateStatus();
     tdStatus.appendChild(st);
 
-    if (!(isTransport || isDiffusion || isDivide || isPathway) && expr) {
+    if (!(isTransport || isDiffusion || isDivide || isPulse || isPathway) && expr) {
       expr.addEventListener("input", () => {
         if (layerOps[i].type === "foreach") {
           layerOps[i].stepsText = expr.value;
@@ -8260,6 +9215,23 @@ function syncLayerSelect() {
       opt.textContent = f.value;
       ui.fnInsertFn.appendChild(opt);
     }
+  }
+
+  if (ui.fnInsertOpEvent) {
+    const names = layerOps
+      .filter((s) => s && s.enabled !== false)
+      .map((s) => String(s.name || "").trim())
+      .filter((nm) => nm);
+    const uniq = Array.from(new Set(names)).sort((a, b) => a.localeCompare(b));
+    const cur = String(ui.fnInsertOpEvent.value || "");
+    ui.fnInsertOpEvent.innerHTML = "";
+    for (const nm of uniq) {
+      const opt = document.createElement("option");
+      opt.value = nm;
+      opt.textContent = nm;
+      ui.fnInsertOpEvent.appendChild(opt);
+    }
+    if (uniq.includes(cur)) ui.fnInsertOpEvent.value = cur;
   }
 
   // Layer ops insert layer (includes let variables)
@@ -9945,6 +10917,12 @@ if (ui.evoStopBtn) {
   });
 }
 
+if (ui.profRunBtn) {
+  ui.profRunBtn.addEventListener("click", async () => {
+    await _profRun();
+  });
+}
+
 if (ui.evoTopList) {
   ui.evoTopList.addEventListener("click", async (e) => {
     const t = e?.target;
@@ -9988,6 +10966,80 @@ _rtInitVizCols();
 _rtInitHistogramControls();
 
 _rtInitSurvivalControls();
+
+if (ui.rtTrajAddLayerBtn) {
+  ui.rtTrajAddLayerBtn.addEventListener("click", async () => {
+    const nm = String(ui.rtTrajAddLayer?.value || "").trim();
+    if (!nm) return;
+    _rtTrajAddSeries(nm);
+    if (!rtLoaded) return;
+    try {
+      const layers = [nm, "cell"];
+      const frame = await _rtPostJson("/api/runtime/frame", { layers });
+      _rtApplyFrame(frame);
+    } catch (e) {
+      _rtSetStatus(String(e?.message || e));
+    }
+  });
+}
+
+for (const el of [ui.rtTrajWindow, ui.rtTrajNormalize, ui.rtTrajLog]) {
+  if (!el) continue;
+  el.addEventListener("input", () => _rtTrajRender());
+  el.addEventListener("change", () => _rtTrajRender());
+}
+
+if (ui.rtTrajClearBtn) {
+  ui.rtTrajClearBtn.addEventListener("click", async () => {
+    rtTrajBirthTick = null;
+    rtTrajDeathTick = null;
+    rtTrajLastCellVal = null;
+    for (const s of rtTrajSeries.values()) {
+      s.hist = [];
+      s.ticks = [];
+    }
+    _rtTrajSetInfo();
+    _rtTrajRender();
+
+    if (!rtLoaded) return;
+    try {
+      const frame = await _rtPostJson("/api/runtime/frame", { layers: _rtGetRequestedLayerNames() });
+      _rtApplyFrame(frame);
+    } catch (e) {
+      _rtSetStatus(String(e?.message || e));
+    }
+  });
+}
+
+_rtTrajSetInfo();
+_rtTrajRender();
+
+if (ui.rtOverlayCanvas) {
+  ui.rtOverlayCanvas.addEventListener("click", async (ev) => {
+    if (!rtMeta) return;
+    const r = ui.rtOverlayCanvas.getBoundingClientRect();
+    const px = ev.clientX - r.left;
+    const py = ev.clientY - r.top;
+    if (!r.width || !r.height) return;
+    const cw = ui.rtOverlayCanvas.width;
+    const ch = ui.rtOverlayCanvas.height;
+    if (cw <= 0 || ch <= 0) return;
+    const x = clamp(Math.floor((px / r.width) * rtMeta.W), 0, rtMeta.W - 1);
+    const y = clamp(Math.floor((py / r.height) * rtMeta.H), 0, rtMeta.H - 1);
+
+    rtTrajSelected = { x, y };
+    rtTrajSelectedAtTick = rtTick;
+    rtTrajBirthTick = null;
+    rtTrajDeathTick = null;
+    rtTrajLastCellVal = null;
+    for (const s of rtTrajSeries.values()) {
+      s.hist = [];
+      s.ticks = [];
+    }
+    _rtTrajSetInfo();
+    _rtTrajRender();
+  });
+}
 
 if (ui.rtVizCols) {
   ui.rtVizCols.addEventListener("change", () => {
@@ -10262,6 +11314,18 @@ if (ui.fnInsertFnBtn) {
   });
 }
 
+if (ui.fnInsertOpEventBtn) {
+  ui.fnInsertOpEventBtn.addEventListener("click", () => {
+    const mode = String(ui.fnInsertOpEventMode?.value || "op_total");
+    const opName = String(ui.fnInsertOpEvent?.value || "").trim();
+    const target = fnLastFocusedExprInput || ui.fnSpecsTable?.querySelector("textarea, input") || null;
+    if (!opName) return;
+    if (!target) return;
+    const fn = mode === "op_last" ? "op_last" : "op_total";
+    insertTextIntoInput(target, `${fn}("${opName.replaceAll("\\", "\\\\").replaceAll('"', "\\\"")}")`);
+  });
+}
+
 if (ui.opsInsertLayerBtn) {
   ui.opsInsertLayerBtn.addEventListener("click", () => {
     const layer = ui.opsInsertLayer?.value || "";
@@ -10504,7 +11568,7 @@ if (ui.pathwayModalCreate) {
             addLayer(state, {
               name: layerName,
               kind: "counts",
-              init: layerName.startsWith("gene_") ? "ones" : "zeros",
+              init: layerName.startsWith("gene_") ? "constant" : "zeros",
               value: layerName.startsWith("gene_") ? 1 : 0,
               seed: 0,
               color: layerName.startsWith("protein_") ? "#10B981" : 

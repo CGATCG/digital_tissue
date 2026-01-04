@@ -80,6 +80,42 @@ class TestCategoricalLayerOps(unittest.TestCase):
         out = np.rint(_read_layer(payload, "cell_type")).astype(int)
         self.assertTrue(set(np.unique(out)).issubset({0, 1, 3}))
 
+    def test_pulse_on_transition_sets_target_value(self):
+        H, W = 1, 3
+        cell = np.array([[1, 1, 1]], dtype=np.float32)
+        kill = np.array([[0, 1, 0]], dtype=np.float32)
+        rf = np.zeros((H, W), dtype=np.float32)
+
+        layers2d = {"cell": cell, "kill": kill, "replacement_factor": rf}
+        kinds = {"cell": "categorical", "kill": "continuous", "replacement_factor": "continuous"}
+        steps = [
+            {
+                "type": "op",
+                "target": "cell",
+                "expr": "where(kill>0, 0, cell)",
+                "allowed_values": [0, 1],
+            },
+            {
+                "type": "pulse_on_transition",
+                "source_layer": "cell",
+                "from_value": 1,
+                "to_value": 0,
+                "target_layer": "replacement_factor",
+                "target_value": 100,
+            },
+        ]
+
+        payload = _make_payload(H, W, layers2d, kinds, steps)
+        apply_layer_ops_inplace(payload)
+
+        cell_out = np.rint(_read_layer(payload, "cell")).astype(int)
+        self.assertEqual(cell_out[0, 1], 0)
+
+        rf_out = _read_layer(payload, "replacement_factor")
+        self.assertAlmostEqual(float(rf_out[0, 1]), 100.0, places=5)
+        self.assertAlmostEqual(float(rf_out[0, 0]), 0.0, places=5)
+        self.assertAlmostEqual(float(rf_out[0, 2]), 0.0, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

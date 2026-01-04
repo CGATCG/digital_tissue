@@ -39,6 +39,62 @@ def _read_layer(payload: dict, name: str) -> np.ndarray:
 
 
 class TestDivideCellsLayerOps(unittest.TestCase):
+    def test_divide_cells_exclude_layers_does_not_copy(self):
+        H, W = 3, 3
+        cell = np.array(
+            [
+                [2, 2, 2],
+                [2, 1, 0],
+                [2, 2, 2],
+            ],
+            dtype=np.float32,
+        )
+        divider = np.zeros((H, W), dtype=np.float32)
+        divider[1, 1] = 60
+
+        morphology = np.zeros((H, W), dtype=np.float32)
+        morphology[1, 1] = 7
+        morphology[1, 2] = 123
+
+        layers2d = {
+            "cell": cell,
+            "protein_divider": divider,
+            "morphology": morphology,
+        }
+        kinds = {
+            "cell": "categorical",
+            "protein_divider": "continuous",
+            "morphology": "categorical",
+        }
+
+        steps = [
+            {
+                "type": "divide_cells",
+                "cell_layer": "cell",
+                "cell_value": 1,
+                "empty_value": 0,
+                "trigger_layer": "protein_divider",
+                "threshold": 50,
+                "split_fraction": 0.5,
+                "max_radius": 10,
+                "layer_prefixes": ["molecule", "protein", "rna", "damage", "gene"],
+                "exclude_layers": ["morphology"],
+                "seed": 0,
+            }
+        ]
+
+        payload = _make_payload(H, W, layers2d, kinds, steps)
+        apply_layer_ops_inplace(payload)
+
+        cell_out = np.rint(_read_layer(payload, "cell")).astype(int)
+        self.assertEqual(cell_out[1, 1], 1)
+        self.assertEqual(cell_out[1, 2], 1)
+
+        morph_out = np.rint(_read_layer(payload, "morphology")).astype(int)
+        # Daughter cell at (1,2) should keep its existing value, not copy from parent.
+        self.assertEqual(morph_out[1, 1], 7)
+        self.assertEqual(morph_out[1, 2], 123)
+
     def test_divide_cells_splits_and_places_nearest_empty(self):
         H, W = 3, 3
         cell = np.array(
@@ -109,6 +165,115 @@ class TestDivideCellsLayerOps(unittest.TestCase):
         gene = np.rint(_read_layer(payload, "gene_y")).astype(int)
         self.assertEqual(gene[1, 1], 2)
         self.assertEqual(gene[1, 2], 1)
+
+    def test_divide_cells_prefers_morphology_empty(self):
+        H, W = 5, 5
+        cell = np.full((H, W), 2, dtype=np.float32)
+        cell[2, 2] = 1
+        cell[2, 3] = 0
+        cell[0, 0] = 0
+
+        morphology = np.zeros((H, W), dtype=np.float32)
+        morphology[0, 0] = 1
+
+        divider = np.zeros((H, W), dtype=np.float32)
+        divider[2, 2] = 60
+
+        molecule_x = np.zeros((H, W), dtype=np.float32)
+        molecule_x[2, 2] = 10
+
+        layers2d = {
+            "cell": cell,
+            "morphology": morphology,
+            "protein_divider": divider,
+            "molecule_x": molecule_x,
+        }
+        kinds = {
+            "cell": "categorical",
+            "morphology": "categorical",
+            "protein_divider": "continuous",
+            "molecule_x": "counts",
+        }
+
+        steps = [
+            {
+                "type": "divide_cells",
+                "cell_layer": "cell",
+                "cell_value": 1,
+                "empty_value": 0,
+                "trigger_layer": "protein_divider",
+                "threshold": 50,
+                "split_fraction": 0.5,
+                "max_radius": 10,
+                "layer_prefixes": ["molecule", "protein", "rna", "damage", "gene"],
+                "seed": 0,
+            }
+        ]
+
+        payload = _make_payload(H, W, layers2d, kinds, steps)
+        apply_layer_ops_inplace(payload)
+
+        cell_out = np.rint(_read_layer(payload, "cell")).astype(int)
+        self.assertEqual(cell_out[2, 2], 1)
+        self.assertEqual(cell_out[0, 0], 1)
+        self.assertEqual(cell_out[2, 3], 0)
+
+        mol = np.rint(_read_layer(payload, "molecule_x")).astype(int)
+        self.assertEqual(mol[2, 2], 5)
+        self.assertEqual(mol[0, 0], 5)
+
+    def test_divide_cells_falls_back_when_no_morphology_empty(self):
+        H, W = 3, 3
+        cell = np.array(
+            [
+                [2, 2, 2],
+                [2, 1, 0],
+                [2, 2, 2],
+            ],
+            dtype=np.float32,
+        )
+        morphology = np.zeros((H, W), dtype=np.float32)
+
+        divider = np.zeros((H, W), dtype=np.float32)
+        divider[1, 1] = 60
+
+        molecule_x = np.zeros((H, W), dtype=np.float32)
+        molecule_x[1, 1] = 10
+
+        layers2d = {
+            "cell": cell,
+            "morphology": morphology,
+            "protein_divider": divider,
+            "molecule_x": molecule_x,
+        }
+        kinds = {
+            "cell": "categorical",
+            "morphology": "categorical",
+            "protein_divider": "continuous",
+            "molecule_x": "counts",
+        }
+
+        steps = [
+            {
+                "type": "divide_cells",
+                "cell_layer": "cell",
+                "cell_value": 1,
+                "empty_value": 0,
+                "trigger_layer": "protein_divider",
+                "threshold": 50,
+                "split_fraction": 0.5,
+                "max_radius": 10,
+                "layer_prefixes": ["molecule", "protein", "rna", "damage", "gene"],
+                "seed": 0,
+            }
+        ]
+
+        payload = _make_payload(H, W, layers2d, kinds, steps)
+        apply_layer_ops_inplace(payload)
+
+        cell_out = np.rint(_read_layer(payload, "cell")).astype(int)
+        self.assertEqual(cell_out[1, 1], 1)
+        self.assertEqual(cell_out[1, 2], 1)
 
     def test_divide_cells_conflict_closest_wins(self):
         H, W = 3, 3

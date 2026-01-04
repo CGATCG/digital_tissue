@@ -211,7 +211,10 @@ def _compute_measurements_from_layers(payload: Dict[str, Any], layers: Dict[str,
     if not isinstance(measurements, list):
         return {}
 
-    ev = _ExprEval(layers=layers, H=H, W=W)
+    events = payload.get("event_counters") if isinstance(payload, dict) else None
+    if not isinstance(events, dict):
+        events = {}
+    ev = _ExprEval(layers=layers, H=H, W=W, events=events)
     out: Dict[str, Any] = {}
     for m in measurements:
         if not isinstance(m, dict):
@@ -246,7 +249,10 @@ def _compute_selected_measurements_from_layers(
     if not isinstance(measurements, list):
         return {}
 
-    ev = _ExprEval(layers=layers, H=H, W=W)
+    events = payload.get("event_counters") if isinstance(payload, dict) else None
+    if not isinstance(events, dict):
+        events = {}
+    ev = _ExprEval(layers=layers, H=H, W=W, events=events)
     out: Dict[str, Any] = {}
     for m in measurements:
         if not isinstance(m, dict):
@@ -261,6 +267,271 @@ def _compute_selected_measurements_from_layers(
             out[name] = ev.eval(expr)
         except Exception:
             out[name] = None
+    return out
+
+
+def _profile_measurements_eval(payload: Dict[str, Any], layers: Dict[str, Any], H: int, W: int) -> Dict[str, Any]:
+    cfg = payload.get("measurements_config")
+    if not isinstance(cfg, dict) or int(cfg.get("version") or 0) != 3:
+        return {"total_s": 0.0, "by_name_s": {}, "values": {}}
+    measurements = cfg.get("measurements")
+    if not isinstance(measurements, list):
+        return {"total_s": 0.0, "by_name_s": {}, "values": {}}
+
+    events = payload.get("event_counters") if isinstance(payload, dict) else None
+    if not isinstance(events, dict):
+        events = {}
+    ev = _ExprEval(layers=layers, H=H, W=W, events=events)
+    total_s = 0.0
+    by_name_s: Dict[str, float] = {}
+    values: Dict[str, Any] = {}
+    for m in measurements:
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("name") or "").strip()
+        expr = str(m.get("expr") or "").strip()
+        if not name or not expr:
+            continue
+        t0 = time.perf_counter()
+        try:
+            values[name] = ev.eval(expr)
+        except Exception:
+            values[name] = None
+        dt = time.perf_counter() - t0
+        total_s += float(dt)
+        by_name_s[name] = float(by_name_s.get(name) or 0.0) + float(dt)
+
+    return {"total_s": float(total_s), "by_name_s": by_name_s, "values": values}
+
+
+def _layers_dict_from_payload_data(payload: Dict[str, Any], expected_len: int) -> Dict[str, np.ndarray]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, np.ndarray] = {}
+    for nm, ent in data.items():
+        if not isinstance(nm, str) or not nm:
+            continue
+        if not isinstance(ent, dict) or ent.get("dtype") != "float32":
+            continue
+        arr = ent.get("arr")
+        if isinstance(arr, np.ndarray):
+            out[nm] = np.asarray(arr, dtype=np.float32).reshape(expected_len)
+            continue
+        b64 = ent.get("b64")
+        if isinstance(b64, str) and b64:
+            try:
+                out[nm] = _decode_float32_b64(b64, expected_len=expected_len, layer_name=nm)
+            except Exception:
+                continue
+    return out
+
+
+def _merge_num_fields(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    for k, v in src.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if isinstance(v, (int, float, np.floating)):
+            dst[k] = float(dst.get(k) or 0.0) + float(v)
+
+
+def _merge_step_perf(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    for step_key, ent in src.items():
+        if not isinstance(step_key, str) or not step_key:
+            continue
+        if not isinstance(ent, dict):
+            continue
+        cur = dst.get(step_key)
+        if not isinstance(cur, dict):
+            cur = {}
+            dst[step_key] = cur
+        for fk, fv in ent.items():
+            if fk == "calls":
+                try:
+                    cur["calls"] = int(cur.get("calls") or 0) + int(fv)
+                except Exception:
+                    cur["calls"] = int(cur.get("calls") or 0)
+                continue
+            if isinstance(fv, (int, float, np.floating)):
+                cur[fk] = float(cur.get(fk) or 0.0) + float(fv)
+
+
+def _profile_run_payload(
+    payload: Dict[str, Any],
+    ticks: int,
+    warmup: int,
+    repeats: int,
+    do_estimate: bool,
+    do_breakdown: bool,
+) -> Dict[str, Any]:
+    ticks_i = max(1, int(ticks))
+    warmup_i = max(0, int(warmup))
+    reps_i = max(1, int(repeats))
+
+    base = _deepcopy_payload(payload)
+
+    def _ensure_opts(p: Dict[str, Any]) -> None:
+        lop_cfg = p.get("layer_ops_config") if isinstance(p, dict) else None
+        if isinstance(lop_cfg, dict):
+            if "opt_env_cache" not in lop_cfg and "optimize_env_cache" not in lop_cfg:
+                lop_cfg["opt_env_cache"] = True
+            if "opt_expr_cache" not in lop_cfg and "optimize_expr_cache" not in lop_cfg:
+                lop_cfg["opt_expr_cache"] = True
+
+    def _warmup_run(p: Dict[str, Any], seed0: int) -> None:
+        p.pop("event_counters", None)
+        p.pop("_profile_layer_ops", None)
+        p.pop("_profile_step_names", None)
+        p.pop("_profile_expr", None)
+        p["_skip_b64_writeback"] = True
+        _ensure_opts(p)
+        for t in range(warmup_i):
+            apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "ticks": int(ticks_i),
+        "warmup": int(warmup_i),
+        "repeats": int(reps_i),
+    }
+
+    if do_estimate:
+        tick_total_s = 0.0
+        meas_total_s = 0.0
+        for ri in range(reps_i):
+            seed0 = 1337 + (ri * 1000003)
+            p = _deepcopy_payload(base)
+            _warmup_run(p, seed0)
+
+            t0 = time.perf_counter()
+            for t in range(ticks_i):
+                apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(warmup_i) + int(t))
+            tick_total_s += time.perf_counter() - t0
+
+            H = int(p.get("H") or 0)
+            W = int(p.get("W") or 0)
+            if H > 0 and W > 0:
+                layers_dict = _layers_dict_from_payload_data(p, expected_len=H * W)
+                mp = _profile_measurements_eval(p, layers_dict, H, W)
+                meas_total_s += float(mp.get("total_s") or 0.0)
+
+        denom = float(max(1, reps_i) * max(1, ticks_i))
+        out["estimate"] = {
+            "ticks_s": float(tick_total_s),
+            "ms_per_tick": float(tick_total_s) * 1000.0 / denom,
+            "measurements_s": float(meas_total_s),
+        }
+
+    if do_breakdown:
+        agg_lop_total_s = 0.0
+        agg_by_type_s: Dict[str, float] = {}
+        agg_expr_perf: Dict[str, Any] = {}
+        agg_step_perf: Dict[str, Any] = {}
+        agg_tick_s = 0.0
+
+        agg_meas_total_s = 0.0
+        agg_meas_by_name_s: Dict[str, float] = {}
+
+        for ri in range(reps_i):
+            seed0 = 4242 + (ri * 1000003)
+            p = _deepcopy_payload(base)
+            _warmup_run(p, seed0)
+
+            p["event_counters"] = {}
+            p["_profile_layer_ops"] = True
+            p["_profile_step_names"] = True
+            p["_profile_expr"] = True
+            p["_skip_b64_writeback"] = True
+            _ensure_opts(p)
+
+            tt0 = time.perf_counter()
+            for t in range(ticks_i):
+                apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(warmup_i) + int(t))
+            agg_tick_s += time.perf_counter() - tt0
+
+            ev = p.get("event_counters") if isinstance(p, dict) else None
+            lop = ev.get("layer_ops_perf") if isinstance(ev, dict) else None
+            if isinstance(lop, dict):
+                agg_lop_total_s += float(lop.get("total_s") or 0.0)
+                bt = lop.get("by_type_s")
+                if isinstance(bt, dict):
+                    _merge_num_fields(agg_by_type_s, bt)
+                ep = lop.get("expr_perf")
+                if isinstance(ep, dict):
+                    if not agg_expr_perf:
+                        agg_expr_perf = {"calls": 0}
+                    try:
+                        agg_expr_perf["calls"] = int(agg_expr_perf.get("calls") or 0) + int(ep.get("calls") or 0)
+                    except Exception:
+                        pass
+                    for k in ("env_s", "validate_s", "compile_s", "eval_s", "asarray_s", "writeback_s", "total_s"):
+                        agg_expr_perf[k] = float(agg_expr_perf.get(k) or 0.0) + float(ep.get(k) or 0.0)
+                sp = lop.get("step_perf")
+                if isinstance(sp, dict):
+                    _merge_step_perf(agg_step_perf, sp)
+
+            H = int(p.get("H") or 0)
+            W = int(p.get("W") or 0)
+            if H > 0 and W > 0:
+                layers_dict = _layers_dict_from_payload_data(p, expected_len=H * W)
+                mp = _profile_measurements_eval(p, layers_dict, H, W)
+                agg_meas_total_s += float(mp.get("total_s") or 0.0)
+                bnm = mp.get("by_name_s")
+                if isinstance(bnm, dict):
+                    _merge_num_fields(agg_meas_by_name_s, bnm)
+
+        step_rows = []
+        for step_key, ent in agg_step_perf.items():
+            if not isinstance(ent, dict):
+                continue
+            total_s = float(ent.get("total_s") or 0.0)
+            calls = int(ent.get("calls") or 0)
+            step_rows.append(
+                {
+                    "step": step_key,
+                    "calls": int(calls),
+                    "total_ms": float(total_s) * 1000.0,
+                    "ms_per_call": (float(total_s) * 1000.0 / float(calls)) if calls > 0 else 0.0,
+                }
+            )
+        step_rows.sort(key=lambda r: float(r.get("total_ms") or 0.0), reverse=True)
+
+        meas_rows = [
+            {"name": k, "total_ms": float(v) * 1000.0}
+            for k, v in agg_meas_by_name_s.items()
+            if isinstance(k, str) and k
+        ]
+        meas_rows.sort(key=lambda r: float(r.get("total_ms") or 0.0), reverse=True)
+
+        denom = float(max(1, reps_i) * max(1, ticks_i))
+        out["breakdown"] = {
+            "ticks_s": float(agg_tick_s),
+            "ms_per_tick": float(agg_tick_s) * 1000.0 / denom,
+            "layer_ops": {
+                "total_ms": float(agg_lop_total_s) * 1000.0,
+                "by_type_ms": {k: float(v) * 1000.0 for k, v in agg_by_type_s.items() if isinstance(k, str) and k},
+                "expr_perf_ms": {
+                    k: (float(agg_expr_perf.get(k) or 0.0) * 1000.0)
+                    for k in (
+                        "env_s",
+                        "validate_s",
+                        "compile_s",
+                        "eval_s",
+                        "asarray_s",
+                        "writeback_s",
+                        "total_s",
+                    )
+                },
+                "expr_calls": int(agg_expr_perf.get("calls") or 0),
+                "steps": step_rows,
+            },
+            "measurements": {
+                "total_ms": float(agg_meas_total_s) * 1000.0,
+                "by_name": meas_rows,
+            },
+        }
+
+    out["note"] = "Timing breakdowns include profiling overhead; use estimate.ms_per_tick for a closer speed estimate."
     return out
 
 
@@ -4106,6 +4377,27 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
             if self.path == "/api/runtime/export":
                 out = _RT.export()
+                self._send_json(200, out)
+                return
+
+            if self.path == "/api/profile/run":
+                body = self._read_json_body()
+                payload = body.get("payload")
+                if not isinstance(payload, dict):
+                    raise ValueError("missing payload")
+                ticks = body.get("ticks", 50)
+                warmup = body.get("warmup", 5)
+                repeats = body.get("repeats", 1)
+                do_estimate = bool(body.get("estimate", True))
+                do_breakdown = bool(body.get("breakdown", True))
+                out = _profile_run_payload(
+                    payload,
+                    ticks=int(ticks) if str(ticks).strip() != "" else 50,
+                    warmup=int(warmup) if str(warmup).strip() != "" else 0,
+                    repeats=int(repeats) if str(repeats).strip() != "" else 1,
+                    do_estimate=do_estimate,
+                    do_breakdown=do_breakdown,
+                )
                 self._send_json(200, out)
                 return
 
