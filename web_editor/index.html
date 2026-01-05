@@ -17,6 +17,7 @@
           <button id="newBtn" class="btn btn--secondary">New</button>
           <button id="openBtn" class="btn btn--secondary">Open</button>
           <button id="deleteBtn" class="btn btn--secondary">Delete</button>
+          <a class="btn btn--secondary" href="experiments.html">Experiments</a>
           <label class="btn btn--secondary">
             Import
             <input id="fileInput" type="file" accept="application/json" hidden />
@@ -36,6 +37,7 @@
             <button class="screenBtn" data-screen="assign">Assign values</button>
             <button class="screenBtn" data-screen="functions">Functions</button>
             <button class="screenBtn" data-screen="runtime">Runtime</button>
+            <button class="screenBtn" data-screen="lifespan">Lifespan</button>
             <button class="screenBtn" data-screen="profiling">Profiling</button>
             <button class="screenBtn" data-screen="evolution">Evolution</button>
           </div>
@@ -738,6 +740,102 @@
                       <canvas id="rtTrajCanvas" class="runtimeTrajCanvas"></canvas>
                     </div>
                     <div id="rtTrajList" class="runtimeTrajList"></div>
+                  </div>
+                </section>
+              </aside>
+            </div>
+          </div>
+
+          <div class="screenPanel" data-screen="lifespan">
+            <div class="functionsLayout">
+              <aside class="toolsDock toolsDock--full">
+                <section class="panel">
+                  <div class="panel__title">Lifespan</div>
+                  <div class="help">
+                    Run a payload for N ticks across replicates and record death as the first tick when any measurement whose name contains "death" becomes 1.
+                    Plots a Kaplan–Meier-style survival curve.
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Payload source</label>
+                    <select id="lifeSource" class="input">
+                      <option value="editor" selected>Current editor</option>
+                      <option value="file">Uploaded JSON</option>
+                    </select>
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Payload file</label>
+                    <div class="two two--btn">
+                      <div id="lifeFileName" class="meta">No file</div>
+                      <label class="btn btn--secondary btn--small">
+                        Upload
+                        <input id="lifeFile" type="file" accept="application/json" hidden />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Ticks</label>
+                    <input id="lifeTicks" class="input" type="number" min="1" step="1" value="200" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Replicates</label>
+                    <input id="lifeReplicates" class="input" type="number" min="1" step="1" value="50" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Seed</label>
+                    <input id="lifeSeed" class="input" type="number" step="1" value="1" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Workers (0=auto)</label>
+                    <input id="lifeWorkers" class="input" type="number" min="0" step="1" value="0" />
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Worker mode</label>
+                    <select id="lifeWorkerMode" class="input">
+                      <option value="thread" selected>Thread</option>
+                      <option value="process">Process</option>
+                    </select>
+                  </div>
+
+                  <div class="row">
+                    <button id="lifeRunBtn" class="btn btn--primary">Run lifespan</button>
+                  </div>
+
+                  <div class="row row--inline">
+                    <div id="lifeStatus" class="meta"></div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="lifeSummary" class="meta"></div>
+                  </div>
+                  <div class="row row--inline">
+                    <div id="lifeDeathNames" class="meta"></div>
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row row--inline">
+                    <canvas id="lifeCanvas" class="evoCanvas"></canvas>
+                  </div>
+
+                  <div class="row">
+                    <label class="label">Measurement</label>
+                    <select id="lifeMeasName" class="input"></select>
+                  </div>
+
+                  <div class="row row--inline">
+                    <canvas id="lifeMeasCanvas" class="evoCanvas"></canvas>
+                  </div>
+
+                  <div class="hr"></div>
+
+                  <div class="row row--inline">
+                    <div id="lifeRepsList" class="runtimeMeasList"></div>
                   </div>
                 </section>
               </aside>

@@ -27,7 +27,7 @@
       },
       {
         "name": "oxygen_death",
-        "expr": "(mean(molecule_glucose, where=(circulation==1)) < 4200)"
+        "expr": "(mean(molecule_glucose, where=(circulation==1)) > 4200)"
       }
     ]
   },
@@ -53,7 +53,7 @@
           {
             "type": "op",
             "target": "${0}",
-            "expr": "${0} * exp(noise * (rand_beta(2,2) - 0.5) * 4)"
+            "expr": "${0} * exp(noise * (rand_beta(2,2) - 0.5) * 5)"
           }
         ]
       },
@@ -62,7 +62,7 @@
         "name": "gf_aging",
         "group": "aging",
         "enabled": true,
-        "expr": "growth_factor * exp( noise * (rand_beta(2,2) - 0.5) * 4)",
+        "expr": "growth_factor * exp( noise * (rand_beta(2,2) - 0.5) * 5)",
         "target": "growth_factor"
       },
       {

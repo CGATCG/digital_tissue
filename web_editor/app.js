@@ -176,6 +176,23 @@ const ui = {
   rtHeatMaskEnabled: $("rtHeatMaskEnabled"),
   rtVizGrid: $("rtVizGrid"),
 
+  lifeSource: $("lifeSource"),
+  lifeFile: $("lifeFile"),
+  lifeFileName: $("lifeFileName"),
+  lifeTicks: $("lifeTicks"),
+  lifeReplicates: $("lifeReplicates"),
+  lifeSeed: $("lifeSeed"),
+  lifeWorkers: $("lifeWorkers"),
+  lifeWorkerMode: $("lifeWorkerMode"),
+  lifeRunBtn: $("lifeRunBtn"),
+  lifeStatus: $("lifeStatus"),
+  lifeSummary: $("lifeSummary"),
+  lifeDeathNames: $("lifeDeathNames"),
+  lifeCanvas: $("lifeCanvas"),
+  lifeMeasName: $("lifeMeasName"),
+  lifeMeasCanvas: $("lifeMeasCanvas"),
+  lifeRepsList: $("lifeRepsList"),
+
   profTicks: $("profTicks"),
   profWarmup: $("profWarmup"),
   profRepeats: $("profRepeats"),
@@ -258,6 +275,128 @@ function _rtClearEvents() {
   rtLastEvents = null;
   rtEventRows.clear();
   if (ui.rtEventsList) ui.rtEventsList.innerHTML = "";
+}
+
+function _lifeDrawMeasurementSeries(seriesObj, measName, ticks) {
+  if (!ui.lifeMeasCanvas) return;
+  const p = _stepsPrepPlotCanvas(ui.lifeMeasCanvas, 900, 220);
+  if (!p) return;
+  const { ctx, W, H } = p;
+  ctx.clearRect(0, 0, W, H);
+
+  const name = String(measName || "").trim();
+  if (!name) return;
+
+  const ticksI = Math.max(1, Math.floor(Number(ticks || 0)));
+
+  const padL = 44;
+  const padR = 14;
+  const padT = 14;
+  const padB = 34;
+  const x0 = padL;
+  const x1 = W - padR;
+  const y0 = padT;
+  const y1 = H - padB;
+  const plotW = Math.max(10, x1 - x0);
+  const plotH = Math.max(10, y1 - y0);
+
+  ctx.strokeStyle = "rgba(255,255,255,.20)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x0, y1);
+  ctx.lineTo(x1, y1);
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x0, y1);
+  ctx.stroke();
+
+  const mean = seriesObj && typeof seriesObj === "object" ? seriesObj.mean : null;
+  const arr0 = mean && typeof mean === "object" ? mean[name] : null;
+  const arr = Array.isArray(arr0) ? arr0 : [];
+  const reps0 = seriesObj && typeof seriesObj === "object" ? seriesObj.replicates : null;
+  const reps = Array.isArray(reps0) ? reps0 : [];
+  if (!arr.length && !reps.length) return;
+
+  let mn = Infinity;
+  let mx = -Infinity;
+  const meanYs = [];
+  for (let i = 0; i < Math.min(arr.length, ticksI); i++) {
+    const v = arr[i];
+    const fv = typeof v === "number" && Number.isFinite(v) ? v : NaN;
+    meanYs.push(fv);
+    if (Number.isFinite(fv)) {
+      if (fv < mn) mn = fv;
+      if (fv > mx) mx = fv;
+    }
+  }
+
+  const repYs = [];
+  for (let ri = 0; ri < reps.length; ri++) {
+    const rr = reps[ri];
+    if (!rr || typeof rr !== "object") {
+      repYs.push([]);
+      continue;
+    }
+    const a0 = rr[name];
+    const a = Array.isArray(a0) ? a0 : [];
+    const ys = [];
+    for (let i = 0; i < Math.min(a.length, ticksI); i++) {
+      const v = a[i];
+      const fv = typeof v === "number" && Number.isFinite(v) ? v : NaN;
+      ys.push(fv);
+      if (Number.isFinite(fv)) {
+        if (fv < mn) mn = fv;
+        if (fv > mx) mx = fv;
+      }
+    }
+    repYs.push(ys);
+  }
+  if (!Number.isFinite(mn) || !Number.isFinite(mx)) return;
+  if (mx === mn) mx = mn + 1e-9;
+
+  const xAt = (t) => x0 + (Math.max(0, Math.min(ticksI, t)) / ticksI) * plotW;
+  const yAt = (v) => y0 + (1 - (v - mn) / (mx - mn)) * plotH;
+
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+  ctx.save();
+  ctx.translate(12, y0 + (y1 - y0) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText(name, 0, 0);
+  ctx.restore();
+  ctx.fillText("tick", x1 - 36, y1 + 24);
+
+  ctx.fillStyle = "rgba(255,255,255,.45)";
+  ctx.fillText(_stepsFmt(mn), 6, y1);
+  ctx.fillText(_stepsFmt(mx), 6, y0 + 10);
+
+  function _drawSeriesLine(ys, strokeStyle, lineWidth) {
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < ys.length; i++) {
+      const v = ys[i];
+      if (!Number.isFinite(v)) {
+        started = false;
+        continue;
+      }
+      const x = xAt(i);
+      const y = yAt(v);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+
+  for (const ys of repYs) {
+    if (ys && ys.length) _drawSeriesLine(ys, "rgba(255,255,255,.18)", 1);
+  }
+
+  if (meanYs && meanYs.length) _drawSeriesLine(meanYs, "rgba(255,220,120,.95)", 2);
 }
 
 if (ui.evoAlgo) {
@@ -986,9 +1125,17 @@ function _evoUpdateMeasurementsUI() {
       const optMed = document.createElement("option");
       optMed.value = "median";
       optMed.textContent = "Median";
+      const optStd = document.createElement("option");
+      optStd.value = "std";
+      optStd.textContent = "Std";
+      const optVar = document.createElement("option");
+      optVar.value = "var";
+      optVar.textContent = "Var";
       aggSelect.appendChild(optLast);
       aggSelect.appendChild(optMean);
       aggSelect.appendChild(optMed);
+      aggSelect.appendChild(optStd);
+      aggSelect.appendChild(optVar);
     }
     aggSelect.addEventListener("change", () => {
       const v = String(aggSelect.value || "last");
@@ -1360,6 +1507,226 @@ function _profRenderLayerOpsByType(byTypeMs) {
 
 let profRunning = false;
 
+let lifePayloadObj = null;
+let lifeMeanSeries = null;
+let lifeSelectedMeas = "";
+
+function _lifeSetStatus(s) {
+  if (ui.lifeStatus) ui.lifeStatus.textContent = String(s || "");
+}
+
+function _lifeSetSummary(s) {
+  if (ui.lifeSummary) ui.lifeSummary.textContent = String(s || "");
+}
+
+function _lifeSetDeathNames(s) {
+  if (ui.lifeDeathNames) ui.lifeDeathNames.textContent = String(s || "");
+}
+
+function _lifeTicksValue() {
+  const v = Number(ui.lifeTicks?.value);
+  if (!Number.isFinite(v)) return 200;
+  return Math.max(1, Math.floor(v));
+}
+
+function _lifeReplicatesValue() {
+  const v = Number(ui.lifeReplicates?.value);
+  if (!Number.isFinite(v)) return 10;
+  return Math.max(1, Math.floor(v));
+}
+
+function _lifeSeedValue() {
+  const v = Number(ui.lifeSeed?.value);
+  if (!Number.isFinite(v)) return 1;
+  return Math.floor(v);
+}
+
+function _lifeWorkersValue() {
+  const v = Number(ui.lifeWorkers?.value);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.floor(v));
+}
+
+function _lifeWorkerModeValue() {
+  const v = String(ui.lifeWorkerMode?.value || "thread").trim().toLowerCase();
+  return v === "process" ? "process" : "thread";
+}
+
+function _lifeClearPlot() {
+  _lifeSetSummary("");
+  _lifeSetDeathNames("");
+  if (ui.lifeRepsList) ui.lifeRepsList.innerHTML = "";
+  if (ui.lifeCanvas) {
+    const p = _stepsPrepPlotCanvas(ui.lifeCanvas, 900, 220);
+    if (p) p.ctx.clearRect(0, 0, p.W, p.H);
+  }
+  if (ui.lifeMeasCanvas) {
+    const p = _stepsPrepPlotCanvas(ui.lifeMeasCanvas, 900, 220);
+    if (p) p.ctx.clearRect(0, 0, p.W, p.H);
+  }
+}
+
+function _lifeMeasNameValue() {
+  const v = String(ui.lifeMeasName?.value || "").trim();
+  return v;
+}
+
+function _lifeSetMeasOptions(names) {
+  if (!ui.lifeMeasName) return;
+  const arr = Array.isArray(names) ? names.map((x) => String(x || "")).filter((x) => x) : [];
+  ui.lifeMeasName.innerHTML = "";
+  for (const nm of arr) {
+    const opt = document.createElement("option");
+    opt.value = nm;
+    opt.textContent = nm;
+    ui.lifeMeasName.appendChild(opt);
+  }
+  if (arr.length) {
+    const cur = lifeSelectedMeas && arr.includes(lifeSelectedMeas) ? lifeSelectedMeas : arr[0];
+    ui.lifeMeasName.value = cur;
+    lifeSelectedMeas = cur;
+  }
+}
+
+function _lifeSourceValue() {
+  const v = String(ui.lifeSource?.value || "editor");
+  return v === "file" ? "file" : "editor";
+}
+
+function _lifeGetPayload() {
+  const src = _lifeSourceValue();
+  if (src === "file") {
+    if (!lifePayloadObj || typeof lifePayloadObj !== "object") throw new Error("Upload a lifespan payload JSON first");
+    return lifePayloadObj;
+  }
+  const txt = serializeState(state);
+  return JSON.parse(txt);
+}
+
+function _lifeSyncSourceUi() {
+  const src = _lifeSourceValue();
+  const disabled = src !== "file";
+  if (ui.lifeFile) ui.lifeFile.disabled = disabled;
+}
+
+function _lifeDrawCurve(curve, ticks) {
+  if (!ui.lifeCanvas) return;
+  const p = _stepsPrepPlotCanvas(ui.lifeCanvas, 900, 220);
+  if (!p) return;
+  const { ctx, W, H } = p;
+  ctx.clearRect(0, 0, W, H);
+
+  const times0 = Array.isArray(curve?.times) ? curve.times : [];
+  const surv0 = Array.isArray(curve?.survival) ? curve.survival : [];
+  if (!times0.length || times0.length !== surv0.length) return;
+
+  const ticksI = Math.max(1, Math.floor(Number(ticks || 0)));
+
+  const padL = 44;
+  const padR = 14;
+  const padT = 14;
+  const padB = 34;
+  const x0 = padL;
+  const x1 = W - padR;
+  const y0 = padT;
+  const y1 = H - padB;
+
+  const xAt = (t) => x0 + (Math.max(0, Math.min(ticksI, t)) / ticksI) * (x1 - x0);
+  const yAt = (s) => y0 + (1 - Math.max(0, Math.min(1, s))) * (y1 - y0);
+
+  ctx.strokeStyle = "rgba(255,255,255,.20)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x0, y1);
+  ctx.lineTo(x1, y1);
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x0, y1);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+  ctx.save();
+  ctx.translate(12, y0 + (y1 - y0) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("Survival", 0, 0);
+  ctx.restore();
+  ctx.fillText("tick", x1 - 36, y1 + 24);
+
+  ctx.strokeStyle = "rgba(100,200,255,.95)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let px = xAt(Number(times0[0]) || 0);
+  let py = yAt(Number(surv0[0]) || 1);
+  ctx.moveTo(px, py);
+  for (let i = 1; i < times0.length; i++) {
+    const tx = xAt(Number(times0[i]) || 0);
+    const ny = yAt(Number(surv0[i]) || 0);
+    ctx.lineTo(tx, py);
+    ctx.lineTo(tx, ny);
+    py = ny;
+    px = tx;
+  }
+  ctx.stroke();
+
+  const med = curve?.median_tick;
+  const medI = Number.isFinite(Number(med)) ? Number(med) : NaN;
+  if (Number.isFinite(medI)) {
+    const mx = xAt(medI);
+    ctx.strokeStyle = "rgba(255,255,255,.35)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.moveTo(mx, y0);
+    ctx.lineTo(mx, y1);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(255,255,255,.65)";
+    ctx.fillText(`median=${_stepsFmt(medI)}`, Math.min(W - 120, mx + 6), y0 + 12);
+  }
+}
+
+function _lifeRenderReplicatesList(reps, ticks) {
+  if (!ui.lifeRepsList) return;
+  const arr = Array.isArray(reps) ? reps : [];
+  if (!arr.length) {
+    ui.lifeRepsList.innerHTML = "";
+    return;
+  }
+
+  const ticksI = Math.max(1, Math.floor(Number(ticks || 0)));
+  const sorted = [...arr].sort((a, b) => Number(a?.death_tick ?? ticksI) - Number(b?.death_tick ?? ticksI));
+  ui.lifeRepsList.innerHTML = "";
+  for (let i = 0; i < Math.min(80, sorted.length); i++) {
+    const r = sorted[i];
+    const died = !!r?.died;
+    const dt = Number(r?.death_tick);
+    const seed0 = Number(r?.seed0);
+    const hit = String(r?.death_measurement || "");
+
+    const row = document.createElement("div");
+    row.className = "runtimeMeasRow";
+
+    const sw = document.createElement("div");
+    sw.className = "runtimeMeasSwatch";
+    sw.style.background = died ? "rgba(255,90,90,.65)" : "rgba(90,255,160,.35)";
+    row.appendChild(sw);
+
+    const nm = document.createElement("div");
+    nm.className = "runtimeMeasName";
+    nm.textContent = `rep ${i + 1}`;
+    row.appendChild(nm);
+
+    const val = document.createElement("div");
+    val.className = "runtimeMeasVal";
+    const dtTxt = Number.isFinite(dt) ? String(dt) : String(ticksI);
+    const why = died ? `died@${dtTxt}${hit ? ` (${hit})` : ""}` : `alive@${ticksI}`;
+    val.textContent = `${why}   seed0=${Number.isFinite(seed0) ? String(Math.floor(seed0)) : "–"}`;
+    row.appendChild(val);
+
+    ui.lifeRepsList.appendChild(row);
+  }
+}
+
 function _profTicksValue() {
   const v = Number(ui.profTicks?.value);
   if (!Number.isFinite(v)) return 50;
@@ -1419,6 +1786,52 @@ async function _profRun() {
     _profSetStatus(String(e?.message || e));
   } finally {
     profRunning = false;
+  }
+}
+
+async function _lifeRun() {
+  if (!ui.lifeRunBtn) return;
+  ui.lifeRunBtn.disabled = true;
+  try {
+    _lifeSetStatus("Running…");
+    _lifeClearPlot();
+    const payload = _lifeGetPayload();
+    const ticks = _lifeTicksValue();
+    const replicates = _lifeReplicatesValue();
+    const seed = _lifeSeedValue();
+    const workers = _lifeWorkersValue();
+    const worker_mode = _lifeWorkerModeValue();
+    const include_series = true;
+    const out = await _rtPostJson("/api/lifespan/run", { payload, ticks, replicates, seed, workers, worker_mode, include_series });
+    if (!out || out.ok !== true) throw new Error("lifespan run failed");
+
+    const curve = out.curve;
+    _lifeDrawCurve(curve, ticks);
+
+    const n = Number(curve?.n ?? replicates);
+    const deaths = Number(curve?.deaths ?? 0);
+    const survivors = Number(curve?.survivors ?? 0);
+    const med = curve?.median_tick;
+    const medTxt = Number.isFinite(Number(med)) ? String(Math.floor(Number(med))) : "–";
+    const workersUsed = Number(out?.workers ?? workers);
+    const workersTxt = Number.isFinite(workersUsed) ? String(Math.floor(workersUsed)) : "–";
+    const modeUsed = String(out?.worker_mode || worker_mode || "thread");
+    _lifeSetSummary(`n=${Number.isFinite(n) ? String(Math.floor(n)) : "–"}   deaths=${Number.isFinite(deaths) ? String(Math.floor(deaths)) : "0"}   survivors=${Number.isFinite(survivors) ? String(Math.floor(survivors)) : "0"}   median_tick=${medTxt}   workers=${workersTxt}   mode=${modeUsed}`);
+
+    const dn = Array.isArray(out.death_measurements) ? out.death_measurements.map((x) => String(x || "")).filter((x) => x) : [];
+    _lifeSetDeathNames(dn.length ? `death measurements: ${dn.join(", ")}` : "");
+
+    lifeMeanSeries = out.measurements_series && typeof out.measurements_series === "object" ? out.measurements_series : null;
+    const names = Array.isArray(lifeMeanSeries?.names) ? lifeMeanSeries.names : [];
+    _lifeSetMeasOptions(names);
+    _lifeDrawMeasurementSeries(lifeMeanSeries, _lifeMeasNameValue(), ticks);
+
+    _lifeRenderReplicatesList(out.replicates_out, ticks);
+    _lifeSetStatus("Done");
+  } catch (e) {
+    _lifeSetStatus(String(e?.message || e));
+  } finally {
+    ui.lifeRunBtn.disabled = false;
   }
 }
 
@@ -10752,6 +11165,9 @@ function setActiveScreen(name) {
       void _rtEnsureSyncedFromEditor(false, "editor").catch((e) => _rtSetStatus(String(e?.message || e)));
     }
   }
+  if (name === "lifespan") {
+    _lifeSyncSourceUi();
+  }
   if (name === "workspace") {
     applyAutoFitZoom();
     return;
@@ -10790,6 +11206,45 @@ function setActiveScreen(name) {
 
 for (const b of document.querySelectorAll(".screenBtn")) {
   b.addEventListener("click", () => setActiveScreen(b.dataset.screen));
+}
+
+if (ui.lifeSource) {
+  ui.lifeSource.addEventListener("change", () => {
+    _lifeSyncSourceUi();
+  });
+}
+
+if (ui.lifeFile) {
+  ui.lifeFile.addEventListener("change", async () => {
+    try {
+      const f = ui.lifeFile.files && ui.lifeFile.files[0] ? ui.lifeFile.files[0] : null;
+      if (!f) return;
+      _lifeSetStatus("Loading…");
+      const txt = await _stepsReadFileAsText(f);
+      const obj = JSON.parse(txt);
+      if (!obj || typeof obj !== "object") throw new Error("payload is not an object");
+      lifePayloadObj = obj;
+      if (ui.lifeFileName) ui.lifeFileName.textContent = String(f.name || "payload.json");
+      _lifeSetStatus("Loaded");
+    } catch (e) {
+      lifePayloadObj = null;
+      if (ui.lifeFileName) ui.lifeFileName.textContent = "No file";
+      _lifeSetStatus(String(e?.message || e));
+    }
+  });
+}
+
+if (ui.lifeRunBtn) {
+  ui.lifeRunBtn.addEventListener("click", () => {
+    void _lifeRun();
+  });
+}
+
+if (ui.lifeMeasName) {
+  ui.lifeMeasName.addEventListener("change", () => {
+    lifeSelectedMeas = _lifeMeasNameValue();
+    _lifeDrawMeasurementSeries(lifeMeanSeries, lifeSelectedMeas, _lifeTicksValue());
+  });
 }
 
 // Wire tab groups within each screen independently

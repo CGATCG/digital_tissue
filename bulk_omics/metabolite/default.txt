@@ -1,0 +1,8 @@
+molecule_glucose
+molecule_H2O
+molecule_O2
+molecule_NH4Cl
+molecule_NaCl
+molecule_CaCl2
+molecule_FeSO4
+molecule_ZnCl2

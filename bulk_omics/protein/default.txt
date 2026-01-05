@@ -1,0 +1,8 @@
+protein_north_importer_glucose
+protein_south_importer_glucose
+protein_east_importer_glucose
+protein_west_importer_glucose
+protein_north_exporter_glucose
+protein_south_exporter_glucose
+protein_east_exporter_glucose
+protein_west_exporter_glucose

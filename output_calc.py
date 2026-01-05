@@ -12,6 +12,20 @@ from typing import Dict, Iterable, List, Optional, Tuple, Any
 import numpy as np
 
 
+_EXPR_AST_CACHE: Dict[str, ast.AST] = {}
+
+
+def _expr_ast_cached(expr: str) -> ast.AST:
+    cur = _EXPR_AST_CACHE.get(expr)
+    if cur is not None:
+        return cur
+    node = ast.parse(expr, mode="eval").body
+    if len(_EXPR_AST_CACHE) >= 2048:
+        _EXPR_AST_CACHE.clear()
+    _EXPR_AST_CACHE[expr] = node
+    return node
+
+
 @dataclass(frozen=True)
 class MeasurementSpec:
     output_name: str
@@ -198,8 +212,8 @@ class _ExprEval:
         raise ValueError(f"Unknown reduction: {fn}")
 
     def eval(self, expr: str) -> Optional[float]:
-        tree = ast.parse(expr, mode="eval")
-        v = self._eval_node(tree.body)
+        body = _expr_ast_cached(expr)
+        v = self._eval_node(body)
         if isinstance(v, np.ndarray):
             raise ValueError("Expression evaluated to an array; expected scalar")
         if v is None:

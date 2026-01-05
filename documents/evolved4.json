@@ -19,60 +19,13 @@
       },
       {
         "name": "morphology_death",
-        "expr": "(2 * count(where=((morphology > 0.5) & (cell > 0.5)))) / (count(where=(morphology > 0.5)) + count(where=(cell > 0.5)) + 1e-9) < 0.97\n"
-      },
-      {
-        "name": "glucose_death",
-        "expr": "(mean(molecule_glucose, where=(circulation==1)) > 150000) + (mean(molecule_glucose, where=(circulation==1)) < 35000)"
-      },
-      {
-        "name": "oxygen_death",
-        "expr": "(mean(molecule_glucose, where=(circulation==1)) < 4200)"
+        "expr": "(2 * count(where=((morphology > 0.5) & (cell > 0.5)))) / (count(where=(morphology > 0.5)) + count(where=(cell > 0.5)) + 1e-9) < 0.985\n"
       }
     ]
   },
   "layer_ops_config": {
     "version": 2,
     "steps": [
-      {
-        "type": "op",
-        "name": "increase_noise",
-        "group": "aging",
-        "enabled": true,
-        "expr": "clip(\n  noise + 0.0257*(noise + 0.0001)\n  + 0.01*(noise + 0.0001) * (2*(rand_beta(2,2) - 0.5)),\n  0, 1\n)",
-        "target": "noise"
-      },
-      {
-        "type": "foreach",
-        "name": "protein_aging",
-        "group": "aging",
-        "enabled": true,
-        "match": "protein_*",
-        "require_match": false,
-        "steps": [
-          {
-            "type": "op",
-            "target": "${0}",
-            "expr": "${0} * exp(noise * (rand_beta(2,2) - 0.5) * 4)"
-          }
-        ]
-      },
-      {
-        "type": "op",
-        "name": "gf_aging",
-        "group": "aging",
-        "enabled": true,
-        "expr": "growth_factor * exp( noise * (rand_beta(2,2) - 0.5) * 4)",
-        "target": "growth_factor"
-      },
-      {
-        "type": "op",
-        "name": "senescence_failure",
-        "group": "aging",
-        "enabled": false,
-        "expr": "damage * exp( (0.2 + 0.1*noise) * (2*(rand_beta(2,2) - 0.5)) )",
-        "target": "damage"
-      },
       {
         "type": "op",
         "name": "reset damage",
@@ -88,6 +41,14 @@
         "enabled": true,
         "expr": "where(lumen == 1, 0, molecule_replacement_factor)",
         "target": "molecule_replacement_factor"
+      },
+      {
+        "type": "op",
+        "name": "reset lumen",
+        "group": "init",
+        "enabled": false,
+        "expr": "where((cell == 0) & (circulation == 0), 1, 0)",
+        "target": "lumen"
       },
       {
         "type": "op",

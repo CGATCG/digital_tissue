@@ -1,0 +1,8 @@
+gene_north_importer_glucose
+gene_south_importer_glucose
+gene_east_importer_glucose
+gene_west_importer_glucose
+gene_north_exporter_glucose
+gene_south_exporter_glucose
+gene_east_exporter_glucose
+gene_west_exporter_glucose

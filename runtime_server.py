@@ -19,6 +19,7 @@ from multiprocessing import shared_memory
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
@@ -199,6 +200,124 @@ def _compute_layer_scalars_from_layers(layers: Dict[str, Any], kinds: Dict[str, 
         except Exception:
             continue
     return out
+
+
+_STX_GENESETS_DIR = (Path(__file__).resolve().parent / "spatial_transcriptomics").resolve()
+_BULK_OMICS_DIR = (Path(__file__).resolve().parent / "bulk_omics").resolve()
+
+
+def _list_stx_gene_sets() -> list[str]:
+    d = _STX_GENESETS_DIR
+    if not d.exists() or not d.is_dir():
+        return []
+    out: list[str] = []
+    for p in d.iterdir():
+        try:
+            if not p.is_file():
+                continue
+        except Exception:
+            continue
+        nm = str(p.name)
+        if not nm or nm.startswith("."):
+            continue
+        out.append(nm)
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+def _load_stx_gene_set(name: str) -> tuple[str, list[str]]:
+    nm = str(name or "").strip()
+    all_sets = _list_stx_gene_sets()
+    if not nm:
+        if "default.txt" in all_sets:
+            nm = "default.txt"
+        elif all_sets:
+            nm = all_sets[0]
+        else:
+            return "", []
+
+    p = (_STX_GENESETS_DIR / nm).resolve()
+    if _STX_GENESETS_DIR not in p.parents:
+        raise ValueError("invalid gene_set")
+    if not p.exists() or not p.is_file():
+        raise ValueError("unknown gene_set")
+
+    txt = p.read_text(encoding="utf-8")
+    genes: list[str] = []
+    seen = set()
+    for line in txt.splitlines():
+        s = str(line).strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            continue
+        if s in seen:
+            continue
+        genes.append(s)
+        seen.add(s)
+    return nm, genes
+
+
+def _list_bulk_omics_sets() -> list[str]:
+    d = _BULK_OMICS_DIR
+    if not d.exists() or not d.is_dir():
+        return []
+    out: list[str] = []
+    for p in d.rglob("*"):
+        try:
+            if not p.is_file():
+                continue
+        except Exception:
+            continue
+        rel = None
+        try:
+            rel = p.relative_to(d)
+        except Exception:
+            rel = None
+        if rel is None:
+            continue
+        if any(str(part).startswith(".") for part in rel.parts):
+            continue
+        nm = rel.as_posix()
+        if not nm:
+            continue
+        out.append(nm)
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+def _load_bulk_omics_set(name: str) -> tuple[str, list[str]]:
+    nm = str(name or "").strip()
+    all_sets = _list_bulk_omics_sets()
+    if not nm:
+        prefer = "rna/default.txt"
+        if prefer in all_sets:
+            nm = prefer
+        elif all_sets:
+            nm = all_sets[0]
+        else:
+            return "", []
+
+    p = (_BULK_OMICS_DIR / nm).resolve()
+    if _BULK_OMICS_DIR not in p.parents:
+        raise ValueError("invalid omics_set")
+    if not p.exists() or not p.is_file():
+        raise ValueError("unknown omics_set")
+
+    txt = p.read_text(encoding="utf-8")
+    layers: list[str] = []
+    seen = set()
+    for line in txt.splitlines():
+        s = str(line).strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            continue
+        if s in seen:
+            continue
+        layers.append(s)
+        seen.add(s)
+    return nm, layers
 
 
 def _compute_measurements_from_layers(payload: Dict[str, Any], layers: Dict[str, Any], H: int, W: int) -> Dict[str, Any]:
@@ -540,6 +659,179 @@ _RUNS_DIR = Path(__file__).resolve().parent / "runs" / "evolution"
 _DOCS_DIR = Path(os.environ.get("DT_DOCS_DIR") or (Path(__file__).resolve().parent / "documents"))
 _WORKSPACE_DIR = Path(os.environ.get("DT_WORKSPACE_DIR") or (Path(__file__).resolve().parent / "workspace"))
 
+_GAME_STATE_PATH = _WORKSPACE_DIR / "game_state.json"
+_GAME_LOCK = threading.RLock()
+_COST_MODEL_CENTS = {
+    "bulk_rnaseq": 20000,
+    "bulk_proteomics": 80000,
+    "bulk_metabolomics": 50000,
+    "spatial_transcriptomics": 250000,
+    "in_vivo_trial": 500000,
+}
+
+
+def _sanitize_player_id(player_id: Any) -> str:
+    s = str(player_id or "").strip()
+    if not s:
+        return "default"
+    if len(s) > 64:
+        s = s[:64]
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+    out = "".join(ch for ch in s if ch in allowed)
+    return out or "default"
+
+
+def _bulk_omics_kind_from_set_name(omics_set: str) -> str:
+    nm = str(omics_set or "").strip().replace("\\", "/")
+    if nm.startswith("rna/"):
+        return "bulk_rnaseq"
+    if nm.startswith("protein/"):
+        return "bulk_proteomics"
+    if nm.startswith("metabolite/") or nm.startswith("metabolomics/"):
+        return "bulk_metabolomics"
+    parts = [p for p in nm.split("/") if p]
+    if parts:
+        p0 = parts[0].lower()
+        if p0 == "rna":
+            return "bulk_rnaseq"
+        if p0 == "protein":
+            return "bulk_proteomics"
+        if p0 in ("metabolite", "metabolomics"):
+            return "bulk_metabolomics"
+    return "bulk_rnaseq"
+
+
+def _game_load_state() -> Dict[str, Any]:
+    try:
+        _ensure_dirs()
+    except Exception:
+        pass
+    st = _safe_read_json(_GAME_STATE_PATH)
+    if not isinstance(st, dict):
+        st = {"version": 1, "players": {}}
+    if not isinstance(st.get("players"), dict):
+        st["players"] = {}
+    if int(st.get("version") or 0) != 1:
+        st = {"version": 1, "players": dict(st.get("players") or {})}
+    return st
+
+
+def _game_player_entry(state: Dict[str, Any], player_id: str) -> Dict[str, Any]:
+    players = state.get("players")
+    if not isinstance(players, dict):
+        players = {}
+        state["players"] = players
+    ent = players.get(player_id)
+    if not isinstance(ent, dict):
+        ent = {
+            "money_spent_cents": 0,
+            "ledger": [],
+            "created_at": float(time.time()),
+            "updated_at": float(time.time()),
+        }
+        players[player_id] = ent
+    if not isinstance(ent.get("ledger"), list):
+        ent["ledger"] = []
+    try:
+        ent["money_spent_cents"] = int(ent.get("money_spent_cents") or 0)
+    except Exception:
+        ent["money_spent_cents"] = 0
+    return ent
+
+
+def _game_public_player(player_id: str, ent: Dict[str, Any], *, last_charge: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cents = 0
+    try:
+        cents = int(ent.get("money_spent_cents") or 0)
+    except Exception:
+        cents = 0
+    out = {
+        "player_id": str(player_id),
+        "currency": "USD",
+        "money_spent_cents": int(cents),
+        "money_spent_usd": float(cents) / 100.0,
+        "ledger": ent.get("ledger") if isinstance(ent.get("ledger"), list) else [],
+        "created_at": ent.get("created_at"),
+        "updated_at": ent.get("updated_at"),
+    }
+    if isinstance(last_charge, dict):
+        out["last_charge"] = last_charge
+    return out
+
+
+def _game_compute_charge(kind: str, samples: int, *, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    k = str(kind or "").strip() or "bulk_rnaseq"
+    unit = int(_COST_MODEL_CENTS.get(k) or 0)
+    n = max(0, int(samples))
+    total = int(unit) * int(n)
+    out = {
+        "id": uuid.uuid4().hex[:12],
+        "ts": float(time.time()),
+        "currency": "USD",
+        "kind": k,
+        "samples": int(n),
+        "unit_cost_cents": int(unit),
+        "cost_cents": int(total),
+        "unit_cost_usd": float(unit) / 100.0,
+        "cost_usd": float(total) / 100.0,
+    }
+    if isinstance(meta, dict) and meta:
+        out["meta"] = meta
+    return out
+
+
+def _game_apply_charge(player_id_in: Any, charge: Dict[str, Any]) -> Dict[str, Any]:
+    player_id = _sanitize_player_id(player_id_in)
+    if not isinstance(charge, dict):
+        charge = {}
+    cents = 0
+    try:
+        cents = int(charge.get("cost_cents") or 0)
+    except Exception:
+        cents = 0
+    cents = max(0, int(cents))
+
+    with _GAME_LOCK:
+        st = _game_load_state()
+        ent = _game_player_entry(st, player_id)
+        try:
+            ent["money_spent_cents"] = int(ent.get("money_spent_cents") or 0) + int(cents)
+        except Exception:
+            ent["money_spent_cents"] = int(cents)
+
+        led = ent.get("ledger")
+        if not isinstance(led, list):
+            led = []
+            ent["ledger"] = led
+        led.append(charge)
+        if len(led) > 250:
+            ent["ledger"] = led[-250:]
+
+        ent["updated_at"] = float(time.time())
+        _atomic_write_json(_GAME_STATE_PATH, st)
+        return _game_public_player(player_id, ent, last_charge=charge)
+
+
+def _game_get_player_state(player_id_in: Any) -> Dict[str, Any]:
+    player_id = _sanitize_player_id(player_id_in)
+    with _GAME_LOCK:
+        st = _game_load_state()
+        ent = _game_player_entry(st, player_id)
+        _atomic_write_json(_GAME_STATE_PATH, st)
+        return _game_public_player(player_id, ent)
+
+
+def _game_reset_player(player_id_in: Any) -> Dict[str, Any]:
+    player_id = _sanitize_player_id(player_id_in)
+    with _GAME_LOCK:
+        st = _game_load_state()
+        ent = _game_player_entry(st, player_id)
+        ent["money_spent_cents"] = 0
+        ent["ledger"] = []
+        ent["updated_at"] = float(time.time())
+        _atomic_write_json(_GAME_STATE_PATH, st)
+        return _game_public_player(player_id, ent)
+
 
 def _find_cell_layer_name(payload: Dict[str, Any]) -> str:
     data = payload.get("data")
@@ -554,6 +846,932 @@ def _find_cell_layer_name(payload: Dict[str, Any]) -> str:
 
 def _deepcopy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(payload))
+
+
+def _ensure_layer_ops_opts(p: Dict[str, Any]) -> None:
+    lop_cfg = p.get("layer_ops_config") if isinstance(p, dict) else None
+    if isinstance(lop_cfg, dict):
+        if "opt_env_cache" not in lop_cfg and "optimize_env_cache" not in lop_cfg:
+            lop_cfg["opt_env_cache"] = True
+        if "opt_expr_cache" not in lop_cfg and "optimize_expr_cache" not in lop_cfg:
+            lop_cfg["opt_expr_cache"] = True
+
+
+def _apply_interventions_to_payload_inplace(payload: Dict[str, Any], interventions_in: Any) -> int:
+    if not isinstance(interventions_in, list) or not interventions_in:
+        return 0
+
+    H = int(payload.get("H") or 0)
+    W = int(payload.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+    expected_len = int(H * W)
+
+    layer_meta = payload.get("layers")
+    kinds: Dict[str, str] = {}
+    if isinstance(layer_meta, list):
+        for m in layer_meta:
+            if not isinstance(m, dict):
+                continue
+            nm = m.get("name")
+            if isinstance(nm, str) and nm:
+                kinds[nm] = str(m.get("kind") or "continuous")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("payload missing data")
+
+    huge = 1e9
+    applied = 0
+
+    for iv in interventions_in:
+        if not isinstance(iv, dict):
+            continue
+        layer = str(iv.get("layer") or "").strip()
+        if not layer:
+            continue
+
+        direction = str(iv.get("direction") or "").strip().lower()
+        if direction in ("+", "inc", "increase", "up", "pos", "positive"):
+            direction = "up"
+        elif direction in ("-", "dec", "decrease", "down", "neg", "negative"):
+            direction = "down"
+        else:
+            raise ValueError(f"invalid intervention direction for layer '{layer}': {direction!r}")
+
+        try:
+            dose = float(iv.get("dose") or 0.0)
+        except Exception:
+            dose = 0.0
+        if not np.isfinite(dose) or dose < 0.0:
+            dose = 0.0
+
+        delta = 0.1 * float(dose)
+        factor = (1.0 + delta) if direction == "up" else (1.0 - delta)
+        if factor < 0.0:
+            factor = 0.0
+        if abs(factor - 1.0) < 1e-12:
+            continue
+
+        kind = kinds.get(layer) or "continuous"
+        if kind == "categorical":
+            raise ValueError(f"cannot apply interventions to categorical layer '{layer}'")
+
+        ent = data.get(layer)
+        if not isinstance(ent, dict) or ent.get("dtype") != "float32":
+            raise ValueError(f"unknown float32 layer: {layer}")
+        b64 = ent.get("b64")
+        if not isinstance(b64, str) or not b64:
+            raise ValueError(f"layer '{layer}' is missing b64 data")
+
+        arr = _decode_float32_b64(b64, expected_len=expected_len, layer_name=layer)
+        arr2 = np.asarray(arr, dtype=np.float32) * np.float32(factor)
+        arr2 = np.nan_to_num(arr2, nan=0.0, posinf=huge, neginf=0.0)
+        arr2 = np.clip(arr2, 0.0, huge)
+        if kind == "counts":
+            arr2 = np.clip(np.rint(arr2), 0.0, huge)
+        ent["b64"] = _encode_float32_b64(np.asarray(arr2, dtype=np.float32).reshape(expected_len))
+        ent.pop("arr", None)
+        applied += 1
+
+    return int(applied)
+
+
+def _run_payload_ticks(base: Dict[str, Any], ticks: int, seed0: int) -> Dict[str, Any]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    ticks_i = max(0, int(ticks))
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+    return p
+
+
+def _measurement_names_from_payload(payload: Dict[str, Any]) -> list[str]:
+    cfg = payload.get("measurements_config")
+    if not isinstance(cfg, dict) or int(cfg.get("version") or 0) != 3:
+        return []
+    measurements = cfg.get("measurements")
+    if not isinstance(measurements, list):
+        return []
+    out: list[str] = []
+    for m in measurements:
+        if not isinstance(m, dict):
+            continue
+        nm = str(m.get("name") or "").strip()
+        if not nm:
+            continue
+        out.append(nm)
+    # preserve configured order while de-duping
+    seen: set[str] = set()
+    out2: list[str] = []
+    for nm in out:
+        if nm in seen:
+            continue
+        out2.append(nm)
+        seen.add(nm)
+    return out2
+
+
+def _death_measurement_names_from_payload(payload: Dict[str, Any]) -> list[str]:
+    names = _measurement_names_from_payload(payload)
+    out: list[str] = []
+    for nm in names:
+        if "death" not in str(nm).lower():
+            continue
+        out.append(nm)
+    return out
+
+
+def _run_lifespan_death_tick(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed0: int,
+    death_names: list[str],
+) -> Dict[str, Any]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+
+    expected_len = int(H * W)
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    ticks_i = max(0, int(ticks))
+    if ticks_i <= 0:
+        return {"died": False, "death_tick": 0, "death_measurement": ""}
+
+    selected = set(death_names)
+    died = False
+    death_tick = ticks_i
+    death_measurement = ""
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        sel = _compute_selected_measurements_from_layers(p, layers, H, W, selected)
+        hit = ""
+        for nm in death_names:
+            try:
+                v = float(sel.get(nm) or 0.0)
+            except Exception:
+                v = 0.0
+            if not np.isfinite(v):
+                v = 0.0
+            if v >= 0.5:
+                hit = nm
+                break
+        if hit:
+            died = True
+            death_tick = int(t)
+            death_measurement = str(hit)
+            break
+
+    return {
+        "died": bool(died),
+        "death_tick": int(death_tick),
+        "death_measurement": str(death_measurement),
+    }
+
+
+def _run_lifespan_rep(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed0: int,
+    death_names: list[str],
+    series_names: list[str],
+) -> tuple[Dict[str, Any], Optional[Dict[str, list[Optional[float]]]]]:
+    if not series_names:
+        return _run_lifespan_death_tick(base, ticks=int(ticks), seed0=int(seed0), death_names=death_names), None
+
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+
+    expected_len = int(H * W)
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    ticks_i = max(0, int(ticks))
+    if ticks_i <= 0:
+        return {"died": False, "death_tick": 0, "death_measurement": ""}, {nm: [] for nm in series_names}
+
+    selected = set(series_names)
+    for nm in death_names:
+        selected.add(nm)
+
+    series: Dict[str, list[Optional[float]]] = {nm: [] for nm in series_names}
+
+    died = False
+    death_tick = ticks_i
+    death_measurement = ""
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        sel = _compute_selected_measurements_from_layers(p, layers, H, W, selected)
+
+        for nm in series_names:
+            vv = sel.get(nm)
+            try:
+                v = float(vv) if vv is not None else None
+            except Exception:
+                v = None
+            if v is None or not np.isfinite(v):
+                series[nm].append(None)
+            else:
+                series[nm].append(float(v))
+
+        if not died:
+            hit = ""
+            for nm in death_names:
+                try:
+                    v = float(sel.get(nm) or 0.0)
+                except Exception:
+                    v = 0.0
+                if not np.isfinite(v):
+                    v = 0.0
+                if v >= 0.5:
+                    hit = nm
+                    break
+            if hit:
+                died = True
+                death_tick = int(t)
+                death_measurement = str(hit)
+                break
+
+    if died:
+        for nm in series_names:
+            cur = series.get(nm)
+            if not isinstance(cur, list):
+                continue
+            while len(cur) < ticks_i:
+                cur.append(None)
+
+    return {
+        "died": bool(died),
+        "death_tick": int(death_tick),
+        "death_measurement": str(death_measurement),
+    }, series
+
+
+_LIFE_WORKER_BASE: Optional[Dict[str, Any]] = None
+_LIFE_WORKER_DEATH_NAMES: Optional[list[str]] = None
+_LIFE_WORKER_SERIES_NAMES: Optional[list[str]] = None
+
+
+def _lifespan_worker_init(base: Dict[str, Any], death_names: list[str], series_names: list[str]) -> None:
+    global _LIFE_WORKER_BASE, _LIFE_WORKER_DEATH_NAMES, _LIFE_WORKER_SERIES_NAMES
+    _LIFE_WORKER_BASE = base
+    _LIFE_WORKER_DEATH_NAMES = list(death_names)
+    _LIFE_WORKER_SERIES_NAMES = list(series_names)
+
+
+def _lifespan_worker_eval(ri: int, ticks: int, seed: int) -> tuple[int, Dict[str, Any], Optional[Dict[str, list[Optional[float]]]]]:
+    if _LIFE_WORKER_BASE is None or _LIFE_WORKER_DEATH_NAMES is None or _LIFE_WORKER_SERIES_NAMES is None:
+        raise ValueError("lifespan worker not initialized")
+    seed0 = int(seed) + (int(ri) * 97)
+    r, series = _run_lifespan_rep(
+        _LIFE_WORKER_BASE,
+        ticks=int(ticks),
+        seed0=int(seed0),
+        death_names=_LIFE_WORKER_DEATH_NAMES,
+        series_names=_LIFE_WORKER_SERIES_NAMES,
+    )
+    r["seed0"] = int(seed0)
+    return int(ri), r, series
+
+
+def _lifespan_survival_curve(death_ticks: list[int], *, ticks: int) -> Dict[str, Any]:
+    ticks_i = max(0, int(ticks))
+    dts: list[int] = []
+    for dt in death_ticks:
+        try:
+            dts.append(int(dt))
+        except Exception:
+            dts.append(int(ticks_i))
+
+    n = int(len(dts))
+    surv = 1.0
+    times: list[int] = [0]
+    survival: list[float] = [1.0]
+    for t in range(ticks_i):
+        at_risk = 0
+        deaths = 0
+        for dt in dts:
+            if int(dt) >= int(t):
+                at_risk += 1
+            if int(dt) == int(t):
+                deaths += 1
+        if at_risk > 0 and deaths > 0:
+            surv *= float(1.0 - (float(deaths) / float(at_risk)))
+        times.append(int(t + 1))
+        survival.append(float(surv))
+
+    median_tick = None
+    for i in range(len(times)):
+        if float(survival[i]) <= 0.5:
+            median_tick = int(times[i])
+            break
+
+    deaths_total = int(sum(1 for dt in dts if int(dt) < int(ticks_i)))
+    return {
+        "n": int(n),
+        "deaths": int(deaths_total),
+        "survivors": int(n - deaths_total),
+        "times": times,
+        "survival": survival,
+        "median_tick": median_tick,
+    }
+
+
+def _run_in_vivo_measurement_series(base: Dict[str, Any], ticks: int, seed0: int) -> Dict[str, list[float]]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+
+    expected_len = int(H * W)
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    names = _measurement_names_from_payload(p)
+    if not names:
+        return {}
+    selected = set(names)
+
+    out: Dict[str, list[float]] = {nm: [] for nm in names}
+    ticks_i = max(0, int(ticks))
+
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        sel = _compute_selected_measurements_from_layers(p, layers, H, W, selected)
+        for nm in names:
+            try:
+                v = float(sel.get(nm) or 0.0)
+            except Exception:
+                v = 0.0
+            if not np.isfinite(v):
+                v = 0.0
+            out[nm].append(float(v))
+
+    return out
+
+
+def _measurement_names_union(healthy: Dict[str, Any], sick: Dict[str, Any]) -> list[str]:
+    a = _measurement_names_from_payload(healthy)
+    b = _measurement_names_from_payload(sick)
+    if not a:
+        return b
+    if not b:
+        return a
+    seen = set(a)
+    out = list(a)
+    for nm in b:
+        if nm in seen:
+            continue
+        out.append(nm)
+        seen.add(nm)
+    return out
+
+
+def _mean_measurement_series(series_list: list[Dict[str, list[float]]], ticks: int, names: list[str]) -> Dict[str, list[float]]:
+    ticks_i = max(0, int(ticks))
+    out: Dict[str, list[float]] = {nm: [0.0] * ticks_i for nm in names}
+    if not series_list or ticks_i <= 0:
+        return out
+
+    denom = float(len(series_list))
+    for nm in names:
+        acc = np.zeros((ticks_i,), dtype=np.float64)
+        for s in series_list:
+            vv = s.get(nm) if isinstance(s, dict) else None
+            if not isinstance(vv, list) or len(vv) != ticks_i:
+                continue
+            try:
+                arr = np.asarray([float(x) for x in vv], dtype=np.float64)
+            except Exception:
+                continue
+            if arr.shape != (ticks_i,):
+                continue
+            np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            acc += arr
+        out[nm] = (acc / denom).astype(np.float64).tolist()
+    return out
+
+
+def _invivo_cure_score(
+    healthy_series: Dict[str, list[float]],
+    sick_series: Dict[str, list[float]],
+    *,
+    names: list[str],
+    ticks: int,
+    win_threshold: float = 0.95,
+) -> Dict[str, Any]:
+    ticks_i = max(0, int(ticks))
+    if ticks_i <= 0:
+        return {
+            "score": 0.0,
+            "score_pct": 0.0,
+            "distance": 0.0,
+            "win": False,
+            "win_threshold": float(win_threshold),
+        }
+
+    err_acc = 0.0
+    base_acc = 0.0
+    n = 0
+    for nm in names:
+        hv = healthy_series.get(nm)
+        sv = sick_series.get(nm)
+        if not isinstance(hv, list) or not isinstance(sv, list) or len(hv) != ticks_i or len(sv) != ticks_i:
+            continue
+        for i in range(ticks_i):
+            try:
+                a = float(hv[i])
+            except Exception:
+                a = 0.0
+            try:
+                b = float(sv[i])
+            except Exception:
+                b = 0.0
+            if not np.isfinite(a):
+                a = 0.0
+            if not np.isfinite(b):
+                b = 0.0
+            err_acc += abs(a - b)
+            base_acc += abs(a)
+            n += 1
+
+    if n <= 0:
+        return {
+            "score": 0.0,
+            "score_pct": 0.0,
+            "distance": 0.0,
+            "win": False,
+            "win_threshold": float(win_threshold),
+        }
+
+    mean_err = float(err_acc / float(n))
+    mean_base = float(base_acc / float(n))
+    scale = max(mean_base, 1e-6)
+    distance = float(mean_err / scale)
+    score = float(1.0 / (1.0 + max(0.0, distance)))
+    score_pct = float(100.0 * score)
+    win = bool(score >= float(win_threshold))
+    return {
+        "score": score,
+        "score_pct": score_pct,
+        "distance": distance,
+        "win": win,
+        "win_threshold": float(win_threshold),
+    }
+
+
+def _spatial_tx_rows(
+    payload: Dict[str, Any],
+    layer_names: list[str],
+    *,
+    cell_layer: str = "cell",
+    min_cell_value: float = 0.5,
+    stride: int = 1,
+    max_spots: Optional[int] = None,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    H = int(payload.get("H") or 0)
+    W = int(payload.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+
+    expected_len = int(H * W)
+    layers = _layers_dict_from_payload_data(payload, expected_len=expected_len)
+    if not layers:
+        raise ValueError("payload has no float32 layers")
+
+    if not layer_names:
+        layer_names = sorted(list(layers.keys()))[:8]
+    else:
+        layer_names = [str(x).strip() for x in layer_names if isinstance(x, str) and str(x).strip()]
+
+    stride_i = max(1, int(stride))
+    xs = np.arange(0, W, stride_i, dtype=np.int64)
+    ys = np.arange(0, H, stride_i, dtype=np.int64)
+    if xs.size == 0 or ys.size == 0:
+        return {"H": H, "W": W, "layers": layer_names, "rows": []}
+
+    gx, gy = np.meshgrid(xs, ys)
+    x_flat = gx.reshape(-1)
+    y_flat = gy.reshape(-1)
+    idx = (y_flat * int(W) + x_flat).astype(np.int64)
+
+    if isinstance(cell_layer, str) and cell_layer and cell_layer in layers:
+        cell_arr = np.asarray(layers[cell_layer], dtype=np.float32).reshape(-1)
+        keep = cell_arr[idx] > float(min_cell_value)
+        if np.any(keep):
+            x_flat = x_flat[keep]
+            y_flat = y_flat[keep]
+            idx = idx[keep]
+
+    n = int(idx.size)
+    if max_spots is not None:
+        max_i = max(1, int(max_spots))
+        if n > max_i:
+            rng = np.random.default_rng(int(seed))
+            pick = rng.choice(n, size=max_i, replace=False)
+            x_flat = x_flat[pick]
+            y_flat = y_flat[pick]
+            idx = idx[pick]
+
+    rows: list[Dict[str, Any]] = []
+    for j in range(int(idx.size)):
+        ii = int(idx[j])
+        row: Dict[str, Any] = {"x": int(x_flat[j]), "y": int(y_flat[j])}
+        for ln in layer_names:
+            arr = layers.get(ln)
+            if arr is None:
+                row[ln] = None
+                continue
+            try:
+                row[ln] = float(np.asarray(arr, dtype=np.float32).reshape(-1)[ii])
+            except Exception:
+                row[ln] = None
+        rows.append(row)
+
+    return {"H": H, "W": W, "layers": layer_names, "rows": rows}
+
+
+def _default_stx_gene_list(payload: Dict[str, Any], max_genes: int = 8) -> list[str]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    float_layers = [nm for nm, ent in data.items() if isinstance(nm, str) and isinstance(ent, dict) and ent.get("dtype") == "float32"]
+    if not float_layers:
+        return []
+
+    prefer = []
+    layer_meta = payload.get("layers")
+    if isinstance(layer_meta, list):
+        for m in layer_meta:
+            if not isinstance(m, dict):
+                continue
+            nm = m.get("name")
+            if isinstance(nm, str) and nm in data:
+                prefer.append(nm)
+    if not prefer:
+        prefer = sorted(float_layers)
+
+    out: list[str] = []
+    seen = set()
+    for nm in prefer:
+        if nm in seen:
+            continue
+        if nm not in float_layers:
+            continue
+        out.append(nm)
+        seen.add(nm)
+        if len(out) >= int(max_genes):
+            break
+    return out
+
+
+def _stx_values_to_counts(
+    values: list[Any],
+    *,
+    rng: Any,
+    target_depth: float = 1000.0,
+    depth_sigma: float = 0.0,
+    mu_noise_sigma: float = 0.0,
+    dropout_p: float = 0.0,
+    dropout_mu_scale: float = 0.0,
+    model: str = "poisson",
+    nb_theta: float = 10.0,
+) -> list[int]:
+    g = int(len(values))
+    if g <= 0:
+        return []
+    v = np.zeros(g, dtype=np.float64)
+    for i, x in enumerate(values):
+        try:
+            f = float(x)
+        except Exception:
+            f = 0.0
+        if not np.isfinite(f) or f < 0.0:
+            f = 0.0
+        v[int(i)] = float(f)
+
+    s = float(v.sum())
+    if not np.isfinite(s) or s <= 0.0:
+        return [0 for _ in range(g)]
+
+    frac = v / float(s)
+
+    try:
+        depth = float(target_depth)
+    except Exception:
+        depth = 0.0
+    if not np.isfinite(depth) or depth < 0.0:
+        depth = 0.0
+
+    try:
+        ds = float(depth_sigma)
+    except Exception:
+        ds = 0.0
+    if np.isfinite(ds) and ds > 0.0:
+        depth = float(depth) * float(rng.lognormal(mean=0.0, sigma=float(ds)))
+
+    mu = frac * float(depth)
+
+    try:
+        ms = float(mu_noise_sigma)
+    except Exception:
+        ms = 0.0
+    if np.isfinite(ms) and ms > 0.0:
+        mu = mu * rng.lognormal(mean=0.0, sigma=float(ms), size=mu.shape)
+
+    m = str(model or "").strip().lower()
+    if m in ("nb", "negbin", "negative_binomial"):
+        try:
+            theta = float(nb_theta)
+        except Exception:
+            theta = 10.0
+        if not np.isfinite(theta) or theta <= 0.0:
+            theta = 1.0
+        lam = rng.gamma(shape=float(theta), scale=(mu / float(theta)))
+        counts = rng.poisson(lam)
+    else:
+        counts = rng.poisson(mu)
+
+    try:
+        dp = float(dropout_p)
+    except Exception:
+        dp = 0.0
+    if np.isfinite(dp) and dp > 0.0:
+        if dp > 1.0:
+            dp = 1.0
+        try:
+            dms = float(dropout_mu_scale)
+        except Exception:
+            dms = 0.0
+        if np.isfinite(dms) and dms > 0.0:
+            p = float(dp) * np.exp(-mu / float(dms))
+        else:
+            p = float(dp)
+        mask = rng.random(size=counts.shape) < p
+        if np.any(mask):
+            cc = np.asarray(counts, dtype=np.int64)
+            cc[mask] = 0
+            counts = cc
+
+    return [int(x) for x in np.asarray(counts, dtype=np.int64).tolist()]
+
+
+def _stx_synthetic_v3_noisy_counts(
+    T: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    H: int,
+    W: int,
+    rng: Any,
+    z_target: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    T = np.asarray(T, dtype=np.float64)
+    if T.ndim != 2:
+        raise ValueError("T must be 2D")
+    n, g = int(T.shape[0]), int(T.shape[1])
+    if n <= 0 or g <= 0:
+        return np.zeros((0, max(g, 0)), dtype=np.int64)
+    T = np.where(np.isfinite(T) & (T >= 0.0), T, 0.0)
+
+    x = np.asarray(np.round(x), dtype=np.int64).reshape(n)
+    y = np.asarray(np.round(y), dtype=np.int64).reshape(n)
+
+    sigma_cell = 0.35
+    theta = 50.0
+    eps = 0.08
+    ambient_frac = 0.001
+    ambient_sigma_cell = 0.25
+
+    s_i = np.exp(rng.normal(loc=-0.5 * sigma_cell * sigma_cell, scale=sigma_cell, size=n))
+    mu = T * s_i.reshape(n, 1)
+
+    coords = np.stack([y, x], axis=1)
+    uniq, inv = np.unique(coords, axis=0, return_inverse=True)
+    loc_counts = np.bincount(inv, minlength=int(uniq.shape[0])).astype(np.float64)
+    loc_counts = np.maximum(loc_counts, 1.0)
+
+    loc_mu = np.zeros((int(uniq.shape[0]), g), dtype=np.float64)
+    for j in range(g):
+        loc_sum = np.bincount(inv, weights=mu[:, j], minlength=int(uniq.shape[0])).astype(np.float64)
+        loc_mu[:, j] = loc_sum / loc_counts
+
+    mu_mixed = np.asarray(mu, dtype=np.float64).copy()
+    uy_all = uniq[:, 0].astype(np.int64)
+    ux_all = uniq[:, 1].astype(np.int64)
+    inb = (uy_all >= 0) & (uy_all < int(H)) & (ux_all >= 0) & (ux_all < int(W))
+    loc_to_inb = np.full((int(uniq.shape[0]),), -1, dtype=np.int64)
+    inb_idx = np.nonzero(inb)[0]
+    loc_to_inb[inb_idx] = np.arange(int(inb_idx.size), dtype=np.int64)
+    uy = uy_all[inb]
+    ux = ux_all[inb]
+    loc_mu_inb = loc_mu[inb]
+
+    key_to_inb: Dict[tuple[int, int], int] = {}
+    for k in range(int(uy.size)):
+        key_to_inb[(int(uy[k]), int(ux[k]))] = int(k)
+
+    inv_inb = loc_to_inb[np.asarray(inv, dtype=np.int64)]
+    cell_has_loc = inv_inb >= 0
+
+    for j in range(g):
+        loc_mix = np.full((int(uy.size),), np.nan, dtype=np.float64)
+        for k in range(int(uy.size)):
+            yy = int(uy[k])
+            xx = int(ux[k])
+            neigh: list[float] = []
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                kk = key_to_inb.get((yy + int(dy), xx + int(dx)))
+                if kk is None:
+                    continue
+                neigh.append(float(loc_mu_inb[int(kk), int(j)]))
+            if not neigh:
+                continue
+            nb = float(np.mean(np.asarray(neigh, dtype=np.float64)))
+            loc_mix[int(k)] = (1.0 - float(eps)) * float(loc_mu_inb[int(k), int(j)]) + float(eps) * nb
+
+        gm = np.full((n,), np.nan, dtype=np.float64)
+        if np.any(cell_has_loc):
+            gm[cell_has_loc] = loc_mix[inv_inb[cell_has_loc]]
+        ok = np.isfinite(gm)
+        if np.any(ok):
+            mu_mixed[:, j] = np.where(ok, gm, mu[:, j])
+
+    mu = mu_mixed
+
+    meanT = np.mean(T, axis=0)
+    lam_feat = float(ambient_frac) * meanT
+    sA = np.exp(rng.normal(loc=-0.5 * ambient_sigma_cell * ambient_sigma_cell, scale=ambient_sigma_cell, size=n))
+    mu_total = mu + sA.reshape(n, 1) * lam_feat.reshape(1, g)
+    mu_total = np.where(np.isfinite(mu_total) & (mu_total >= 0.0), mu_total, 0.0)
+
+    th = float(theta)
+    if not np.isfinite(th) or th <= 0.0:
+        th = 1.0
+    lam = rng.gamma(shape=th, scale=(mu_total / th))
+    Y = rng.poisson(lam).astype(np.int64)
+
+    z0 = np.mean(Y == 0, axis=0)
+    if z_target is None:
+        zt = np.asarray(z0, dtype=np.float64)
+    else:
+        zt = np.asarray(z_target, dtype=np.float64).reshape(-1)
+        if int(zt.size) != int(g):
+            raise ValueError("z_target must have length == #features")
+        zt = np.where(np.isfinite(zt), zt, z0)
+    zt = np.clip(zt, 0.0, 0.98)
+    denom = 1.0 - z0
+    denom = np.where(denom <= 0.0, 1.0, denom)
+    p_extra = np.clip((zt - z0) / denom, 0.0, 1.0)
+
+    for j in range(g):
+        pj = float(p_extra[j])
+        if pj <= 0.0:
+            continue
+        r = rng.random(size=n)
+        drop = (Y[:, j] > 0) & (r < pj)
+        if np.any(drop):
+            Y[drop, j] = 0
+
+    return np.asarray(Y, dtype=np.int64)
+
+
+def _bulk_synthetic_v1_noisy_counts(
+    T: np.ndarray,
+    *,
+    rng: Any,
+    z_target: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    T = np.asarray(T, dtype=np.float64)
+    if T.ndim != 2:
+        raise ValueError("T must be 2D")
+    n, g = int(T.shape[0]), int(T.shape[1])
+    if n <= 0 or g <= 0:
+        return np.zeros((0, max(g, 0)), dtype=np.int64)
+    T = np.where(np.isfinite(T) & (T >= 0.0), T, 0.0)
+
+    sigma_sample = 0.35
+    theta = 50.0
+    ambient_frac = 0.001
+    ambient_sigma_sample = 0.25
+
+    s_i = np.exp(rng.normal(loc=-0.5 * sigma_sample * sigma_sample, scale=sigma_sample, size=n))
+    mu = T * s_i.reshape(n, 1)
+
+    meanT = np.mean(T, axis=0)
+    lam_feat = float(ambient_frac) * meanT
+    sA = np.exp(rng.normal(loc=-0.5 * ambient_sigma_sample * ambient_sigma_sample, scale=ambient_sigma_sample, size=n))
+    mu_total = mu + sA.reshape(n, 1) * lam_feat.reshape(1, g)
+    mu_total = np.where(np.isfinite(mu_total) & (mu_total >= 0.0), mu_total, 0.0)
+
+    th = float(theta)
+    if not np.isfinite(th) or th <= 0.0:
+        th = 1.0
+    lam = rng.gamma(shape=th, scale=(mu_total / th))
+    Y = rng.poisson(lam).astype(np.int64)
+
+    z0 = np.mean(Y == 0, axis=0)
+    if z_target is None:
+        zt = np.asarray(z0, dtype=np.float64)
+    else:
+        zt = np.asarray(z_target, dtype=np.float64).reshape(-1)
+        if int(zt.size) != int(g):
+            raise ValueError("z_target must have length == #features")
+        zt = np.where(np.isfinite(zt), zt, z0)
+    zt = np.clip(zt, 0.0, 0.98)
+    denom = 1.0 - z0
+    denom = np.where(denom <= 0.0, 1.0, denom)
+    p_extra = np.clip((zt - z0) / denom, 0.0, 1.0)
+
+    for j in range(g):
+        pj = float(p_extra[j])
+        if pj <= 0.0:
+            continue
+        r = rng.random(size=n)
+        drop = (Y[:, j] > 0) & (r < pj)
+        if np.any(drop):
+            Y[drop, j] = 0
+
+    return np.asarray(Y, dtype=np.int64)
+
+
+def _csv_escape(v: Any) -> str:
+    if v is None:
+        s = ""
+    else:
+        s = str(v)
+    if any(ch in s for ch in (",", "\n", "\r", "\"")):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def _csv_from_rows(header: list[str], rows: list[list[Any]]) -> str:
+    out_lines = [",".join(_csv_escape(h) for h in header)]
+    for r in rows:
+        out_lines.append(",".join(_csv_escape(x) for x in r))
+    return "\n".join(out_lines) + "\n"
 
 
 def _safe_read_json(path: Path) -> Any:
@@ -1474,7 +2692,7 @@ def _evo_worker_eval_affine(
         agg_modes = {
             str(k): str(v)
             for k, v in meas_aggs.items()
-            if isinstance(k, str) and str(v) in ("mean", "median")
+            if isinstance(k, str) and str(v) in ("mean", "median", "std", "var")
         }
         agg_names = set(agg_modes.keys())
         per_tick_meas: Dict[str, list[float]] = {k: [] for k in agg_names}
@@ -1508,7 +2726,10 @@ def _evo_worker_eval_affine(
                 sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, H, W, agg_names)
                 for nm in agg_names:
                     try:
-                        per_tick_meas[nm].append(float(sel.get(nm) or 0.0))
+                        vv = float(sel.get(nm) or 0.0)
+                        if not np.isfinite(vv):
+                            vv = 0.0
+                        per_tick_meas[nm].append(vv)
                     except Exception:
                         per_tick_meas[nm].append(0.0)
 
@@ -1544,6 +2765,10 @@ def _evo_worker_eval_affine(
                     measurements[nm] = float(np.mean(np.asarray(vals, dtype=np.float64)))
                 elif mode == "median":
                     measurements[nm] = float(np.median(np.asarray(vals, dtype=np.float64)))
+                elif mode == "std":
+                    measurements[nm] = float(np.std(np.asarray(vals, dtype=np.float64)))
+                elif mode == "var":
+                    measurements[nm] = float(np.var(np.asarray(vals, dtype=np.float64)))
         
         rep_metrics.append(
             {
@@ -1718,7 +2943,7 @@ def _evo_worker_eval_cem_delta(
         agg_modes = {
             str(k): str(v)
             for k, v in meas_aggs.items()
-            if isinstance(k, str) and str(v) in ("mean", "median")
+            if isinstance(k, str) and str(v) in ("mean", "median", "std", "var")
         }
         agg_names = set(agg_modes.keys())
         per_tick_meas: Dict[str, list[float]] = {k: [] for k in agg_names}
@@ -1749,10 +2974,13 @@ def _evo_worker_eval_cem_delta(
                         if isinstance(arr2, np.ndarray):
                             layers_dict_tick[nm2] = arr2
 
-                sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, H, W, agg_names)
+                sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, int(H), int(W), agg_names)
                 for nm in agg_names:
                     try:
-                        per_tick_meas[nm].append(float(sel.get(nm) or 0.0))
+                        vv = float(sel.get(nm) or 0.0)
+                        if not np.isfinite(vv):
+                            vv = 0.0
+                        per_tick_meas[nm].append(vv)
                     except Exception:
                         per_tick_meas[nm].append(0.0)
 
@@ -1788,6 +3016,10 @@ def _evo_worker_eval_cem_delta(
                     measurements[nm] = float(np.mean(np.asarray(vals, dtype=np.float64)))
                 elif mode == "median":
                     measurements[nm] = float(np.median(np.asarray(vals, dtype=np.float64)))
+                elif mode == "std":
+                    measurements[nm] = float(np.std(np.asarray(vals, dtype=np.float64)))
+                elif mode == "var":
+                    measurements[nm] = float(np.var(np.asarray(vals, dtype=np.float64)))
         
         rep_metrics.append(
             {
@@ -2477,7 +3709,7 @@ class _EvolutionJob:
         agg_modes = {
             str(k): str(v)
             for k, v in meas_aggs.items()
-            if isinstance(k, str) and str(v) in ("mean", "median")
+            if isinstance(k, str) and str(v) in ("mean", "median", "std", "var")
         }
         agg_names = set(agg_modes.keys())
 
@@ -2526,7 +3758,10 @@ class _EvolutionJob:
                     sel = _compute_selected_measurements_from_layers(p, layers_dict_tick, int(H), int(W), agg_names)
                     for nm in agg_names:
                         try:
-                            per_tick_meas[nm].append(float(sel.get(nm) or 0.0))
+                            vv = float(sel.get(nm) or 0.0)
+                            if not np.isfinite(vv):
+                                vv = 0.0
+                            per_tick_meas[nm].append(vv)
                         except Exception:
                             per_tick_meas[nm].append(0.0)
             dd = p.get("data")
@@ -2572,6 +3807,10 @@ class _EvolutionJob:
                         measurements[nm] = float(np.mean(np.asarray(vals, dtype=np.float64)))
                     elif mode == "median":
                         measurements[nm] = float(np.median(np.asarray(vals, dtype=np.float64)))
+                    elif mode == "std":
+                        measurements[nm] = float(np.std(np.asarray(vals, dtype=np.float64)))
+                    elif mode == "var":
+                        measurements[nm] = float(np.var(np.asarray(vals, dtype=np.float64)))
 
             tick_by_type_s: Dict[str, float] = {}
             if profile_ticks:
@@ -4186,14 +5425,33 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         t0 = time.time()
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
         try:
-            if self.path == "/api/health":
+            if path == "/api/health":
                 self._send_json(200, {"ok": True, "tick": int(_RT.tick)})
                 return
-            if self.path == "/api/doc/status":
+            if path == "/api/spatial_tx/gene_sets":
+                self._send_json(200, {"ok": True, "gene_sets": _list_stx_gene_sets()})
+                return
+            if path == "/api/bulk_omics/sets":
+                self._send_json(200, {"ok": True, "sets": _list_bulk_omics_sets()})
+                return
+            if path == "/api/game/state":
+                pid = ""
+                try:
+                    qv = qs.get("player_id")
+                    if isinstance(qv, list) and qv:
+                        pid = str(qv[0] or "")
+                except Exception:
+                    pid = ""
+                self._send_json(200, {"ok": True, "game": _game_get_player_state(pid)})
+                return
+            if path == "/api/doc/status":
                 self._send_json(200, _DOC.status())
                 return
-            if self.path == "/api/doc/list":
+            if path == "/api/doc/list":
                 self._send_json(200, _DOC.list_docs())
                 return
             super().do_GET()
@@ -4210,6 +5468,538 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/doc/clear":
                 _DOC.clear_active()
                 self._send_json(200, _DOC.status())
+                return
+
+            if self.path == "/api/game/reset":
+                body = self._read_json_body()
+                self._send_json(200, {"ok": True, "game": _game_reset_player(body.get("player_id"))})
+                return
+
+            if self.path == "/api/experiments/spatial_tx":
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = body.get("interventions")
+
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                seed = body.get("seed", 1)
+                gene_set_req = body.get("gene_set")
+                gene_set_name, genes = _load_stx_gene_set(str(gene_set_req or ""))
+
+                conds = body.get("conditions")
+                cond_list: list[Dict[str, Any]] = []
+                if isinstance(conds, list):
+                    for c in conds:
+                        if not isinstance(c, dict):
+                            continue
+                        nm = str(c.get("name") or "").strip()
+                        payload = c.get("payload")
+                        if not nm or not isinstance(payload, dict):
+                            continue
+                        cond_list.append({"name": nm, "payload": payload})
+
+                if cond_list:
+                    for ent in cond_list:
+                        try:
+                            nm = str(ent.get("name") or "").strip().lower()
+                        except Exception:
+                            nm = ""
+                        if nm != "sick":
+                            continue
+                        p0 = ent.get("payload")
+                        if not isinstance(p0, dict):
+                            continue
+                        p1 = _deepcopy_payload(p0)
+                        _apply_interventions_to_payload_inplace(p1, interventions)
+                        ent["payload"] = p1
+
+                if not cond_list:
+                    healthy = body.get("healthy")
+                    sick = body.get("sick")
+                    if isinstance(healthy, dict):
+                        cond_list.append({"name": "healthy", "payload": healthy})
+                    if isinstance(sick, dict):
+                        sick2 = _deepcopy_payload(sick)
+                        _apply_interventions_to_payload_inplace(sick2, interventions)
+                        cond_list.append({"name": "sick", "payload": sick2})
+
+                if not cond_list:
+                    raise ValueError("missing conditions (provide conditions[] or healthy/sick payloads)")
+
+                if not genes:
+                    first_payload = cond_list[0].get("payload") if cond_list else None
+                    if isinstance(first_payload, dict):
+                        genes = _default_stx_gene_list(first_payload, max_genes=8)
+                if not genes:
+                    raise ValueError("no genes selected")
+
+                z_target_arr = None
+                z_target_in = body.get("z_target")
+                if isinstance(z_target_in, list):
+                    if len(z_target_in) != int(len(genes)):
+                        raise ValueError("z_target must have length == #genes")
+                    tmp: list[float] = []
+                    for v in z_target_in:
+                        try:
+                            f = float(v)
+                        except Exception:
+                            f = float("nan")
+                        tmp.append(f)
+                    z_target_arr = np.asarray(tmp, dtype=np.float64)
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+                syn_rng = np.random.default_rng(3)
+
+                meta_header = [
+                    "cell_id",
+                    "sample",
+                    "condition",
+                    "replicate",
+                    "seed",
+                    "ticks",
+                    "x",
+                    "y",
+                    "grid_index",
+                ]
+                meta_rows: list[list[Any]] = []
+                mat_header = ["cell_id", *genes]
+                truth_mat_rows: list[list[Any]] = []
+                noisy_mat_rows: list[list[Any]] = []
+
+                out_runs: list[Dict[str, Any]] = []
+                for ci, c in enumerate(cond_list):
+                    nm = str(c.get("name") or "").strip()
+                    payload = c.get("payload")
+                    if not nm or not isinstance(payload, dict):
+                        continue
+
+                    for ri in range(reps_i):
+                        seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
+                        p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
+                        tx = _spatial_tx_rows(
+                            p,
+                            genes,
+                            cell_layer="",
+                            min_cell_value=0.0,
+                            stride=1,
+                            max_spots=None,
+                            seed=seed0,
+                        )
+
+                        H = int(tx.get("H") or 0)
+                        W = int(tx.get("W") or 0)
+                        rows = tx.get("rows")
+                        if not isinstance(rows, list):
+                            rows = []
+
+                        run_cell_ids: list[str] = []
+                        run_x: list[int] = []
+                        run_y: list[int] = []
+                        run_T: list[list[float]] = []
+
+                        for si, row in enumerate(rows):
+                            if not isinstance(row, dict):
+                                continue
+                            x = row.get("x")
+                            y = row.get("y")
+                            try:
+                                xi = int(x)
+                            except Exception:
+                                continue
+                            try:
+                                yi = int(y)
+                            except Exception:
+                                continue
+                            grid_index = (yi * int(W) + xi) if (W > 0) else int(yi)
+                            cell_id = f"{nm}_r{int(ri)}_s{int(seed0)}_{int(si)}"
+
+                            meta_rows.append(
+                                [
+                                    cell_id,
+                                    nm,
+                                    nm,
+                                    int(ri),
+                                    int(seed0),
+                                    int(ticks_i),
+                                    int(xi),
+                                    int(yi),
+                                    int(grid_index),
+                                ]
+                            )
+                            vals: list[Any] = []
+                            for g in genes:
+                                vals.append(row.get(g))
+                            vv: list[float] = []
+                            for x0 in vals:
+                                try:
+                                    f0 = float(x0)
+                                except Exception:
+                                    f0 = 0.0
+                                if not np.isfinite(f0) or f0 < 0.0:
+                                    f0 = 0.0
+                                vv.append(float(f0))
+
+                            truth_mat_rows.append([cell_id, *vv])
+                            run_cell_ids.append(cell_id)
+                            run_x.append(int(xi))
+                            run_y.append(int(yi))
+                            run_T.append(vv)
+
+                        if run_cell_ids and run_T:
+                            T_arr = np.asarray(run_T, dtype=np.float64)
+                            x_arr = np.asarray(run_x, dtype=np.int64)
+                            y_arr = np.asarray(run_y, dtype=np.int64)
+                            Y = _stx_synthetic_v3_noisy_counts(T_arr, x_arr, y_arr, H=int(H), W=int(W), rng=syn_rng, z_target=z_target_arr)
+                            for ii, cid in enumerate(run_cell_ids):
+                                noisy_mat_rows.append([cid, *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]])
+
+                        out_runs.append(
+                            {
+                                "condition": nm,
+                                "replicate": int(ri),
+                                "seed": int(seed0),
+                                "ticks": int(ticks_i),
+                                "cells": int(len(rows)),
+                                "H": int(H),
+                                "W": int(W),
+                            }
+                        )
+
+                matrix_truth_csv = _csv_from_rows(mat_header, truth_mat_rows)
+                matrix_noisy_csv = _csv_from_rows(mat_header, noisy_mat_rows)
+                metadata_csv = _csv_from_rows(meta_header, meta_rows)
+
+                samples_run = int(len(out_runs))
+                charge = _game_compute_charge(
+                    "spatial_transcriptomics",
+                    samples_run,
+                    meta={
+                        "experiment": "spatial_tx_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "gene_set": str(gene_set_name or ""),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": "spatial_tx_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "gene_set": str(gene_set_name or ""),
+                        "genes": genes,
+                        "noise": {
+                            "model": "synthetic_v3",
+                            "sigma_cell": 0.35,
+                            "theta": 50.0,
+                            "eps": 0.08,
+                            "ambient_frac": 0.001,
+                            "ambient_sigma_cell": 0.25,
+                            "rng_seed": 3,
+                        },
+                        "matrix_csv": matrix_noisy_csv,
+                        "matrix_truth_csv": matrix_truth_csv,
+                        "matrix_noisy_csv": matrix_noisy_csv,
+                        "metadata_csv": metadata_csv,
+                        "runs": out_runs,
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path == "/api/experiments/in_vivo_trial":
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = body.get("interventions")
+
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                seed = body.get("seed", 1)
+                healthy = body.get("healthy")
+                sick = body.get("sick")
+                if not isinstance(healthy, dict) or not isinstance(sick, dict):
+                    raise ValueError("missing healthy/sick payloads")
+
+                sick2 = _deepcopy_payload(sick)
+                _apply_interventions_to_payload_inplace(sick2, interventions)
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                names = _measurement_names_union(healthy, sick)
+                if not names:
+                    raise ValueError("no measurements configured (missing measurements_config)")
+
+                rep_series_healthy: list[Dict[str, list[float]]] = []
+                rep_series_sick: list[Dict[str, list[float]]] = []
+                for ri in range(reps_i):
+                    seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                    seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+                    rep_series_healthy.append(_run_in_vivo_measurement_series(healthy, ticks=ticks_i, seed0=seed0_h))
+                    rep_series_sick.append(_run_in_vivo_measurement_series(sick2, ticks=ticks_i, seed0=seed0_s))
+
+                mean_healthy = _mean_measurement_series(rep_series_healthy, ticks=ticks_i, names=names)
+                mean_sick = _mean_measurement_series(rep_series_sick, ticks=ticks_i, names=names)
+
+                cure = _invivo_cure_score(mean_healthy, mean_sick, names=names, ticks=ticks_i)
+
+                samples_run = int(2 * reps_i)
+                charge = _game_compute_charge(
+                    "in_vivo_trial",
+                    samples_run,
+                    meta={
+                        "experiment": "in_vivo_trial_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": "in_vivo_trial_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "measurements": names,
+                        "series": {
+                            "healthy": mean_healthy,
+                            "sick": mean_sick,
+                        },
+                        "cure": cure,
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path == "/api/experiments/bulk_omics":
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = body.get("interventions")
+
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                seed = body.get("seed", 1)
+                omics_set_req = body.get("omics_set")
+                omics_set_name, features = _load_bulk_omics_set(str(omics_set_req or ""))
+
+                conds = body.get("conditions")
+                cond_list: list[Dict[str, Any]] = []
+                if isinstance(conds, list):
+                    for c in conds:
+                        if not isinstance(c, dict):
+                            continue
+                        nm = str(c.get("name") or "").strip()
+                        payload = c.get("payload")
+                        if not nm or not isinstance(payload, dict):
+                            continue
+                        cond_list.append({"name": nm, "payload": payload})
+
+                if cond_list:
+                    for ent in cond_list:
+                        try:
+                            nm = str(ent.get("name") or "").strip().lower()
+                        except Exception:
+                            nm = ""
+                        if nm != "sick":
+                            continue
+                        p0 = ent.get("payload")
+                        if not isinstance(p0, dict):
+                            continue
+                        p1 = _deepcopy_payload(p0)
+                        _apply_interventions_to_payload_inplace(p1, interventions)
+                        ent["payload"] = p1
+
+                if not cond_list:
+                    healthy = body.get("healthy")
+                    sick = body.get("sick")
+                    if isinstance(healthy, dict):
+                        cond_list.append({"name": "healthy", "payload": healthy})
+                    if isinstance(sick, dict):
+                        sick2 = _deepcopy_payload(sick)
+                        _apply_interventions_to_payload_inplace(sick2, interventions)
+                        cond_list.append({"name": "sick", "payload": sick2})
+
+                if not cond_list:
+                    raise ValueError("missing conditions (provide conditions[] or healthy/sick payloads)")
+
+                if not features:
+                    raise ValueError("no features selected")
+
+                z_target_arr = None
+                z_target_in = body.get("z_target")
+                if isinstance(z_target_in, list):
+                    if len(z_target_in) != int(len(features)):
+                        raise ValueError("z_target must have length == #features")
+                    tmp: list[float] = []
+                    for v in z_target_in:
+                        try:
+                            f = float(v)
+                        except Exception:
+                            f = float("nan")
+                        tmp.append(f)
+                    z_target_arr = np.asarray(tmp, dtype=np.float64)
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                syn_rng = np.random.default_rng(3)
+
+                meta_header = [
+                    "sample_id",
+                    "condition",
+                    "replicate",
+                    "seed",
+                    "ticks",
+                ]
+                meta_rows: list[list[Any]] = []
+                mat_header = ["sample_id", *features]
+                truth_mat_rows: list[list[Any]] = []
+
+                run_ids: list[str] = []
+                run_T: list[list[float]] = []
+
+                out_runs: list[Dict[str, Any]] = []
+                for ci, c in enumerate(cond_list):
+                    nm = str(c.get("name") or "").strip()
+                    payload = c.get("payload")
+                    if not nm or not isinstance(payload, dict):
+                        continue
+
+                    for ri in range(reps_i):
+                        seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
+                        p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
+                        H = int(p.get("H") or 0)
+                        W = int(p.get("W") or 0)
+                        if H <= 0 or W <= 0:
+                            raise ValueError("payload invalid H/W")
+                        expected_len = int(H * W)
+                        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+                        if not layers:
+                            raise ValueError("payload has no float32 layers")
+
+                        sample_id = f"{nm}_r{int(ri)}_s{int(seed0)}"
+                        vv: list[float] = []
+                        for ln in features:
+                            arr = layers.get(ln)
+                            if arr is None:
+                                vv.append(0.0)
+                                continue
+                            try:
+                                s = float(np.asarray(arr, dtype=np.float64).reshape(-1).sum())
+                            except Exception:
+                                s = 0.0
+                            if not np.isfinite(s) or s < 0.0:
+                                s = 0.0
+                            vv.append(float(s))
+
+                        meta_rows.append([
+                            sample_id,
+                            nm,
+                            int(ri),
+                            int(seed0),
+                            int(ticks_i),
+                        ])
+                        truth_mat_rows.append([sample_id, *vv])
+                        run_ids.append(sample_id)
+                        run_T.append(vv)
+
+                        out_runs.append(
+                            {
+                                "condition": nm,
+                                "replicate": int(ri),
+                                "seed": int(seed0),
+                                "ticks": int(ticks_i),
+                                "H": int(H),
+                                "W": int(W),
+                            }
+                        )
+
+                noisy_mat_rows: list[list[Any]] = []
+                if run_ids and run_T:
+                    T_arr = np.asarray(run_T, dtype=np.float64)
+                    Y = _bulk_synthetic_v1_noisy_counts(T_arr, rng=syn_rng, z_target=z_target_arr)
+                    for ii, sid in enumerate(run_ids):
+                        noisy_mat_rows.append([sid, *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]])
+
+                matrix_truth_csv = _csv_from_rows(mat_header, truth_mat_rows)
+                matrix_noisy_csv = _csv_from_rows(mat_header, noisy_mat_rows)
+                metadata_csv = _csv_from_rows(meta_header, meta_rows)
+
+                samples_run = int(len(out_runs))
+                kind = _bulk_omics_kind_from_set_name(str(omics_set_name or ""))
+                charge = _game_compute_charge(
+                    kind,
+                    samples_run,
+                    meta={
+                        "experiment": "bulk_omics_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "omics_set": str(omics_set_name or ""),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": "bulk_omics_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "omics_set": str(omics_set_name or ""),
+                        "genes": features,
+                        "noise": {
+                            "model": "bulk_synthetic_v1",
+                            "sigma_sample": 0.35,
+                            "theta": 50.0,
+                            "ambient_frac": 0.001,
+                            "ambient_sigma_sample": 0.25,
+                            "rng_seed": 3,
+                        },
+                        "matrix_csv": matrix_noisy_csv,
+                        "matrix_truth_csv": matrix_truth_csv,
+                        "matrix_noisy_csv": matrix_noisy_csv,
+                        "metadata_csv": metadata_csv,
+                        "runs": out_runs,
+                        "game": game,
+                    },
+                )
                 return
 
             if self.path == "/api/doc/get":
@@ -4399,6 +6189,223 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     do_breakdown=do_breakdown,
                 )
                 self._send_json(200, out)
+                return
+
+            if self.path == "/api/lifespan/run":
+                body = self._read_json_body()
+                payload = body.get("payload")
+                if not isinstance(payload, dict):
+                    raise ValueError("missing payload")
+
+                ticks = body.get("ticks", 200)
+                replicates = body.get("replicates", 10)
+                seed = body.get("seed", 1)
+                try:
+                    ticks_i = max(1, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                include_series = bool(body.get("include_series") or False)
+
+                worker_mode_raw = body.get("worker_mode", "thread")
+                worker_mode = str(worker_mode_raw or "thread").strip().lower()
+                if worker_mode not in ("thread", "process"):
+                    worker_mode = "thread"
+
+                workers_missing = "workers" not in body
+                workers_raw = body.get("workers", None)
+                if workers_missing:
+                    workers_i = 1
+                else:
+                    try:
+                        workers_i = int(workers_raw)
+                    except Exception:
+                        workers_i = 0
+
+                death_names = _death_measurement_names_from_payload(payload)
+                if not death_names:
+                    raise ValueError("no death measurements found (measurement name must contain 'death')")
+
+                series_names: list[str] = []
+                if include_series:
+                    all_names = _measurement_names_from_payload(payload)
+                    dn = set(death_names)
+                    series_names = [nm for nm in all_names if nm not in dn]
+
+                if workers_i <= 0:
+                    workers_i = max(1, int(min(4, os.cpu_count() or 1)))
+                workers_i = max(1, min(int(workers_i), int(reps_i), 32))
+
+                reps_out: list[Dict[str, Any]] = [{} for _ in range(reps_i)]
+                death_ticks: list[int] = [int(ticks_i) for _ in range(reps_i)]
+                reps_series_out: list[Optional[Dict[str, list[Optional[float]]]]] = [None for _ in range(reps_i)]
+
+                series_sum: Dict[str, list[float]] = {nm: [0.0] * int(ticks_i) for nm in series_names}
+                series_n: Dict[str, list[int]] = {nm: [0] * int(ticks_i) for nm in series_names}
+
+                def _accum_series(series: Optional[Dict[str, list[Optional[float]]]]) -> None:
+                    if not series_names or not isinstance(series, dict):
+                        return
+                    for nm in series_names:
+                        arr = series.get(nm)
+                        if not isinstance(arr, list) or not arr:
+                            continue
+                        ss = series_sum.get(nm)
+                        nn = series_n.get(nm)
+                        if not isinstance(ss, list) or not isinstance(nn, list):
+                            continue
+                        m = min(int(ticks_i), len(arr), len(ss), len(nn))
+                        for i in range(m):
+                            v0 = arr[i]
+                            if v0 is None:
+                                continue
+                            try:
+                                v = float(v0)
+                            except Exception:
+                                continue
+                            if not np.isfinite(v):
+                                continue
+                            ss[i] += float(v)
+                            nn[i] += 1
+
+                def _run_one(ri: int) -> tuple[int, Dict[str, Any], Optional[Dict[str, list[Optional[float]]]]]:
+                    seed0 = int(seed_i) + (int(ri) * 97)
+                    r, series = _run_lifespan_rep(
+                        payload,
+                        ticks=ticks_i,
+                        seed0=seed0,
+                        death_names=death_names,
+                        series_names=series_names,
+                    )
+                    r["seed0"] = int(seed0)
+                    return int(ri), r, series
+
+                if int(reps_i) <= 1 or int(workers_i) <= 1:
+                    for ri in range(reps_i):
+                        _, r, series = _run_one(int(ri))
+                        reps_out[int(ri)] = r
+                        if 0 <= int(ri) < int(reps_i):
+                            reps_series_out[int(ri)] = series
+                        _accum_series(series)
+                        try:
+                            death_ticks[int(ri)] = int(r.get("death_tick"))
+                        except Exception:
+                            death_ticks[int(ri)] = int(ticks_i)
+                elif worker_mode == "process":
+                    ctx = mp.get_context("spawn")
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=int(workers_i),
+                        mp_context=ctx,
+                        initializer=_lifespan_worker_init,
+                        initargs=(payload, death_names, series_names),
+                    ) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(range(reps_i))
+
+                        def _submit_one() -> None:
+                            try:
+                                ri0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_lifespan_worker_eval, int(ri0), int(ticks_i), int(seed_i)))
+
+                        for _ in range(min(int(workers_i), int(reps_i))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(
+                                pending, return_when=concurrent.futures.FIRST_COMPLETED
+                            )
+                            for fut in done:
+                                ri, r, series = fut.result()
+                                if 0 <= int(ri) < int(reps_i):
+                                    reps_out[int(ri)] = r
+                                    reps_series_out[int(ri)] = series
+                                    _accum_series(series)
+                                    try:
+                                        death_ticks[int(ri)] = int(r.get("death_tick"))
+                                    except Exception:
+                                        death_ticks[int(ri)] = int(ticks_i)
+                                _submit_one()
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(range(reps_i))
+
+                        def _submit_one() -> None:
+                            try:
+                                ri0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_run_one, int(ri0)))
+
+                        for _ in range(min(int(workers_i), int(reps_i))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(
+                                pending, return_when=concurrent.futures.FIRST_COMPLETED
+                            )
+                            for fut in done:
+                                ri, r, series = fut.result()
+                                if 0 <= int(ri) < int(reps_i):
+                                    reps_out[int(ri)] = r
+                                    reps_series_out[int(ri)] = series
+                                    _accum_series(series)
+                                    try:
+                                        death_ticks[int(ri)] = int(r.get("death_tick"))
+                                    except Exception:
+                                        death_ticks[int(ri)] = int(ticks_i)
+                                _submit_one()
+
+                mean_series: Optional[Dict[str, Any]] = None
+                if series_names:
+                    mean: Dict[str, list[Optional[float]]] = {}
+                    for nm in series_names:
+                        ss = series_sum.get(nm)
+                        nn = series_n.get(nm)
+                        if not isinstance(ss, list) or not isinstance(nn, list) or len(ss) != int(ticks_i) or len(nn) != int(ticks_i):
+                            continue
+                        out_arr: list[Optional[float]] = []
+                        for i in range(int(ticks_i)):
+                            c = int(nn[i])
+                            if c <= 0:
+                                out_arr.append(None)
+                            else:
+                                out_arr.append(float(ss[i]) / float(c))
+                        mean[nm] = out_arr
+                    mean_series = {
+                        "ticks": list(range(int(ticks_i))),
+                        "names": series_names,
+                        "mean": mean,
+                        "replicates": reps_series_out,
+                    }
+
+                curve = _lifespan_survival_curve(death_ticks, ticks=ticks_i)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": "lifespan_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "seed": int(seed_i),
+                        "workers": int(workers_i),
+                        "worker_mode": str(worker_mode),
+                        "death_measurements": death_names,
+                        "measurements_series": mean_series,
+                        "replicates_out": reps_out,
+                        "curve": curve,
+                    },
+                )
                 return
 
             self._send_json(404, {"ok": False, "error": "not found"})
