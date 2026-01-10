@@ -116,6 +116,44 @@
 
               <div id="tabInVivoPanel" class="tabPanel">
                 <div class="meta" style="margin-top: 6px;">Runs the simulation for each condition and plots Measurements over ticks.</div>
+
+                <div class="row">
+                  <label class="label">Workers (0=auto)</label>
+                  <input id="ivWorkers" class="input" type="number" min="0" step="1" value="0" />
+                </div>
+
+                <div class="row">
+                  <label class="label">Worker mode</label>
+                  <select id="ivWorkerMode" class="input">
+                    <option value="process" selected>Process</option>
+                    <option value="thread">Thread</option>
+                  </select>
+                </div>
+
+                <div class="row row--inline">
+                  <label class="checkbox"><input id="ivShowIndividuals" type="checkbox" /> Show individuals</label>
+                </div>
+
+                <div class="hr" style="margin: 10px 0;"></div>
+
+                <div class="meta">Protein screen: perturb each protein_* layer (one at a time) and rank by median lifespan.</div>
+
+                <div class="row">
+                  <label class="label">Screen direction</label>
+                  <select id="ivScreenDir" class="input">
+                    <option value="up" selected>Up (+10% per dose)</option>
+                    <option value="down">Down (-10% per dose)</option>
+                  </select>
+                </div>
+
+                <div class="row">
+                  <label class="label">Screen dose</label>
+                  <input id="ivScreenDose" class="input" type="number" min="0" step="0.5" value="1" />
+                </div>
+
+                <div class="row">
+                  <button id="ivScreenBtn" class="btn btn--secondary">Run screen</button>
+                </div>
               </div>
 
               <div class="row row--inline">

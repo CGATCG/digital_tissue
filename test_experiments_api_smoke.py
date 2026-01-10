@@ -117,12 +117,43 @@ def _run_steps(base_url: str) -> None:
 
     player_id = "smoke_player"
 
+    gene_set = ""
+    try:
+        gs = _http_get_json(base_url, "/api/spatial_tx/gene_sets", timeout_s=10.0)
+        cand = gs.get("gene_sets") if isinstance(gs, dict) else None
+        if isinstance(cand, list):
+            for nm in cand:
+                if isinstance(nm, str) and nm.strip():
+                    gene_set = nm.strip()
+                    break
+    except Exception:
+        gene_set = ""
+    _assert(bool(gene_set), "spatial gene_set available")
+
+    omics_set = ""
+    try:
+        bs = _http_get_json(base_url, "/api/bulk_omics/sets", timeout_s=10.0)
+        cand2 = bs.get("sets") if isinstance(bs, dict) else None
+        if isinstance(cand2, list):
+            for nm in cand2:
+                if isinstance(nm, str) and nm.strip().lower().startswith("rna/"):
+                    omics_set = nm.strip()
+                    break
+            if not omics_set:
+                for nm in cand2:
+                    if isinstance(nm, str) and nm.strip():
+                        omics_set = nm.strip()
+                        break
+    except Exception:
+        omics_set = ""
+    _assert(bool(omics_set), "bulk omics_set available")
+
     req = {
         "player_id": player_id,
         "ticks": 2,
         "replicates": 1,
         "seed": 1,
-        "gene_set": "default.txt",
+        "gene_set": gene_set,
         "healthy": healthy,
         "sick": sick,
         "interventions": interventions,
@@ -146,7 +177,7 @@ def _run_steps(base_url: str) -> None:
     genes = out.get("genes")
     _assert(isinstance(genes, list) and len(genes) >= 1, "genes list")
 
-    _assert(out.get("gene_set") == "default.txt", "gene_set")
+    _assert(out.get("gene_set") == gene_set, "gene_set")
 
     matrix_csv = out.get("matrix_csv")
     truth_csv = out.get("matrix_truth_csv")
@@ -192,7 +223,7 @@ def _run_steps(base_url: str) -> None:
         "ticks": 2,
         "replicates": 1,
         "seed": 1,
-        "omics_set": "rna/default.txt",
+        "omics_set": omics_set,
         "healthy": healthy,
         "sick": sick,
         "interventions": interventions,
@@ -208,7 +239,7 @@ def _run_steps(base_url: str) -> None:
     _assert(isinstance(game2.get("money_spent_cents"), int), "bulk money_spent_cents int")
     _assert(int(game2.get("money_spent_cents") or 0) > int(game.get("money_spent_cents") or 0), "money spent increases")
 
-    _assert(out2.get("omics_set") == "rna/default.txt", "omics_set")
+    _assert(out2.get("omics_set") == omics_set, "omics_set")
     genes2 = out2.get("genes")
     _assert(isinstance(genes2, list) and len(genes2) >= 1, "bulk genes list")
 
@@ -256,7 +287,9 @@ def _run_steps(base_url: str) -> None:
     out3 = _http_post_json(base_url, "/api/experiments/in_vivo_trial", req3, timeout_s=120.0)
     _assert(out3.get("ok") is True, "in vivo ok")
     _assert(out3.get("experiment") == "in_vivo_trial_v1", "in vivo experiment type")
-    _assert(int(out3.get("ticks") or 0) == 5, "in vivo ticks")
+    ticks_out = int(out3.get("ticks") or 0)
+    _assert(ticks_out >= 5, "in vivo ticks >= requested")
+    _assert(int(out3.get("requested_ticks") or 0) == 5, "in vivo requested_ticks")
     _assert(int(out3.get("replicates") or 0) == 2, "in vivo replicates")
 
     game3 = out3.get("game")
@@ -273,8 +306,8 @@ def _run_steps(base_url: str) -> None:
     _assert(isinstance(sh, dict) and isinstance(ss, dict), "in vivo series healthy/sick dict")
     k0 = str(meas[0])
     _assert(k0 in sh and k0 in ss, "series contains first measurement")
-    _assert(isinstance(sh.get(k0), list) and len(sh.get(k0)) == 5, "healthy series length")
-    _assert(isinstance(ss.get(k0), list) and len(ss.get(k0)) == 5, "sick series length")
+    _assert(isinstance(sh.get(k0), list) and len(sh.get(k0)) == ticks_out, "healthy series length")
+    _assert(isinstance(ss.get(k0), list) and len(ss.get(k0)) == ticks_out, "sick series length")
 
     cure = out3.get("cure")
     _assert(isinstance(cure, dict), "in vivo cure present")

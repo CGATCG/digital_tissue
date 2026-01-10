@@ -359,7 +359,7 @@
         "name": "log_growth",
         "group": "signaling",
         "enabled": true,
-        "expr": "mature_growth_factor + (growth_factor * 0.000005)",
+        "expr": "mature_growth_factor + (growth_factor * 0.00007)",
         "target": "mature_growth_factor"
       },
       {

@@ -23,6 +23,13 @@
     geneSetSel: document.getElementById("geneSetSel"),
     omicsSetSel: document.getElementById("omicsSetSel"),
 
+    ivWorkers: document.getElementById("ivWorkers"),
+    ivWorkerMode: document.getElementById("ivWorkerMode"),
+    ivShowIndividuals: document.getElementById("ivShowIndividuals"),
+    ivScreenDir: document.getElementById("ivScreenDir"),
+    ivScreenDose: document.getElementById("ivScreenDose"),
+    ivScreenBtn: document.getElementById("ivScreenBtn"),
+
     runBtn: document.getElementById("runBtn"),
     runCost: document.getElementById("runCost"),
     clearBtn: document.getElementById("clearBtn"),
@@ -48,6 +55,8 @@
     tab: "spatial",
     playerId: "",
     interventions: [],
+    screenSortKey: "median_lifespan_tick",
+    screenSortDesc: true,
   };
 
   function _isNonEmptyString(s) {
@@ -68,6 +77,98 @@
       out.push(k);
     }
     out.sort((a, b) => a.localeCompare(b));
+    return out;
+  }
+
+  function _invivoScreenSortOptions() {
+    return [
+      { key: "median_lifespan_tick", label: "Median lifespan" },
+      { key: "mean_lifespan_tick", label: "Mean lifespan" },
+      { key: "p25_lifespan_tick", label: "P25 lifespan" },
+      { key: "p75_lifespan_tick", label: "P75 lifespan" },
+      { key: "min_lifespan_tick", label: "Min lifespan" },
+      { key: "max_lifespan_tick", label: "Max lifespan" },
+      { key: "deaths", label: "Deaths" },
+      { key: "survivors", label: "Survivors" },
+      { key: "layer", label: "Layer (A→Z)" },
+    ];
+  }
+
+  function _renderKaplanMeier(result) {
+    const r = result;
+    const death = r && r.death && typeof r.death === "object" ? r.death : null;
+    if (!death) return "";
+
+    const dh = death.healthy && typeof death.healthy === "object" ? death.healthy : null;
+    const ds = death.sick && typeof death.sick === "object" ? death.sick : null;
+    const aliveH = dh && Array.isArray(dh.alive_n) ? dh.alive_n : null;
+    const aliveS = ds && Array.isArray(ds.alive_n) ? ds.alive_n : null;
+    const ticks = Number(r.ticks || 0);
+    if (!aliveH || !aliveS || !ticks || ticks <= 1) return "";
+    if (aliveH.length !== ticks || aliveS.length !== ticks) return "";
+
+    const nH = Array.isArray(dh.death_ticks) ? dh.death_ticks.length : (Number.isFinite(Number(r.replicates)) ? Number(r.replicates) : 0);
+    const nS = Array.isArray(ds.death_ticks) ? ds.death_ticks.length : (Number.isFinite(Number(r.replicates)) ? Number(r.replicates) : 0);
+    const n0H = Math.max(1, Number.isFinite(Number(aliveH[0])) ? Number(aliveH[0]) : nH || 1);
+    const n0S = Math.max(1, Number.isFinite(Number(aliveS[0])) ? Number(aliveS[0]) : nS || 1);
+
+    const survH = aliveH.map((x) => {
+      const v = Number(x);
+      return Number.isFinite(v) ? Math.max(0, Math.min(1, v / n0H)) : 0;
+    });
+    const survS = aliveS.map((x) => {
+      const v = Number(x);
+      return Number.isFinite(v) ? Math.max(0, Math.min(1, v / n0S)) : 0;
+    });
+
+    const W = 760;
+    const H = 170;
+    const padL = 44;
+    const padR = 10;
+    const padT = 18;
+    const padB = 28;
+    const x0 = padL;
+    const x1 = W - padR;
+    const y0 = padT;
+    const y1 = H - padB;
+    const sx = (i) => x0 + (i / (ticks - 1)) * (x1 - x0);
+    const sy = (v) => y1 - Math.max(0, Math.min(1, v)) * (y1 - y0);
+
+    const stepPath = (arr) => {
+      let d = "";
+      let prev = null;
+      for (let i = 0; i < ticks; i++) {
+        const v = Number(arr[i]);
+        const vv = Number.isFinite(v) ? v : 0;
+        if (i === 0) {
+          d += `M${sx(0).toFixed(2)},${sy(vv).toFixed(2)} `;
+          prev = vv;
+          continue;
+        }
+        d += `L${sx(i).toFixed(2)},${sy(prev).toFixed(2)} `;
+        d += `L${sx(i).toFixed(2)},${sy(vv).toFixed(2)} `;
+        prev = vv;
+      }
+      return d.trim();
+    };
+
+    const dH = stepPath(survH);
+    const dS = stepPath(survS);
+
+    let out = "";
+    out += `\n<div style="margin: 10px 0 18px 0;">`;
+    out += `\n  <div class="meta" style="margin-bottom: 6px;">Survival (Kaplan–Meier style)</div>`;
+    out += `\n  <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="border:1px solid rgba(255,255,255,.10); border-radius:12px; background: rgba(255,255,255,.02);">`;
+    out += `\n    <line x1="${x0}" y1="${y1}" x2="${x1}" y2="${y1}" stroke="rgba(255,255,255,.18)" />`;
+    out += `\n    <line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="rgba(255,255,255,.18)" />`;
+    out += `\n    <text x="${x0}" y="${y0 - 6}" fill="rgba(245,246,247,.62)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">1.00</text>`;
+    out += `\n    <text x="${x0}" y="${y1 + 16}" fill="rgba(245,246,247,.62)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">0.00</text>`;
+    out += `\n    <path d="${dH}" fill="none" stroke="rgba(50,215,75,.95)" stroke-width="2" />`;
+    out += `\n    <path d="${dS}" fill="none" stroke="rgba(255,69,58,.95)" stroke-width="2" />`;
+    out += `\n    <text x="${x1 - 170}" y="${y0 - 6}" fill="rgba(50,215,75,.95)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">healthy</text>`;
+    out += `\n    <text x="${x1 - 90}" y="${y0 - 6}" fill="rgba(255,69,58,.95)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">sick</text>`;
+    out += `\n  </svg>`;
+    out += `\n</div>`;
     return out;
   }
 
@@ -352,6 +453,46 @@
       .replace(/'/g, "&#39;");
   }
 
+  function _renderWarningsAndDeathSummary(result) {
+    const r = result;
+    const warnings = r && Array.isArray(r.warnings) ? r.warnings : [];
+    const death = r && r.death && typeof r.death === "object" ? r.death : null;
+
+    let out = "";
+
+    if (warnings.length) {
+      out += `<div style="margin: 8px 0 12px 0; padding: 10px 12px; border: 1px solid rgba(255,255,255,.10); border-radius: 12px; background: rgba(255,255,255,.03);">`;
+      out += `<div class="meta" style="font-weight:600; margin-bottom: 6px; color: rgba(255,214,10,.95);">Warnings</div>`;
+      for (const w of warnings.slice(0, 6)) {
+        const msg = w && typeof w.message === "string" ? w.message : (w && typeof w.kind === "string" ? w.kind : "warning");
+        out += `<div class="meta" style="margin: 4px 0;">- ${_svgEscape(msg)}</div>`;
+      }
+      if (warnings.length > 6) {
+        out += `<div class="meta" style="margin-top: 6px;">(showing 6 of ${_svgEscape(String(warnings.length))})</div>`;
+      }
+      out += `</div>`;
+    }
+
+    if (death) {
+      const h = death.healthy && typeof death.healthy === "object" ? death.healthy : null;
+      const s = death.sick && typeof death.sick === "object" ? death.sick : null;
+      const hTicks = h && Array.isArray(h.death_ticks) ? h.death_ticks : [];
+      const sTicks = s && Array.isArray(s.death_ticks) ? s.death_ticks : [];
+      const minH = hTicks.length ? Math.min(...hTicks.map((x) => Number(x)).filter((x) => Number.isFinite(x))) : null;
+      const minS = sTicks.length ? Math.min(...sTicks.map((x) => Number(x)).filter((x) => Number.isFinite(x))) : null;
+
+      if (minH != null || minS != null) {
+        out += `<div style="margin: 8px 0 12px 0; padding: 10px 12px; border: 1px solid rgba(255,255,255,.10); border-radius: 12px; background: rgba(255,255,255,.02);">`;
+        out += `<div class="meta" style="font-weight:600; margin-bottom: 6px;">Death</div>`;
+        if (minH != null) out += `<div class="meta">healthy earliest death tick: ${_svgEscape(String(minH))}</div>`;
+        if (minS != null) out += `<div class="meta">sick earliest death tick: ${_svgEscape(String(minS))}</div>`;
+        out += `</div>`;
+      }
+    }
+
+    return out;
+  }
+
   function _renderInVivoPlots(result) {
     const r = result;
     const series = r && r.series;
@@ -379,6 +520,13 @@
       cureHtml += `</div>`;
     }
 
+    const warnHtml = _renderWarningsAndDeathSummary(r);
+    const kmHtml = _renderKaplanMeier(r);
+
+    const reps = r && r.series_replicates && typeof r.series_replicates === "object" ? r.series_replicates : null;
+    const repsH = reps && Array.isArray(reps.healthy) ? reps.healthy : null;
+    const repsS = reps && Array.isArray(reps.sick) ? reps.sick : null;
+
     const W = 760;
     const H = 170;
     const padL = 44;
@@ -390,17 +538,23 @@
     const y0 = padT;
     const y1 = H - padB;
 
-    let out = cureHtml;
+    let out = `${warnHtml}${kmHtml}${cureHtml}`;
     for (const nm of names) {
       const hv = Array.isArray(h[nm]) ? h[nm] : null;
       const sv = Array.isArray(s[nm]) ? s[nm] : null;
       if (!hv || !sv || hv.length !== ticks || sv.length !== ticks) continue;
       const vals = [];
       for (let i = 0; i < ticks; i++) {
-        const a = Number(hv[i]);
-        const b = Number(sv[i]);
-        if (Number.isFinite(a)) vals.push(a);
-        if (Number.isFinite(b)) vals.push(b);
+        const av = hv[i];
+        const bv = sv[i];
+        if (av != null) {
+          const a = Number(av);
+          if (Number.isFinite(a)) vals.push(a);
+        }
+        if (bv != null) {
+          const b = Number(bv);
+          if (Number.isFinite(b)) vals.push(b);
+        }
       }
       let vmin = 0;
       let vmax = 1;
@@ -419,17 +573,51 @@
 
       const pathOf = (arr) => {
         let d = "";
+        let penDown = false;
         for (let i = 0; i < ticks; i++) {
-          const v = Number(arr[i]);
-          const vv = Number.isFinite(v) ? v : 0;
-          const cmd = i === 0 ? "M" : "L";
-          d += `${cmd}${sx(i).toFixed(2)},${sy(vv).toFixed(2)} `;
+          const raw = arr[i];
+          if (raw == null) {
+            penDown = false;
+            continue;
+          }
+          const v = Number(raw);
+          if (!Number.isFinite(v)) {
+            penDown = false;
+            continue;
+          }
+          const cmd = penDown ? "L" : "M";
+          d += `${cmd}${sx(i).toFixed(2)},${sy(v).toFixed(2)} `;
+          penDown = true;
         }
         return d.trim();
       };
 
       const dH = pathOf(hv);
       const dS = pathOf(sv);
+
+      const repPathsH = [];
+      const repPathsS = [];
+      if (repsH && repsS) {
+        const maxK = 32;
+        const kH = Math.min(maxK, repsH.length);
+        const kS = Math.min(maxK, repsS.length);
+        for (let ri = 0; ri < kH; ri++) {
+          const rr = repsH[ri];
+          if (!rr || typeof rr !== "object") continue;
+          const arr = Array.isArray(rr[nm]) ? rr[nm] : null;
+          if (!arr || arr.length !== ticks) continue;
+          const d = pathOf(arr);
+          if (d) repPathsH.push(d);
+        }
+        for (let ri = 0; ri < kS; ri++) {
+          const rr = repsS[ri];
+          if (!rr || typeof rr !== "object") continue;
+          const arr = Array.isArray(rr[nm]) ? rr[nm] : null;
+          if (!arr || arr.length !== ticks) continue;
+          const d = pathOf(arr);
+          if (d) repPathsS.push(d);
+        }
+      }
       const title = _svgEscape(nm);
       const labelMin = _svgEscape(vmin.toFixed(3));
       const labelMax = _svgEscape(vmax.toFixed(3));
@@ -441,6 +629,14 @@
       out += `\n    <line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="rgba(255,255,255,.18)" />`;
       out += `\n    <text x="${x0}" y="${y0 - 6}" fill="rgba(245,246,247,.62)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">${labelMax}</text>`;
       out += `\n    <text x="${x0}" y="${y1 + 16}" fill="rgba(245,246,247,.62)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">${labelMin}</text>`;
+
+      for (const d of repPathsH) {
+        out += `\n    <path d="${d}" fill="none" stroke="rgba(50,215,75,.22)" stroke-width="1" />`;
+      }
+      for (const d of repPathsS) {
+        out += `\n    <path d="${d}" fill="none" stroke="rgba(255,69,58,.22)" stroke-width="1" />`;
+      }
+
       out += `\n    <path d="${dH}" fill="none" stroke="rgba(50,215,75,.95)" stroke-width="2" />`;
       out += `\n    <path d="${dS}" fill="none" stroke="rgba(255,69,58,.95)" stroke-width="2" />`;
       out += `\n    <text x="${x1 - 170}" y="${y0 - 6}" fill="rgba(50,215,75,.95)" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">healthy</text>`;
@@ -449,6 +645,124 @@
       out += `\n</div>`;
     }
     return out.trim();
+  }
+
+  function _renderInVivoScreen(result) {
+    const r = result;
+    if (!r || r.experiment !== "in_vivo_screen_v1") return "";
+    const baseline = r.baseline && typeof r.baseline === "object" ? r.baseline : null;
+    const baseMed = baseline && Number.isFinite(Number(baseline.median_lifespan_tick)) ? Number(baseline.median_lifespan_tick) : null;
+    const res = Array.isArray(r.results) ? r.results : [];
+
+    const sortOptions = _invivoScreenSortOptions();
+    const sortKey = sortOptions.some((o) => o.key === state.screenSortKey) ? state.screenSortKey : "median_lifespan_tick";
+    const desc = !!state.screenSortDesc;
+
+    const items = [];
+    for (const it of res) {
+      if (!it || typeof it !== "object") continue;
+      const layer = typeof it.layer === "string" ? it.layer : "";
+      if (!layer) continue;
+      items.push(it);
+    }
+    if (!items.length) return "";
+
+    const getVal = (it) => {
+      if (!it || typeof it !== "object") return null;
+      if (sortKey === "layer") return String(it.layer || "");
+      const v = Number(it[sortKey]);
+      return Number.isFinite(v) ? v : null;
+    };
+
+    items.sort((a, b) => {
+      const va = getVal(a);
+      const vb = getVal(b);
+      if (sortKey === "layer") {
+        const sa = String(va || "");
+        const sb = String(vb || "");
+        return desc ? sb.localeCompare(sa) : sa.localeCompare(sb);
+      }
+      const na = va == null ? -Infinity : va;
+      const nb = vb == null ? -Infinity : vb;
+      return desc ? (nb - na) : (na - nb);
+    });
+
+    let maxMed = 1;
+    for (const it of items) {
+      const v = Number(it.median_lifespan_tick);
+      if (Number.isFinite(v) && v > maxMed) maxMed = v;
+    }
+    if (baseMed != null && baseMed > maxMed) maxMed = baseMed;
+    if (!Number.isFinite(maxMed) || maxMed <= 0) maxMed = 1;
+
+    const dir = typeof r.direction === "string" ? r.direction : "";
+    const dose = Number.isFinite(Number(r.dose)) ? Number(r.dose) : 0;
+    const reps = Number.isFinite(Number(r.replicates)) ? Number(r.replicates) : 0;
+    const ticks = Number.isFinite(Number(r.ticks)) ? Number(r.ticks) : 0;
+
+    let out = "";
+    out += `<div style="margin: 8px 0 12px 0; padding: 10px 12px; border: 1px solid rgba(255,255,255,.10); border-radius: 12px; background: rgba(255,255,255,.02);">`;
+    out += `<div class="meta" style="font-weight: 600; margin-bottom: 4px;">Protein screen</div>`;
+    out += `<div class="meta">direction=${_svgEscape(dir)} dose=${_svgEscape(dose.toFixed(2))} reps=${_svgEscape(String(reps))} ticks=${_svgEscape(String(ticks))}</div>`;
+    if (baseMed != null) {
+      out += `<div class="meta" style="margin-top: 6px;">baseline median lifespan: ${_svgEscape(baseMed.toFixed(2))}</div>`;
+    }
+    out += `</div>`;
+
+    out += `<div style="display:flex; gap:10px; align-items:center; margin: 8px 0 10px 0;">`;
+    out += `<div class="meta">Sort</div>`;
+    out += `<select id="ivScreenSortKeyOut" class="input" style="max-width: 240px;">`;
+    for (const opt of sortOptions) {
+      const sel = opt.key === sortKey ? " selected" : "";
+      out += `<option value="${_svgEscape(opt.key)}"${sel}>${_svgEscape(opt.label)}</option>`;
+    }
+    out += `</select>`;
+    out += `<button id="ivScreenSortDirOut" class="btn btn--secondary btn--small">${desc ? "Desc" : "Asc"}</button>`;
+    out += `</div>`;
+
+    out += `<div style="max-height: 560px; overflow:auto; border: 1px solid rgba(255,255,255,.10); border-radius: 12px;">`;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const med = Number(it.median_lifespan_tick);
+      const medSafe = Number.isFinite(med) ? med : 0;
+      const frac = Math.max(0, Math.min(1, medSafe / maxMed));
+      const pct = (100 * frac).toFixed(2);
+      const bg = i % 2 === 0 ? "rgba(255,255,255,.02)" : "rgba(255,255,255,.00)";
+      out += `<div style="display:flex; gap:10px; align-items:center; padding: 8px 10px; background:${bg};">`;
+      out += `<div class="meta" style="width:36px; text-align:right;">${i + 1}</div>`;
+      out += `<div class="meta" style="flex: 0 0 360px; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;">${_svgEscape(String(it.layer || ""))}</div>`;
+      out += `<div style="flex:1; height: 10px; background: rgba(255,255,255,.10); border-radius: 999px; overflow:hidden;">`;
+      out += `<div style="width:${pct}%; height:100%; background: rgba(50,215,75,.70);"></div>`;
+      out += `</div>`;
+      const sv = getVal(it);
+      const svTxt = sortKey === "layer" ? "" : (sv == null ? "" : Number(sv).toFixed(2));
+      const medTxt = Number.isFinite(med) ? med.toFixed(2) : "";
+      out += `<div class="meta" style="width: 110px; text-align:right;">${_svgEscape(svTxt || medTxt)}</div>`;
+      out += `</div>`;
+    }
+    out += `</div>`;
+    return out;
+  }
+
+  function _renderInVivoScreenIntoHost(host) {
+    if (!host) return;
+    const html = _renderInVivoScreen(state.result);
+    host.innerHTML = html;
+
+    const sel = document.getElementById("ivScreenSortKeyOut");
+    if (sel) {
+      sel.addEventListener("change", () => {
+        state.screenSortKey = String(sel.value || "median_lifespan_tick");
+        _renderInVivoScreenIntoHost(host);
+      });
+    }
+    const btn = document.getElementById("ivScreenSortDirOut");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        state.screenSortDesc = !state.screenSortDesc;
+        _renderInVivoScreenIntoHost(host);
+      });
+    }
   }
 
   function _downloadText(filename, text, mime) {
@@ -480,7 +794,10 @@
     const data = _safeJsonParse(text) || { ok: false, error: text };
     if (!resp.ok || !data || data.ok !== true) {
       const msg = data && data.error ? String(data.error) : `HTTP ${resp.status}`;
-      throw new Error(msg);
+      const err = new Error(msg);
+      err.data = data;
+      err.status = resp.status;
+      throw err;
     }
     return data;
   }
@@ -501,7 +818,12 @@
     const truthRows = _countCsvRows(r.matrix_truth_csv);
     const noisyRows = _countCsvRows(r.matrix_noisy_csv || r.matrix_csv);
     const metaRows = _countCsvRows(r.metadata_csv);
-    ui.outSummary.textContent = `experiment=${r.experiment || ""} runs=${runs.length} cells=${metaRows} genes=${(r.genes || []).length} truth_rows=${truthRows} noisy_rows=${noisyRows}`;
+    const wk = Number.isFinite(Number(r.workers)) ? Number(r.workers) : null;
+    const wm = typeof r.worker_mode === "string" ? r.worker_mode : "";
+    const parTxt = wk != null ? ` workers=${wk}${wm ? ` mode=${wm}` : ""}` : "";
+    const warnN = Array.isArray(r.warnings) ? r.warnings.length : 0;
+    const warnTxt = warnN > 0 ? ` warnings=${warnN}` : "";
+    ui.outSummary.textContent = `experiment=${r.experiment || ""}${parTxt}${warnTxt} runs=${runs.length} cells=${metaRows} genes=${(r.genes || []).length} truth_rows=${truthRows} noisy_rows=${noisyRows}`;
     ui.outText.value = JSON.stringify(r, null, 2);
     ui.downloadJsonBtn.disabled = false;
     ui.downloadTruthMatrixCsvBtn.disabled = !(typeof r.matrix_truth_csv === "string" && r.matrix_truth_csv.length > 0 && truthRows > 0);
@@ -518,13 +840,14 @@
     ui.outText.value = "";
     ui.outSummary.textContent = "";
     ui.outText.style.display = "";
-    const host = document.getElementById("invivoPlotsHost");
-    if (host) host.innerHTML = "";
-    _setStatus("");
     ui.downloadJsonBtn.disabled = true;
     ui.downloadTruthMatrixCsvBtn.disabled = true;
     ui.downloadNoisyMatrixCsvBtn.disabled = true;
     ui.downloadMetadataCsvBtn.disabled = true;
+    const host = document.getElementById("invivoPlotsHost");
+    if (host) host.innerHTML = "";
+    const host2 = document.getElementById("invivoScreenHost");
+    if (host2) host2.innerHTML = "";
   }
 
   ui.backToEditorBtn.addEventListener("click", () => {
@@ -669,10 +992,19 @@
       const path = isInVivo
         ? "/api/experiments/in_vivo_trial"
         : (isBulk ? "/api/experiments/bulk_omics" : "/api/experiments/spatial_tx");
+
+      let invivoPar = {};
+      if (isInVivo) {
+        const wRaw = Number(ui.ivWorkers && ui.ivWorkers.value != null ? ui.ivWorkers.value : 0);
+        const w = Number.isFinite(wRaw) ? wRaw : 0;
+        const mode = String((ui.ivWorkerMode && ui.ivWorkerMode.value) || "process").trim();
+        const showInd = !!(ui.ivShowIndividuals && ui.ivShowIndividuals.checked);
+        invivoPar = { workers: w, worker_mode: mode, include_replicates: showInd };
+      }
       const req = {
         ...baseReq,
         ...(isInVivo
-          ? {}
+          ? invivoPar
           : isBulk
           ? { omics_set: String((ui.omicsSetSel && ui.omicsSetSel.value) || "").trim() }
           : { gene_set: String((ui.geneSetSel && ui.geneSetSel.value) || "").trim() }),
@@ -694,15 +1026,21 @@
             ui.outText.parentElement.appendChild(host);
           }
           host.innerHTML = html;
+          const host2 = document.getElementById("invivoScreenHost");
+          if (host2) host2.innerHTML = "";
         } else {
           ui.outText.style.display = "";
           const host = document.getElementById("invivoPlotsHost");
           if (host) host.innerHTML = "";
+          const host2 = document.getElementById("invivoScreenHost");
+          if (host2) host2.innerHTML = "";
         }
       } else {
         ui.outText.style.display = "";
         const host = document.getElementById("invivoPlotsHost");
         if (host) host.innerHTML = "";
+        const host2 = document.getElementById("invivoScreenHost");
+        if (host2) host2.innerHTML = "";
       }
       if (out && out.game) {
         _updateMoneyUi(out.game);
@@ -711,11 +1049,84 @@
       }
       _setStatus("Done");
     } catch (e) {
-      _setStatus(`Error: ${e && e.message ? e.message : String(e)}`);
+      if (e && e.data && typeof e.data === "object") {
+        state.result = e.data;
+        _updateOutput();
+        if (e.data && e.data.error_kind === "ticks_exceed_death") {
+          _setStatus(`Error: requested ticks exceed survival (see output JSON for details)`);
+        } else {
+          _setStatus(`Error: ${e && e.message ? e.message : String(e)}`);
+        }
+      } else {
+        _setStatus(`Error: ${e && e.message ? e.message : String(e)}`);
+      }
     } finally {
       ui.runBtn.disabled = false;
     }
   });
+
+  if (ui.ivScreenBtn) {
+    ui.ivScreenBtn.addEventListener("click", async () => {
+      try {
+        if (!state.sick) {
+          _setStatus("Upload sick first");
+          return;
+        }
+
+        const wRaw = Number(ui.ivWorkers && ui.ivWorkers.value != null ? ui.ivWorkers.value : 0);
+        const w = Number.isFinite(wRaw) ? wRaw : 0;
+        const mode = String((ui.ivWorkerMode && ui.ivWorkerMode.value) || "process").trim();
+
+        const dir = String((ui.ivScreenDir && ui.ivScreenDir.value) || "up").trim();
+        const dose = Number(ui.ivScreenDose && ui.ivScreenDose.value != null ? ui.ivScreenDose.value : 1);
+
+        const req = {
+          player_id: state.playerId,
+          ticks: Number(ui.ticksInput.value || 0),
+          replicates: Number(ui.repsInput.value || 1),
+          seed: Number(ui.seedInput.value || 1),
+          sick: state.sick,
+          interventions: Array.isArray(state.interventions) ? state.interventions : [],
+          workers: w,
+          worker_mode: mode,
+          direction: dir,
+          dose: dose,
+        };
+
+        ui.runBtn.disabled = true;
+        ui.ivScreenBtn.disabled = true;
+        _setStatus("Running screen...");
+        const out = await _postJson("/api/experiments/in_vivo_screen", req);
+        state.result = out;
+        _updateOutput();
+
+        if (out && out.experiment === "in_vivo_screen_v1") {
+          ui.outText.style.display = "none";
+          let host = document.getElementById("invivoScreenHost");
+          if (!host) {
+            host = document.createElement("div");
+            host.id = "invivoScreenHost";
+            ui.outText.parentElement.appendChild(host);
+          }
+          _renderInVivoScreenIntoHost(host);
+          const host2 = document.getElementById("invivoPlotsHost");
+          if (host2) host2.innerHTML = "";
+        }
+
+        if (out && out.game) {
+          _updateMoneyUi(out.game);
+        } else {
+          await _refreshGameState();
+        }
+        _setStatus("Done");
+      } catch (e) {
+        _setStatus(`Error: ${e && e.message ? e.message : String(e)}`);
+      } finally {
+        ui.runBtn.disabled = false;
+        if (ui.ivScreenBtn) ui.ivScreenBtn.disabled = false;
+      }
+    });
+  }
 
   // init
   _clearAll();

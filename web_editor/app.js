@@ -45,6 +45,7 @@ const ui = {
   derivedPresetGeneFromMolecule: $("derivedPresetGeneFromMolecule"),
 
   bulkDeleteBtn: $("bulkDeleteBtn"),
+  downloadLayersBtn: $("downloadLayersBtn"),
   bulkDeleteInfo: $("bulkDeleteInfo"),
   bulkAddPreview: $("bulkAddPreview"),
 
@@ -69,6 +70,8 @@ const ui = {
   opMin: $("opMin"),
   opMax: $("opMax"),
   opSeed: $("opSeed"),
+  opExpr: $("opExpr"),
+  opExprPreview: $("opExprPreview"),
   opMaskLayer: $("opMaskLayer"),
   opMaskOp: $("opMaskOp"),
   opMaskValue: $("opMaskValue"),
@@ -4754,14 +4757,19 @@ function updateAssignOpUi() {
   const valueRow = ui.opValue ? ui.opValue.closest(".row") : null;
   const minRow = ui.opMin ? ui.opMin.closest(".row") : null;
   const seedRow = ui.opSeed ? ui.opSeed.closest(".row") : null;
+  const exprRow = ui.opExpr ? ui.opExpr.closest(".row") : null;
+  const exprPrevRow = ui.opExprPreview ? ui.opExprPreview.closest(".row") : null;
 
   const showValue = opType === "set_constant";
   const showMinMax = opType === "set_random_uniform" || opType === "add_random_uniform";
   const showSeed = showMinMax;
+  const showExpr = opType === "apply_expr";
 
   if (valueRow) valueRow.style.display = showValue ? "" : "none";
   if (minRow) minRow.style.display = showMinMax ? "" : "none";
   if (seedRow) seedRow.style.display = showSeed ? "" : "none";
+  if (exprRow) exprRow.style.display = showExpr ? "" : "none";
+  if (exprPrevRow) exprPrevRow.style.display = showExpr ? "" : "none";
 
   if (isRandomAssignOpType(opType)) {
     let changed = false;
@@ -4779,11 +4787,82 @@ function updateAssignOpUi() {
 
   renderOpTargetsList();
   updateMaskedOpsPreview();
+  updateAssignExprPreview();
 }
 
 function isRandomAssignOpType(opType) {
   const t = String(opType || "");
   return t === "set_random_uniform" || t === "add_random_uniform";
+}
+
+const ASSIGN_EXPR_ALLOWED_FUNCS = new Set(["where", "clip", "abs", "sqrt", "exp", "log", "minimum", "maximum"]);
+
+function _validateAssignExpr(expr) {
+  const e = String(expr || "").trim();
+  if (!e) return { ok: false, text: "Expression is empty", usedLayers: [] };
+  if (e.includes(";") || e.includes("{") || e.includes("}")) return { ok: false, text: "Disallowed characters in expression", usedLayers: [] };
+  const bal = _checkBalancedDelimiters(e);
+  if (bal) return { ok: false, text: bal, usedLayers: [] };
+  if (_hasDisallowedAttributeAccess(e)) return { ok: false, text: "Attribute access not allowed", usedLayers: [] };
+  if (_hasDisallowedKeywordArgsOrAssignment(e)) return { ok: false, text: "Keyword args / assignment not allowed", usedLayers: [] };
+  const ar = _checkAllowedFuncArity(e);
+  if (ar) return { ok: false, text: ar, usedLayers: [] };
+
+  const ids = _tokenizeIdentifiers(e);
+  const layerSet = new Set((state?.layers || []).map((l) => l.name));
+  const unknown = [];
+  const usedLayers = new Set();
+  for (const id of ids) {
+    if (id === "x") continue;
+    if (ASSIGN_EXPR_ALLOWED_FUNCS.has(id)) continue;
+    if (OPS_ALLOWED_FUNCS.has(id)) {
+      unknown.push(id);
+      continue;
+    }
+    if (id === "True" || id === "False") continue;
+    if (layerSet.has(id)) {
+      usedLayers.add(id);
+      continue;
+    }
+    unknown.push(id);
+  }
+  if (unknown.length) return { ok: false, text: `Unknown identifier(s): ${unknown.join(", ")}`, usedLayers: [] };
+  return { ok: true, text: "OK", usedLayers: Array.from(usedLayers) };
+}
+
+function _compileAssignExpr(expr) {
+  const src = String(expr || "").trim();
+  if (!src) throw new Error("Expression is empty");
+  const body = `with (env) { return (${src}); }`;
+  return new Function("env", body);
+}
+
+function _assignExprEnvBase() {
+  const where = (cond, a, b) => (cond ? a : b);
+  const clip = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+  const abs = (x) => Math.abs(x);
+  const sqrt = (x) => Math.sqrt(x);
+  const exp = (x) => Math.exp(x);
+  const log = (x) => Math.log(x);
+  const minimum = (a, b) => Math.min(a, b);
+  const maximum = (a, b) => Math.max(a, b);
+  return { True: true, False: false, where, clip, abs, sqrt, exp, log, minimum, maximum, x: 0 };
+}
+
+function updateAssignExprPreview() {
+  if (!ui.opExprPreview) return;
+  const opType = String(ui.opType?.value || "");
+  if (opType !== "apply_expr") {
+    ui.opExprPreview.textContent = "";
+    return;
+  }
+  try {
+    const expr = String(ui.opExpr?.value || "").trim();
+    const v = _validateAssignExpr(expr);
+    ui.opExprPreview.textContent = v.ok ? "Expression: OK" : `Expression: ${v.text}`;
+  } catch (e) {
+    ui.opExprPreview.textContent = `Expression: ${String(e?.message || e)}`;
+  }
 }
 
 function saveFunctionsCfg() {
@@ -10050,6 +10129,20 @@ function download(filename, text) {
   URL.revokeObjectURL(a.href);
 }
 
+function downloadText(filename, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function downloadLayersList() {
+  const names = Array.isArray(state?.layers) ? state.layers.map((l) => String(l?.name || "").trim()).filter((x) => x) : [];
+  const txt = names.join("\n") + (names.length ? "\n" : "");
+  downloadText("layers.txt", txt);
+}
+
 function tick() {
   try {
     draw(state, selectedLayer);
@@ -12205,6 +12298,7 @@ ui.opApplyBtn.addEventListener("click", () => {
       max: Number(ui.opMax.value),
       seed: Number(ui.opSeed.value),
     };
+    const opExpr = String(ui.opExpr?.value || "").trim();
 
     const mask = makeMask(state, maskCfg.layer, maskCfg.op, maskCfg.value, maskCfg.invert);
     let n = 0;
@@ -12217,6 +12311,16 @@ ui.opApplyBtn.addEventListener("click", () => {
 
     const opType = String(opCfg.type);
     const baseSeed = Math.floor(Number(opCfg.seed)) || 0;
+
+    let assignExprFn = null;
+    let assignExprUsedLayers = [];
+    if (opType === "apply_expr") {
+      const v = _validateAssignExpr(opExpr);
+      if (!v.ok) throw new Error(`Bad expression: ${v.text}`);
+      assignExprFn = _compileAssignExpr(opExpr);
+      assignExprUsedLayers = Array.isArray(v.usedLayers) ? v.usedLayers : [];
+    }
+
     for (let li = 0; li < targets.length; li++) {
       const target = targets[li];
       const meta = state.layers.find((l) => l.name === target);
@@ -12277,6 +12381,32 @@ ui.opApplyBtn.addEventListener("click", () => {
             if (!mask[i]) continue;
             a[i] = a[i] + (lo + (hi - lo) * rng());
           }
+        }
+        continue;
+      }
+
+      if (opType === "apply_expr") {
+        if (!assignExprFn) throw new Error("Expression compiler error");
+        const envBase = _assignExprEnvBase();
+        const layerArrs = {};
+        for (const nm of assignExprUsedLayers) {
+          const arr = state.data[nm];
+          if (!arr) throw new Error(`Missing layer data: ${nm}`);
+          layerArrs[nm] = arr;
+        }
+
+        for (let i = 0; i < a.length; i++) {
+          if (!mask[i]) continue;
+          const env = envBase;
+          env.x = a[i];
+          for (const nm of assignExprUsedLayers) env[nm] = layerArrs[nm][i];
+
+          let out = assignExprFn(env);
+          out = Number(out);
+          if (!Number.isFinite(out)) continue;
+          if (isCat) a[i] = Math.round(out);
+          else if (isCounts) a[i] = clampCounts(out);
+          else a[i] = out;
         }
         continue;
       }
@@ -12368,6 +12498,10 @@ document.addEventListener("keydown", (ev) => {
 
 if (ui.bulkDeleteBtn) {
   ui.bulkDeleteBtn.addEventListener("click", () => bulkDeleteSelected());
+}
+
+if (ui.downloadLayersBtn) {
+  ui.downloadLayersBtn.addEventListener("click", () => downloadLayersList());
 }
 
 ui.saveBtn.addEventListener("click", () => {

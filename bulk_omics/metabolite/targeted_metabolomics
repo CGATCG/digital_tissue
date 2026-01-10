@@ -1,8 +1,12 @@
-molecule_glucose
 molecule_H2O
 molecule_O2
 molecule_NH4Cl
+molecule_KH2PO4
+molecule_MgSO4
 molecule_NaCl
 molecule_CaCl2
 molecule_FeSO4
 molecule_ZnCl2
+molecule_glucose
+toxin
+molecule_replacement_factor

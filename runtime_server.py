@@ -202,6 +202,230 @@ def _compute_layer_scalars_from_layers(layers: Dict[str, Any], kinds: Dict[str, 
     return out
 
 
+def _run_in_vivo_measurement_series_until_death(
+    base: Dict[str, Any], *, ticks: int, seed0: int, death_names: list[str]
+) -> tuple[Dict[str, list[float]], int, str]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+
+    expected_len = int(H * W)
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    names = _measurement_names_from_payload(p)
+    if not names:
+        return {}, int(max(0, int(ticks))), ""
+    selected = set(names)
+
+    out: Dict[str, list[float]] = {nm: [] for nm in names}
+    ticks_i = max(0, int(ticks))
+
+    dn = [str(x) for x in death_names if str(x).strip()]
+    died = False
+    death_tick = int(ticks_i)
+    death_measurement = ""
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        sel = _compute_selected_measurements_from_layers(p, layers, H, W, selected)
+        for nm in names:
+            try:
+                v = float(sel.get(nm) or 0.0)
+            except Exception:
+                v = 0.0
+            if not np.isfinite(v):
+                v = 0.0
+            out[nm].append(float(v))
+
+        hit = ""
+        if dn:
+            for nm in dn:
+                try:
+                    v = float(sel.get(nm) or 0.0)
+                except Exception:
+                    v = 0.0
+                if not np.isfinite(v):
+                    v = 0.0
+                if v >= 0.5:
+                    hit = nm
+                    break
+        else:
+            cell0 = layers.get("cell") if isinstance(layers, dict) else None
+            if cell0 is not None:
+                try:
+                    carr = np.asarray(cell0, dtype=np.float32).reshape(-1)
+                except Exception:
+                    carr = None
+                if carr is not None and carr.size > 0:
+                    try:
+                        alive = int(np.sum(carr > 0.5))
+                    except Exception:
+                        alive = -1
+                    if int(alive) == 0:
+                        hit = "cell_extinction"
+        if hit:
+            died = True
+            death_tick = int(t)
+            death_measurement = str(hit)
+            break
+
+    if not died:
+        death_tick = int(ticks_i)
+        death_measurement = ""
+
+    return out, int(death_tick), str(death_measurement)
+
+
+def _death_tick_from_series(series: Dict[str, list[float]], *, ticks: int, death_names: list[str]) -> tuple[int, str]:
+    ticks_i = max(0, int(ticks))
+    dn = [str(x) for x in death_names if str(x).strip()]
+    if not dn:
+        return int(ticks_i), ""
+    best_tick = int(ticks_i)
+    best_nm = ""
+    for nm in dn:
+        arr = series.get(nm)
+        if not isinstance(arr, list) or not arr:
+            continue
+        m = min(int(ticks_i), len(arr))
+        for i in range(m):
+            try:
+                v = float(arr[i])
+            except Exception:
+                v = 0.0
+            if not np.isfinite(v):
+                v = 0.0
+            if v >= 0.5:
+                if int(i) < int(best_tick):
+                    best_tick = int(i)
+                    best_nm = str(nm)
+                break
+    return int(best_tick), str(best_nm)
+
+
+def _mean_measurement_series_ragged(
+    series_list: list[Dict[str, list[float]]], ticks: int, names: list[str]
+) -> tuple[Dict[str, list[Optional[float]]], Dict[str, list[int]]]:
+    ticks_i = max(0, int(ticks))
+    out: Dict[str, list[Optional[float]]] = {nm: [None] * ticks_i for nm in names}
+    out_n: Dict[str, list[int]] = {nm: [0] * ticks_i for nm in names}
+    if not series_list or ticks_i <= 0:
+        return out, out_n
+
+    for nm in names:
+        acc = np.zeros((ticks_i,), dtype=np.float64)
+        cnt = np.zeros((ticks_i,), dtype=np.int64)
+        for s in series_list:
+            vv = s.get(nm) if isinstance(s, dict) else None
+            if not isinstance(vv, list) or not vv:
+                continue
+            m = min(int(ticks_i), len(vv))
+            for i in range(m):
+                try:
+                    v = float(vv[i])
+                except Exception:
+                    continue
+                if not np.isfinite(v):
+                    continue
+                acc[i] += float(v)
+                cnt[i] += 1
+        for i in range(int(ticks_i)):
+            c = int(cnt[i])
+            out_n[nm][i] = int(c)
+            if c <= 0:
+                out[nm][i] = None
+            else:
+                out[nm][i] = float(acc[i] / float(c))
+
+    return out, out_n
+
+
+def _pad_measurement_series_to_ticks(
+    series: Dict[str, list[float]], *, ticks: int, names: list[str]
+) -> Dict[str, list[Optional[float]]]:
+    ticks_i = max(0, int(ticks))
+    out: Dict[str, list[Optional[float]]] = {nm: [None] * ticks_i for nm in names}
+    if ticks_i <= 0:
+        return out
+    if not isinstance(series, dict):
+        return out
+    for nm in names:
+        vv = series.get(nm)
+        if not isinstance(vv, list) or not vv:
+            continue
+        m = min(int(ticks_i), len(vv))
+        for i in range(m):
+            try:
+                v = float(vv[i])
+            except Exception:
+                continue
+            if not np.isfinite(v):
+                continue
+            out[nm][i] = float(v)
+    return out
+
+
+def _alive_n_from_death_ticks(death_ticks: list[int], *, ticks: int) -> list[int]:
+    ticks_i = max(0, int(ticks))
+    out = [0] * ticks_i
+    dts: list[int] = []
+    for dt in death_ticks:
+        try:
+            dts.append(int(dt))
+        except Exception:
+            dts.append(int(ticks_i))
+    for t in range(ticks_i):
+        n = 0
+        for dt in dts:
+            if int(dt) >= int(t):
+                n += 1
+        out[t] = int(n)
+    return out
+
+
+def _preflight_death_before_ticks(
+    payload: Dict[str, Any], *, ticks: int, seed0: int
+) -> Optional[Dict[str, Any]]:
+    ticks_i = max(0, int(ticks))
+    if ticks_i <= 0:
+        return None
+    death_names = _death_measurement_names_from_payload(payload)
+    if not death_names:
+        return None
+    r = _run_lifespan_death_tick(payload, ticks=int(ticks_i), seed0=int(seed0), death_names=death_names)
+    died = bool(r.get("died"))
+    try:
+        dt = int(r.get("death_tick"))
+    except Exception:
+        dt = int(ticks_i)
+    dm = str(r.get("death_measurement") or "")
+    if died and int(dt) < int(ticks_i):
+        return {
+            "died": True,
+            "death_tick": int(dt),
+            "death_measurement": str(dm),
+            "death_names": list(death_names),
+        }
+    return None
+
+
 _STX_GENESETS_DIR = (Path(__file__).resolve().parent / "spatial_transcriptomics").resolve()
 _BULK_OMICS_DIR = (Path(__file__).resolve().parent / "bulk_omics").resolve()
 
@@ -1032,16 +1256,31 @@ def _run_lifespan_death_tick(
         layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
         sel = _compute_selected_measurements_from_layers(p, layers, H, W, selected)
         hit = ""
-        for nm in death_names:
-            try:
-                v = float(sel.get(nm) or 0.0)
-            except Exception:
-                v = 0.0
-            if not np.isfinite(v):
-                v = 0.0
-            if v >= 0.5:
-                hit = nm
-                break
+        if death_names:
+            for nm in death_names:
+                try:
+                    v = float(sel.get(nm) or 0.0)
+                except Exception:
+                    v = 0.0
+                if not np.isfinite(v):
+                    v = 0.0
+                if v >= 0.5:
+                    hit = nm
+                    break
+        else:
+            cell0 = layers.get("cell") if isinstance(layers, dict) else None
+            if cell0 is not None:
+                try:
+                    carr = np.asarray(cell0, dtype=np.float32).reshape(-1)
+                except Exception:
+                    carr = None
+                if carr is not None and carr.size > 0:
+                    try:
+                        alive = int(np.sum(carr > 0.5))
+                    except Exception:
+                        alive = -1
+                    if int(alive) == 0:
+                        hit = "cell_extinction"
         if hit:
             died = True
             death_tick = int(t)
@@ -1177,6 +1416,180 @@ def _lifespan_worker_eval(ri: int, ticks: int, seed: int) -> tuple[int, Dict[str
     )
     r["seed0"] = int(seed0)
     return int(ri), r, series
+
+
+_INVIVO_WORKER_HEALTHY_BASE: Optional[Dict[str, Any]] = None
+_INVIVO_WORKER_SICK_BASE: Optional[Dict[str, Any]] = None
+
+
+def _invivo_worker_init(healthy: Dict[str, Any], sick: Dict[str, Any]) -> None:
+    global _INVIVO_WORKER_HEALTHY_BASE, _INVIVO_WORKER_SICK_BASE
+    _INVIVO_WORKER_HEALTHY_BASE = healthy
+    _INVIVO_WORKER_SICK_BASE = sick
+
+
+_INVIVO_WORKER_DEATH_NAMES: Optional[list[str]] = None
+
+
+def _invivo_worker_init_v2(healthy: Dict[str, Any], sick: Dict[str, Any], death_names: list[str]) -> None:
+    global _INVIVO_WORKER_HEALTHY_BASE, _INVIVO_WORKER_SICK_BASE, _INVIVO_WORKER_DEATH_NAMES
+    _INVIVO_WORKER_HEALTHY_BASE = healthy
+    _INVIVO_WORKER_SICK_BASE = sick
+    _INVIVO_WORKER_DEATH_NAMES = list(death_names)
+
+
+def _invivo_worker_eval(
+    ri: int, ticks: int, seed: int
+) -> tuple[int, Dict[str, list[float]], Dict[str, list[float]], int, str, int, str]:
+    if _INVIVO_WORKER_HEALTHY_BASE is None or _INVIVO_WORKER_SICK_BASE is None:
+        raise ValueError("in vivo worker not initialized")
+    dn = _INVIVO_WORKER_DEATH_NAMES
+    if dn is None:
+        dn = []
+    seed0_h = int(seed) + (0 * 1000003) + (int(ri) * 97)
+    seed0_s = int(seed) + (1 * 1000003) + (int(ri) * 97)
+    sh, dt_h, dm_h = _run_in_vivo_measurement_series_until_death(
+        _INVIVO_WORKER_HEALTHY_BASE, ticks=int(ticks), seed0=int(seed0_h), death_names=dn
+    )
+    ss, dt_s, dm_s = _run_in_vivo_measurement_series_until_death(
+        _INVIVO_WORKER_SICK_BASE, ticks=int(ticks), seed0=int(seed0_s), death_names=dn
+    )
+    return int(ri), sh, ss, int(dt_h), str(dm_h), int(dt_s), str(dm_s)
+
+
+def _invivo_worker_death_eval(cond: int, ri: int, ticks: int, seed: int) -> tuple[int, int, int, str]:
+    if _INVIVO_WORKER_HEALTHY_BASE is None or _INVIVO_WORKER_SICK_BASE is None:
+        raise ValueError("in vivo worker not initialized")
+    dn = _INVIVO_WORKER_DEATH_NAMES
+    if dn is None:
+        dn = []
+    ci = 0 if int(cond) == 0 else 1
+    base = _INVIVO_WORKER_HEALTHY_BASE if ci == 0 else _INVIVO_WORKER_SICK_BASE
+    seed0 = int(seed) + (int(ci) * 1000003) + (int(ri) * 97)
+    r = _run_lifespan_death_tick(base, ticks=int(ticks), seed0=int(seed0), death_names=dn)
+    try:
+        dt = int(r.get("death_tick"))
+    except Exception:
+        dt = int(ticks)
+    dm = str(r.get("death_measurement") or "")
+    return int(ci), int(ri), int(dt), str(dm)
+
+
+def _protein_layer_names_from_payload(payload: Dict[str, Any]) -> list[str]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return []
+    out: list[str] = []
+    for k, ent in data.items():
+        if not isinstance(k, str) or not k.startswith("protein_"):
+            continue
+        if not isinstance(ent, dict) or ent.get("dtype") != "float32":
+            continue
+        b64 = ent.get("b64")
+        if not isinstance(b64, str) or not b64:
+            continue
+        out.append(k)
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+_INVIVO_SCREEN_WORKER_BASE: Optional[Dict[str, Any]] = None
+_INVIVO_SCREEN_WORKER_DEATH_NAMES: Optional[list[str]] = None
+_INVIVO_SCREEN_WORKER_TICKS: Optional[int] = None
+_INVIVO_SCREEN_WORKER_SEED: Optional[int] = None
+_INVIVO_SCREEN_WORKER_REPS: Optional[int] = None
+_INVIVO_SCREEN_WORKER_DIRECTION: Optional[str] = None
+_INVIVO_SCREEN_WORKER_DOSE: Optional[float] = None
+
+
+def _invivo_screen_worker_init(
+    base: Dict[str, Any],
+    death_names: list[str],
+    ticks: int,
+    seed: int,
+    replicates: int,
+    direction: str,
+    dose: float,
+) -> None:
+    global _INVIVO_SCREEN_WORKER_BASE
+    global _INVIVO_SCREEN_WORKER_DEATH_NAMES
+    global _INVIVO_SCREEN_WORKER_TICKS
+    global _INVIVO_SCREEN_WORKER_SEED
+    global _INVIVO_SCREEN_WORKER_REPS
+    global _INVIVO_SCREEN_WORKER_DIRECTION
+    global _INVIVO_SCREEN_WORKER_DOSE
+    _INVIVO_SCREEN_WORKER_BASE = base
+    _INVIVO_SCREEN_WORKER_DEATH_NAMES = list(death_names)
+    _INVIVO_SCREEN_WORKER_TICKS = int(ticks)
+    _INVIVO_SCREEN_WORKER_SEED = int(seed)
+    _INVIVO_SCREEN_WORKER_REPS = int(replicates)
+    _INVIVO_SCREEN_WORKER_DIRECTION = str(direction or "up").strip().lower()
+    _INVIVO_SCREEN_WORKER_DOSE = float(dose)
+
+
+def _invivo_screen_worker_eval(layer_index: int, layer_name: str) -> Dict[str, Any]:
+    if (
+        _INVIVO_SCREEN_WORKER_BASE is None
+        or _INVIVO_SCREEN_WORKER_DEATH_NAMES is None
+        or _INVIVO_SCREEN_WORKER_TICKS is None
+        or _INVIVO_SCREEN_WORKER_SEED is None
+        or _INVIVO_SCREEN_WORKER_REPS is None
+        or _INVIVO_SCREEN_WORKER_DIRECTION is None
+        or _INVIVO_SCREEN_WORKER_DOSE is None
+    ):
+        raise ValueError("in vivo screen worker not initialized")
+
+    base = _INVIVO_SCREEN_WORKER_BASE
+    death_names = _INVIVO_SCREEN_WORKER_DEATH_NAMES
+    ticks_i = int(_INVIVO_SCREEN_WORKER_TICKS)
+    seed_i = int(_INVIVO_SCREEN_WORKER_SEED)
+    reps_i = int(_INVIVO_SCREEN_WORKER_REPS)
+    direction = str(_INVIVO_SCREEN_WORKER_DIRECTION)
+    dose = float(_INVIVO_SCREEN_WORKER_DOSE)
+
+    p = _deepcopy_payload(base)
+    layer = str(layer_name or "").strip()
+    if layer:
+        _apply_interventions_to_payload_inplace(p, [{"layer": layer, "direction": direction, "dose": dose}])
+
+    death_ticks: list[int] = []
+    for ri in range(int(reps_i)):
+        seed0 = int(seed_i) + (int(layer_index + 1) * 1000003) + (int(ri) * 97)
+        r = _run_lifespan_death_tick(p, ticks=int(ticks_i), seed0=int(seed0), death_names=death_names)
+        try:
+            dt = int(r.get("death_tick"))
+        except Exception:
+            dt = int(ticks_i)
+        death_ticks.append(int(dt))
+
+    arr = np.asarray(death_ticks, dtype=np.float64)
+    median_tick = float(np.median(arr)) if arr.size else float(ticks_i)
+    mean_tick = float(np.mean(arr)) if arr.size else float(ticks_i)
+    try:
+        p25_tick = float(np.quantile(arr, 0.25)) if arr.size else float(ticks_i)
+    except Exception:
+        p25_tick = float(ticks_i)
+    try:
+        p75_tick = float(np.quantile(arr, 0.75)) if arr.size else float(ticks_i)
+    except Exception:
+        p75_tick = float(ticks_i)
+    min_tick = float(np.min(arr)) if arr.size else float(ticks_i)
+    max_tick = float(np.max(arr)) if arr.size else float(ticks_i)
+    deaths = int(sum(1 for dt in death_ticks if int(dt) < int(ticks_i)))
+    return {
+        "layer": str(layer),
+        "layer_index": int(layer_index),
+        "n": int(len(death_ticks)),
+        "ticks": int(ticks_i),
+        "median_lifespan_tick": float(median_tick),
+        "mean_lifespan_tick": float(mean_tick),
+        "p25_lifespan_tick": float(p25_tick),
+        "p75_lifespan_tick": float(p75_tick),
+        "min_lifespan_tick": float(min_tick),
+        "max_lifespan_tick": float(max_tick),
+        "deaths": int(deaths),
+        "survivors": int(len(death_ticks) - deaths),
+    }
 
 
 def _lifespan_survival_curve(death_ticks: list[int], *, ticks: int) -> Dict[str, Any]:
@@ -1343,15 +1756,13 @@ def _invivo_cure_score(
             try:
                 a = float(hv[i])
             except Exception:
-                a = 0.0
+                a = float("nan")
             try:
                 b = float(sv[i])
             except Exception:
-                b = 0.0
-            if not np.isfinite(a):
-                a = 0.0
-            if not np.isfinite(b):
-                b = 0.0
+                b = float("nan")
+            if not np.isfinite(a) or not np.isfinite(b):
+                continue
             err_acc += abs(a - b)
             base_acc += abs(a)
             n += 1
@@ -1596,13 +2007,30 @@ def _stx_synthetic_v3_noisy_counts(
         return np.zeros((0, max(g, 0)), dtype=np.int64)
     T = np.where(np.isfinite(T) & (T >= 0.0), T, 0.0)
 
+    spot_total = np.asarray(np.sum(T, axis=1), dtype=np.float64).reshape(n)
+    tissue = spot_total > 0.0
+    target_median_umi = 2000.0
+    if np.any(tissue):
+        med = float(np.median(spot_total[tissue]))
+        if np.isfinite(med) and med > 0.0:
+            scale = float(target_median_umi) / float(med)
+        else:
+            scale = 1.0
+    else:
+        scale = 1.0
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    if float(scale) > 1.0:
+        scale = 1.0
+    T = T * float(scale)
+
     x = np.asarray(np.round(x), dtype=np.int64).reshape(n)
     y = np.asarray(np.round(y), dtype=np.int64).reshape(n)
 
     sigma_cell = 0.35
     theta = 50.0
     eps = 0.08
-    ambient_frac = 0.001
+    ambient_total_umi = 0.05
     ambient_sigma_cell = 0.25
 
     s_i = np.exp(rng.normal(loc=-0.5 * sigma_cell * sigma_cell, scale=sigma_cell, size=n))
@@ -1629,6 +2057,12 @@ def _stx_synthetic_v3_noisy_counts(
     ux = ux_all[inb]
     loc_mu_inb = loc_mu[inb]
 
+    loc_tissue = (
+        np.bincount(inv, weights=np.asarray(tissue, dtype=np.float64), minlength=int(uniq.shape[0])).astype(np.float64)
+        > 0.0
+    )
+    loc_tissue_inb = np.asarray(loc_tissue[inb], dtype=bool)
+
     key_to_inb: Dict[tuple[int, int], int] = {}
     for k in range(int(uy.size)):
         key_to_inb[(int(uy[k]), int(ux[k]))] = int(k)
@@ -1639,12 +2073,16 @@ def _stx_synthetic_v3_noisy_counts(
     for j in range(g):
         loc_mix = np.full((int(uy.size),), np.nan, dtype=np.float64)
         for k in range(int(uy.size)):
+            if not bool(loc_tissue_inb[int(k)]):
+                continue
             yy = int(uy[k])
             xx = int(ux[k])
             neigh: list[float] = []
             for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 kk = key_to_inb.get((yy + int(dy), xx + int(dx)))
                 if kk is None:
+                    continue
+                if not bool(loc_tissue_inb[int(kk)]):
                     continue
                 neigh.append(float(loc_mu_inb[int(kk), int(j)]))
             if not neigh:
@@ -1661,10 +2099,16 @@ def _stx_synthetic_v3_noisy_counts(
 
     mu = mu_mixed
 
-    meanT = np.mean(T, axis=0)
-    lam_feat = float(ambient_frac) * meanT
+    meanT = np.mean(T[tissue] if np.any(tissue) else T, axis=0)
+    meanT = np.where(np.isfinite(meanT) & (meanT >= 0.0), meanT, 0.0)
+    meanT_sum = float(np.sum(meanT))
+    if not np.isfinite(meanT_sum) or meanT_sum <= 0.0:
+        feat_p = np.ones((g,), dtype=np.float64) / float(g)
+    else:
+        feat_p = meanT / float(meanT_sum)
     sA = np.exp(rng.normal(loc=-0.5 * ambient_sigma_cell * ambient_sigma_cell, scale=ambient_sigma_cell, size=n))
-    mu_total = mu + sA.reshape(n, 1) * lam_feat.reshape(1, g)
+    tissue_f = np.asarray(tissue, dtype=np.float64).reshape(n)
+    mu_total = mu + (sA.reshape(n, 1) * tissue_f.reshape(n, 1) * float(ambient_total_umi)) * feat_p.reshape(1, g)
     mu_total = np.where(np.isfinite(mu_total) & (mu_total >= 0.0), mu_total, 0.0)
 
     th = float(theta)
@@ -5561,6 +6005,38 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError(f"seed must be an int: {e}") from e
                 syn_rng = np.random.default_rng(3)
 
+                # Death-aware preflight: spatial/bulk assays are snapshots at `ticks`, so
+                # cancel if any replicate dies before the requested tick.
+                for ci, c in enumerate(cond_list):
+                    nm0 = str(c.get("name") or "").strip()
+                    payload0 = c.get("payload")
+                    if not nm0 or not isinstance(payload0, dict):
+                        continue
+                    for ri in range(reps_i):
+                        seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
+                        pf = _preflight_death_before_ticks(payload0, ticks=int(ticks_i), seed0=int(seed0))
+                        if isinstance(pf, dict):
+                            dt0 = int(pf.get("death_tick") or 0)
+                            self._send_json(
+                                400,
+                                {
+                                    "ok": False,
+                                    "error": f"ticks too high: '{nm0}' died at tick {dt0} (< requested ticks={int(ticks_i)})",
+                                    "error_kind": "ticks_exceed_death",
+                                    "experiment": "spatial_tx_v1",
+                                    "details": {
+                                        "condition": str(nm0),
+                                        "replicate": int(ri),
+                                        "seed": int(seed0),
+                                        "requested_ticks": int(ticks_i),
+                                        "death_tick": int(dt0),
+                                        "death_measurement": str(pf.get("death_measurement") or ""),
+                                        "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
+                                    },
+                                },
+                            )
+                            return
+
                 meta_header = [
                     "cell_id",
                     "sample",
@@ -5707,7 +6183,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             "sigma_cell": 0.35,
                             "theta": 50.0,
                             "eps": 0.08,
-                            "ambient_frac": 0.001,
+                            "target_median_umi": 2000.0,
+                            "ambient_total_umi": 0.05,
                             "ambient_sigma_cell": 0.25,
                             "rng_seed": 3,
                         },
@@ -5726,9 +6203,14 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 player_id = body.get("player_id")
                 interventions = body.get("interventions")
 
+                include_replicates_raw = body.get("include_replicates", False)
+                include_replicates = bool(include_replicates_raw)
+
                 ticks = body.get("ticks", 100)
                 replicates = body.get("replicates", 1)
                 seed = body.get("seed", 1)
+                workers_raw = body.get("workers", None)
+                worker_mode_raw = body.get("worker_mode", "process")
                 healthy = body.get("healthy")
                 sick = body.get("sick")
                 if not isinstance(healthy, dict) or not isinstance(sick, dict):
@@ -5741,6 +6223,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     ticks_i = max(0, int(ticks))
                 except Exception as e:
                     raise ValueError(f"ticks must be an int: {e}") from e
+                requested_ticks = int(ticks_i)
                 try:
                     reps_i = max(1, int(replicates))
                 except Exception as e:
@@ -5750,22 +6233,332 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 except Exception as e:
                     raise ValueError(f"seed must be an int: {e}") from e
 
+                worker_mode = str(worker_mode_raw or "process").strip().lower()
+                if worker_mode not in ("thread", "process"):
+                    worker_mode = "process"
+
+                workers_missing = "workers" not in body
+                if workers_missing:
+                    workers_i = 1
+                else:
+                    try:
+                        workers_i = int(workers_raw)
+                    except Exception:
+                        workers_i = 0
+                if workers_i <= 0:
+                    workers_i = max(1, int(min(4, os.cpu_count() or 1)))
+                workers_i = max(1, min(int(workers_i), int(reps_i), 32))
+
                 names = _measurement_names_union(healthy, sick)
                 if not names:
                     raise ValueError("no measurements configured (missing measurements_config)")
 
+                death_names = _death_measurement_names_from_payload(healthy)
+                dn2 = _death_measurement_names_from_payload(sick2)
+                seen_dn = set(death_names)
+                for nm in dn2:
+                    if nm in seen_dn:
+                        continue
+                    death_names.append(nm)
+                    seen_dn.add(nm)
+
+                # Auto-extend ticks until all individuals in (at least) one group are dead,
+                # with a safety cap so runs can't explode.
+                ticks_cap = int(max(0, max(int(requested_ticks), int(max(200, int(5 * int(requested_ticks or 1)))))))
+                ticks_cap = int(min(int(ticks_cap), 5000))
+                ticks_probe = int(max(1, int(requested_ticks)))
+                ticks_probe = int(min(int(ticks_probe), int(ticks_cap)))
+
+                probe_death_ticks_h: list[int] = [int(ticks_probe) for _ in range(int(reps_i))]
+                probe_death_ticks_s: list[int] = [int(ticks_probe) for _ in range(int(reps_i))]
+                probe_death_meas_h: list[str] = ["" for _ in range(int(reps_i))]
+                probe_death_meas_s: list[str] = ["" for _ in range(int(reps_i))]
+
+                def _run_death_probe(ticks_run: int) -> None:
+                    nonlocal probe_death_ticks_h
+                    nonlocal probe_death_ticks_s
+                    nonlocal probe_death_meas_h
+                    nonlocal probe_death_meas_s
+
+                    probe_death_ticks_h = [int(ticks_run) for _ in range(int(reps_i))]
+                    probe_death_ticks_s = [int(ticks_run) for _ in range(int(reps_i))]
+                    probe_death_meas_h = ["" for _ in range(int(reps_i))]
+                    probe_death_meas_s = ["" for _ in range(int(reps_i))]
+
+                    if int(reps_i) <= 1 or int(workers_i) <= 1:
+                        for ri in range(int(reps_i)):
+                            seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                            seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+                            rh = _run_lifespan_death_tick(healthy, ticks=int(ticks_run), seed0=int(seed0_h), death_names=death_names)
+                            rs = _run_lifespan_death_tick(sick2, ticks=int(ticks_run), seed0=int(seed0_s), death_names=death_names)
+                            try:
+                                probe_death_ticks_h[int(ri)] = int(rh.get("death_tick"))
+                            except Exception:
+                                probe_death_ticks_h[int(ri)] = int(ticks_run)
+                            try:
+                                probe_death_ticks_s[int(ri)] = int(rs.get("death_tick"))
+                            except Exception:
+                                probe_death_ticks_s[int(ri)] = int(ticks_run)
+                            probe_death_meas_h[int(ri)] = str(rh.get("death_measurement") or "")
+                            probe_death_meas_s[int(ri)] = str(rs.get("death_measurement") or "")
+                        return
+
+                    if worker_mode == "process":
+                        ctx = mp.get_context("spawn")
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(workers_i),
+                            mp_context=ctx,
+                            initializer=_invivo_worker_init_v2,
+                            initargs=(healthy, sick2, death_names),
+                        ) as ex:
+                            futs: list[concurrent.futures.Future] = []
+                            for ci in (0, 1):
+                                for ri in range(int(reps_i)):
+                                    futs.append(ex.submit(_invivo_worker_death_eval, int(ci), int(ri), int(ticks_run), int(seed_i)))
+                            for fut in concurrent.futures.as_completed(futs):
+                                ci, ri, dt, dm = fut.result()
+                                if 0 <= int(ri) < int(reps_i):
+                                    if int(ci) == 0:
+                                        probe_death_ticks_h[int(ri)] = int(dt)
+                                        probe_death_meas_h[int(ri)] = str(dm)
+                                    else:
+                                        probe_death_ticks_s[int(ri)] = int(dt)
+                                        probe_death_meas_s[int(ri)] = str(dm)
+                        return
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
+                        futs2: list[concurrent.futures.Future] = []
+                        for ci in (0, 1):
+                            for ri in range(int(reps_i)):
+                                futs2.append(ex.submit(_invivo_worker_death_eval, int(ci), int(ri), int(ticks_run), int(seed_i)))
+                        for fut in concurrent.futures.as_completed(futs2):
+                            ci, ri, dt, dm = fut.result()
+                            if 0 <= int(ri) < int(reps_i):
+                                if int(ci) == 0:
+                                    probe_death_ticks_h[int(ri)] = int(dt)
+                                    probe_death_meas_h[int(ri)] = str(dm)
+                                else:
+                                    probe_death_ticks_s[int(ri)] = int(dt)
+                                    probe_death_meas_s[int(ri)] = str(dm)
+
+                while True:
+                    _run_death_probe(int(ticks_probe))
+                    try:
+                        max_h_probe = int(max(int(x) for x in probe_death_ticks_h)) if probe_death_ticks_h else int(ticks_probe)
+                    except Exception:
+                        max_h_probe = int(ticks_probe)
+                    try:
+                        max_s_probe = int(max(int(x) for x in probe_death_ticks_s)) if probe_death_ticks_s else int(ticks_probe)
+                    except Exception:
+                        max_s_probe = int(ticks_probe)
+
+                    healthy_all_dead = bool(int(max_h_probe) < int(ticks_probe))
+                    sick_all_dead = bool(int(max_s_probe) < int(ticks_probe))
+                    if healthy_all_dead or sick_all_dead:
+                        break
+                    if int(ticks_probe) >= int(ticks_cap):
+                        break
+                    ticks_probe = int(min(int(ticks_cap), max(int(ticks_probe) + 1, int(ticks_probe) * 2)))
+
+                # Determine how many ticks to actually compute full measurement series for.
+                # If a group fully died during the probe, we stop at the earlier group's extinction time (+1 tick).
+                # Otherwise we run to ticks_cap and warn.
+                try:
+                    max_h_probe2 = int(max(int(x) for x in probe_death_ticks_h)) if probe_death_ticks_h else int(ticks_probe)
+                except Exception:
+                    max_h_probe2 = int(ticks_probe)
+                try:
+                    max_s_probe2 = int(max(int(x) for x in probe_death_ticks_s)) if probe_death_ticks_s else int(ticks_probe)
+                except Exception:
+                    max_s_probe2 = int(ticks_probe)
+
+                group_dead_found = bool(int(max_h_probe2) < int(ticks_probe) or int(max_s_probe2) < int(ticks_probe))
+                if group_dead_found:
+                    end_tick = int(min(int(max_h_probe2), int(max_s_probe2)))
+                    ticks_used = int(max(int(requested_ticks), int(end_tick) + 1))
+                    ticks_used = int(min(int(ticks_used), int(ticks_probe)))
+                else:
+                    ticks_used = int(min(int(ticks_cap), int(ticks_probe)))
+
+                # Rebind ticks_i to the actual run length for the rest of the handler.
+                ticks_i = int(ticks_used)
+
                 rep_series_healthy: list[Dict[str, list[float]]] = []
                 rep_series_sick: list[Dict[str, list[float]]] = []
-                for ri in range(reps_i):
+
+                death_ticks_healthy: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
+                death_ticks_sick: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
+                death_meas_healthy: list[str] = ["" for _ in range(int(reps_i))]
+                death_meas_sick: list[str] = ["" for _ in range(int(reps_i))]
+
+                def _run_one(ri: int) -> tuple[int, Dict[str, list[float]], Dict[str, list[float]], int, str, int, str]:
                     seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
                     seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
-                    rep_series_healthy.append(_run_in_vivo_measurement_series(healthy, ticks=ticks_i, seed0=seed0_h))
-                    rep_series_sick.append(_run_in_vivo_measurement_series(sick2, ticks=ticks_i, seed0=seed0_s))
+                    sh, dt_h, dm_h = _run_in_vivo_measurement_series_until_death(
+                        healthy, ticks=ticks_i, seed0=seed0_h, death_names=death_names
+                    )
+                    ss, dt_s, dm_s = _run_in_vivo_measurement_series_until_death(
+                        sick2, ticks=ticks_i, seed0=seed0_s, death_names=death_names
+                    )
+                    return int(ri), sh, ss, int(dt_h), str(dm_h), int(dt_s), str(dm_s)
 
-                mean_healthy = _mean_measurement_series(rep_series_healthy, ticks=ticks_i, names=names)
-                mean_sick = _mean_measurement_series(rep_series_sick, ticks=ticks_i, names=names)
+                if int(reps_i) <= 1 or int(workers_i) <= 1:
+                    for ri in range(reps_i):
+                        _, sh, ss, dt_h, dm_h, dt_s, dm_s = _run_one(int(ri))
+                        rep_series_healthy.append(sh)
+                        rep_series_sick.append(ss)
+                        if 0 <= int(ri) < int(reps_i):
+                            death_ticks_healthy[int(ri)] = int(dt_h)
+                            death_ticks_sick[int(ri)] = int(dt_s)
+                            death_meas_healthy[int(ri)] = str(dm_h)
+                            death_meas_sick[int(ri)] = str(dm_s)
+                elif worker_mode == "process":
+                    ctx = mp.get_context("spawn")
+                    out_h: list[Optional[Dict[str, list[float]]]] = [None for _ in range(int(reps_i))]
+                    out_s: list[Optional[Dict[str, list[float]]]] = [None for _ in range(int(reps_i))]
+                    out_dt_h: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
+                    out_dt_s: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
+                    out_dm_h: list[str] = ["" for _ in range(int(reps_i))]
+                    out_dm_s: list[str] = ["" for _ in range(int(reps_i))]
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=int(workers_i),
+                        mp_context=ctx,
+                        initializer=_invivo_worker_init_v2,
+                        initargs=(healthy, sick2, death_names),
+                    ) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(range(reps_i))
+
+                        def _submit_one() -> None:
+                            try:
+                                ri0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_invivo_worker_eval, int(ri0), int(ticks_i), int(seed_i)))
+
+                        for _ in range(min(int(workers_i), int(reps_i))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                            for fut in done:
+                                ri, sh, ss, dt_h, dm_h, dt_s, dm_s = fut.result()
+                                if 0 <= int(ri) < int(reps_i):
+                                    out_h[int(ri)] = sh
+                                    out_s[int(ri)] = ss
+                                    out_dt_h[int(ri)] = int(dt_h)
+                                    out_dt_s[int(ri)] = int(dt_s)
+                                    out_dm_h[int(ri)] = str(dm_h)
+                                    out_dm_s[int(ri)] = str(dm_s)
+                                _submit_one()
+
+                    rep_series_healthy = [x if isinstance(x, dict) else {} for x in out_h]
+                    rep_series_sick = [x if isinstance(x, dict) else {} for x in out_s]
+                    death_ticks_healthy = [int(x) for x in out_dt_h]
+                    death_ticks_sick = [int(x) for x in out_dt_s]
+                    death_meas_healthy = [str(x) for x in out_dm_h]
+                    death_meas_sick = [str(x) for x in out_dm_s]
+                else:
+                    out_h2: list[Optional[Dict[str, list[float]]]] = [None for _ in range(int(reps_i))]
+                    out_s2: list[Optional[Dict[str, list[float]]]] = [None for _ in range(int(reps_i))]
+                    out_dt_h2: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
+                    out_dt_s2: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
+                    out_dm_h2: list[str] = ["" for _ in range(int(reps_i))]
+                    out_dm_s2: list[str] = ["" for _ in range(int(reps_i))]
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(range(reps_i))
+
+                        def _submit_one() -> None:
+                            try:
+                                ri0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_run_one, int(ri0)))
+
+                        for _ in range(min(int(workers_i), int(reps_i))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                            for fut in done:
+                                ri, sh, ss, dt_h, dm_h, dt_s, dm_s = fut.result()
+                                if 0 <= int(ri) < int(reps_i):
+                                    out_h2[int(ri)] = sh
+                                    out_s2[int(ri)] = ss
+                                    out_dt_h2[int(ri)] = int(dt_h)
+                                    out_dt_s2[int(ri)] = int(dt_s)
+                                    out_dm_h2[int(ri)] = str(dm_h)
+                                    out_dm_s2[int(ri)] = str(dm_s)
+                                _submit_one()
+
+                    rep_series_healthy = [x if isinstance(x, dict) else {} for x in out_h2]
+                    rep_series_sick = [x if isinstance(x, dict) else {} for x in out_s2]
+                    death_ticks_healthy = [int(x) for x in out_dt_h2]
+                    death_ticks_sick = [int(x) for x in out_dt_s2]
+                    death_meas_healthy = [str(x) for x in out_dm_h2]
+                    death_meas_sick = [str(x) for x in out_dm_s2]
+
+                mean_healthy, mean_healthy_n = _mean_measurement_series_ragged(rep_series_healthy, ticks=ticks_i, names=names)
+                mean_sick, mean_sick_n = _mean_measurement_series_ragged(rep_series_sick, ticks=ticks_i, names=names)
+
+                series_reps: Optional[Dict[str, Any]] = None
+                if bool(include_replicates):
+                    reps_h = [_pad_measurement_series_to_ticks(s, ticks=int(ticks_i), names=names) for s in rep_series_healthy]
+                    reps_s = [_pad_measurement_series_to_ticks(s, ticks=int(ticks_i), names=names) for s in rep_series_sick]
+                    series_reps = {"healthy": reps_h, "sick": reps_s}
+
+                alive_n_healthy = _alive_n_from_death_ticks(death_ticks_healthy, ticks=int(ticks_i))
+                alive_n_sick = _alive_n_from_death_ticks(death_ticks_sick, ticks=int(ticks_i))
 
                 cure = _invivo_cure_score(mean_healthy, mean_sick, names=names, ticks=ticks_i)
+
+                warnings: list[Dict[str, Any]] = []
+                if int(ticks_i) > int(requested_ticks):
+                    warnings.append(
+                        {
+                            "kind": "auto_extended_ticks",
+                            "message": "The run was extended beyond requested ticks to reach group extinction (all dead in at least one group), subject to a safety cap.",
+                            "details": {
+                                "requested_ticks": int(requested_ticks),
+                                "ticks_used": int(ticks_i),
+                                "ticks_cap": int(ticks_cap),
+                                "ticks_probe": int(ticks_probe),
+                            },
+                        }
+                    )
+                if not group_dead_found:
+                    warnings.append(
+                        {
+                            "kind": "group_extinction_not_reached",
+                            "message": "Neither group reached extinction (all dead) within the safety cap.",
+                            "details": {
+                                "requested_ticks": int(requested_ticks),
+                                "ticks_used": int(ticks_i),
+                                "ticks_cap": int(ticks_cap),
+                            },
+                        }
+                    )
+                try:
+                    min_h = int(min(int(x) for x in death_ticks_healthy)) if death_ticks_healthy else int(ticks_i)
+                except Exception:
+                    min_h = int(ticks_i)
+                try:
+                    min_s = int(min(int(x) for x in death_ticks_sick)) if death_ticks_sick else int(ticks_i)
+                except Exception:
+                    min_s = int(ticks_i)
+                if int(min_h) < int(ticks_i) or int(min_s) < int(ticks_i):
+                    warnings.append(
+                        {
+                            "kind": "series_truncated_by_death",
+                            "message": "One or more replicates died before the requested tick count; series values after death are omitted (null).",
+                            "details": {
+                                "requested_ticks": int(ticks_i),
+                                "healthy_min_death_tick": int(min_h),
+                                "sick_min_death_tick": int(min_s),
+                            },
+                        }
+                    )
 
                 samples_run = int(2 * reps_i)
                 charge = _game_compute_charge(
@@ -5774,6 +6567,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     meta={
                         "experiment": "in_vivo_trial_v1",
                         "ticks": int(ticks_i),
+                        "requested_ticks": int(requested_ticks),
                         "replicates": int(reps_i),
                     },
                 )
@@ -5785,13 +6579,259 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         "ok": True,
                         "experiment": "in_vivo_trial_v1",
                         "ticks": int(ticks_i),
+                        "requested_ticks": int(requested_ticks),
+                        "ticks_cap": int(ticks_cap),
                         "replicates": int(reps_i),
+                        "workers": int(workers_i),
+                        "worker_mode": str(worker_mode),
                         "measurements": names,
                         "series": {
                             "healthy": mean_healthy,
                             "sick": mean_sick,
                         },
+                        "series_replicates": series_reps,
+                        "series_n": {
+                            "healthy": mean_healthy_n,
+                            "sick": mean_sick_n,
+                        },
+                        "death": {
+                            "healthy": {
+                                "death_ticks": [int(x) for x in death_ticks_healthy],
+                                "death_measurements": [str(x) for x in death_meas_healthy],
+                                "alive_n": alive_n_healthy,
+                            },
+                            "sick": {
+                                "death_ticks": [int(x) for x in death_ticks_sick],
+                                "death_measurements": [str(x) for x in death_meas_sick],
+                                "alive_n": alive_n_sick,
+                            },
+                            "death_names": list(death_names),
+                        },
+                        "warnings": warnings,
                         "cure": cure,
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path == "/api/experiments/in_vivo_screen":
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = body.get("interventions")
+
+                ticks = body.get("ticks", 200)
+                replicates = body.get("replicates", 10)
+                seed = body.get("seed", 1)
+                workers_raw = body.get("workers", None)
+                worker_mode_raw = body.get("worker_mode", "process")
+                direction = body.get("direction", "up")
+                dose = body.get("dose", 1)
+
+                sick = body.get("sick")
+                if not isinstance(sick, dict):
+                    raise ValueError("missing sick payload")
+
+                sick2 = _deepcopy_payload(sick)
+                _apply_interventions_to_payload_inplace(sick2, interventions)
+
+                try:
+                    ticks_i = max(1, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                try:
+                    dose_f = float(dose)
+                except Exception:
+                    dose_f = 0.0
+                if not np.isfinite(dose_f) or dose_f < 0.0:
+                    dose_f = 0.0
+
+                worker_mode = str(worker_mode_raw or "process").strip().lower()
+                if worker_mode not in ("thread", "process"):
+                    worker_mode = "process"
+
+                try:
+                    workers_i = int(workers_raw) if ("workers" in body) else 0
+                except Exception:
+                    workers_i = 0
+                if workers_i <= 0:
+                    workers_i = max(1, int(min(4, os.cpu_count() or 1)))
+
+                death_names = _death_measurement_names_from_payload(sick2)
+
+                prot_layers = _protein_layer_names_from_payload(sick2)
+                if not prot_layers:
+                    raise ValueError("no protein_* float32 layers found")
+
+                def _lifespan_stats(dts: list[int]) -> Dict[str, Any]:
+                    arr = np.asarray([int(x) for x in dts], dtype=np.float64) if dts else np.asarray([], dtype=np.float64)
+                    if arr.size:
+                        med = float(np.median(arr))
+                        mean = float(np.mean(arr))
+                        try:
+                            p25 = float(np.quantile(arr, 0.25))
+                        except Exception:
+                            p25 = float(med)
+                        try:
+                            p75 = float(np.quantile(arr, 0.75))
+                        except Exception:
+                            p75 = float(med)
+                        mn = float(np.min(arr))
+                        mx = float(np.max(arr))
+                    else:
+                        med = float(ticks_i)
+                        mean = float(ticks_i)
+                        p25 = float(ticks_i)
+                        p75 = float(ticks_i)
+                        mn = float(ticks_i)
+                        mx = float(ticks_i)
+                    deaths = int(sum(1 for dt in dts if int(dt) < int(ticks_i)))
+                    return {
+                        "n": int(len(dts)),
+                        "ticks": int(ticks_i),
+                        "median_lifespan_tick": float(med),
+                        "mean_lifespan_tick": float(mean),
+                        "p25_lifespan_tick": float(p25),
+                        "p75_lifespan_tick": float(p75),
+                        "min_lifespan_tick": float(mn),
+                        "max_lifespan_tick": float(mx),
+                        "deaths": int(deaths),
+                        "survivors": int(len(dts) - deaths),
+                    }
+
+                # Baseline (sick + interventions)
+                base_death_ticks: list[int] = []
+                for ri in range(int(reps_i)):
+                    seed0 = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                    r0 = _run_lifespan_death_tick(sick2, ticks=int(ticks_i), seed0=int(seed0), death_names=death_names)
+                    try:
+                        dt0 = int(r0.get("death_tick"))
+                    except Exception:
+                        dt0 = int(ticks_i)
+                    base_death_ticks.append(int(dt0))
+                base_stats = _lifespan_stats(base_death_ticks)
+
+                workers_i = max(1, min(int(workers_i), int(len(prot_layers)), 32))
+
+                def _eval_layer(li: int, nm: str) -> Dict[str, Any]:
+                    p0 = _deepcopy_payload(sick2)
+                    _apply_interventions_to_payload_inplace(p0, [{"layer": str(nm), "direction": direction, "dose": float(dose_f)}])
+                    dts: list[int] = []
+                    for ri in range(int(reps_i)):
+                        seed0 = int(seed_i) + (int(li + 1) * 1000003) + (int(ri) * 97)
+                        r = _run_lifespan_death_tick(p0, ticks=int(ticks_i), seed0=int(seed0), death_names=death_names)
+                        try:
+                            dt = int(r.get("death_tick"))
+                        except Exception:
+                            dt = int(ticks_i)
+                        dts.append(int(dt))
+                    stats = _lifespan_stats(dts)
+                    return {
+                        "layer": str(nm),
+                        "layer_index": int(li),
+                        **stats,
+                    }
+
+                results_out: list[Optional[Dict[str, Any]]] = [None for _ in range(int(len(prot_layers)))]
+                if int(len(prot_layers)) <= 1 or int(workers_i) <= 1:
+                    for li, nm in enumerate(prot_layers):
+                        results_out[int(li)] = _eval_layer(int(li), str(nm))
+                elif worker_mode == "process":
+                    ctx = mp.get_context("spawn")
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=int(workers_i),
+                        mp_context=ctx,
+                        initializer=_invivo_screen_worker_init,
+                        initargs=(sick2, death_names, int(ticks_i), int(seed_i), int(reps_i), str(direction), float(dose_f)),
+                    ) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(list(enumerate(prot_layers)))
+
+                        def _submit_one() -> None:
+                            try:
+                                li0, nm0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_invivo_screen_worker_eval, int(li0), str(nm0)))
+
+                        for _ in range(min(int(workers_i), int(len(prot_layers)))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                            for fut in done:
+                                r = fut.result()
+                                li = int(r.get("layer_index") or 0)
+                                if 0 <= li < int(len(results_out)):
+                                    results_out[li] = r
+                                _submit_one()
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(list(enumerate(prot_layers)))
+
+                        def _submit_one() -> None:
+                            try:
+                                li0, nm0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_eval_layer, int(li0), str(nm0)))
+
+                        for _ in range(min(int(workers_i), int(len(prot_layers)))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                            for fut in done:
+                                r = fut.result()
+                                li = int(r.get("layer_index") or 0)
+                                if 0 <= li < int(len(results_out)):
+                                    results_out[li] = r
+                                _submit_one()
+
+                results: list[Dict[str, Any]] = [r for r in results_out if isinstance(r, dict)]
+                results.sort(key=lambda d: float(d.get("median_lifespan_tick") or 0.0), reverse=True)
+
+                samples_run = int(int(reps_i) * int(len(prot_layers) + 1))
+                charge = _game_compute_charge(
+                    "in_vivo_trial",
+                    samples_run,
+                    meta={
+                        "experiment": "in_vivo_screen_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "protein_layers": int(len(prot_layers)),
+                        "direction": str(direction),
+                        "dose": float(dose_f),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": "in_vivo_screen_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "workers": int(workers_i),
+                        "worker_mode": str(worker_mode),
+                        "direction": str(direction),
+                        "dose": float(dose_f),
+                        "protein_layers": int(len(prot_layers)),
+                        "baseline": {
+                            **base_stats,
+                        },
+                        "death_names": list(death_names),
+                        "results": results,
                         "game": game,
                     },
                 )
@@ -5879,6 +6919,37 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError(f"seed must be an int: {e}") from e
 
                 syn_rng = np.random.default_rng(3)
+
+                # Death-aware preflight: bulk assays are snapshots at `ticks`.
+                for ci, c in enumerate(cond_list):
+                    nm0 = str(c.get("name") or "").strip()
+                    payload0 = c.get("payload")
+                    if not nm0 or not isinstance(payload0, dict):
+                        continue
+                    for ri in range(reps_i):
+                        seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
+                        pf = _preflight_death_before_ticks(payload0, ticks=int(ticks_i), seed0=int(seed0))
+                        if isinstance(pf, dict):
+                            dt0 = int(pf.get("death_tick") or 0)
+                            self._send_json(
+                                400,
+                                {
+                                    "ok": False,
+                                    "error": f"ticks too high: '{nm0}' died at tick {dt0} (< requested ticks={int(ticks_i)})",
+                                    "error_kind": "ticks_exceed_death",
+                                    "experiment": "bulk_omics_v1",
+                                    "details": {
+                                        "condition": str(nm0),
+                                        "replicate": int(ri),
+                                        "seed": int(seed0),
+                                        "requested_ticks": int(ticks_i),
+                                        "death_tick": int(dt0),
+                                        "death_measurement": str(pf.get("death_measurement") or ""),
+                                        "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
+                                    },
+                                },
+                            )
+                            return
 
                 meta_header = [
                     "sample_id",

@@ -199,6 +199,7 @@
                   </div>
                   <div class="row row--inlineFlex">
                     <button id="bulkDeleteBtn" class="btn btn--danger btn--tiny">Delete selected</button>
+                    <button id="downloadLayersBtn" class="btn btn--secondary btn--tiny">Download layers</button>
                     <div class="spacer"></div>
                     <div id="bulkDeleteInfo" class="meta"></div>
                   </div>
@@ -396,6 +397,7 @@
                         <option value="set_constant">set constant</option>
                         <option value="set_random_uniform">set random uniform</option>
                         <option value="add_random_uniform">add random uniform</option>
+                        <option value="apply_expr">apply expression</option>
                       </select>
                     </div>
                     <div class="row">
@@ -412,6 +414,14 @@
                     <div class="row">
                       <label class="label">Seed</label>
                       <input id="opSeed" class="input" type="number" value="0" step="1" />
+                    </div>
+
+                    <div class="row">
+                      <label class="label">Expression</label>
+                      <textarea id="opExpr" class="input" style="min-height: 86px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;" spellcheck="false">clip(x * 0.5, 0, 1)</textarea>
+                    </div>
+                    <div class="row row--inline">
+                      <div id="opExprPreview" class="meta"></div>
                     </div>
 
                     <div class="hr"></div>
