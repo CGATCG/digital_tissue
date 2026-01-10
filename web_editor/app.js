@@ -4682,6 +4682,8 @@ async function _docOpenPrompt(token) {
 let inspectSummaryLastLayer = "";
 let inspectSummaryDirty = true;
 
+let inspectPinnedCell = null;
+
 let inspectHistMaskLayer = "";
 let inspectHistMaskOp = "==";
 let inspectHistMaskValue = 1;
@@ -8642,9 +8644,12 @@ function _syncInspectModeUi() {
   if (showSummary) {
     inspectSummaryDirty = true;
     renderInspectSummary(state, selectedLayer);
+    if (inspectPinnedCell) _inspectRenderAtCell(inspectPinnedCell.y, inspectPinnedCell.x);
   } else {
     if (ui.inspectSummaryStats) ui.inspectSummaryStats.textContent = "";
     if (ui.inspectCursorValue) ui.inspectCursorValue.textContent = "";
+    if (inspectPinnedCell) renderInspectTable(state, inspectPinnedCell.y, inspectPinnedCell.x);
+    else if (ui.inspectTable) ui.inspectTable.innerHTML = "";
   }
 }
 
@@ -9276,6 +9281,31 @@ function renderInspectTable(state, y, x) {
   `;
 }
 
+function _inspectRenderAtCell(y, x) {
+  const inspectMode = ui.inspectMode?.value || "cursor";
+  if (inspectMode === "summary") {
+    _ensureInspectSummaryUpToDate();
+    const meta = state.layers.find((l) => l.name === selectedLayer);
+    const a = state.data[selectedLayer];
+    if (ui.inspectCursorValue) {
+      if (!meta || !a) ui.inspectCursorValue.textContent = "";
+      else {
+        const v = a[y * state.W + x];
+        const vv = meta.kind === "categorical" || meta.kind === "counts" ? String(clampCounts(v)) : Number(v).toFixed(6);
+        ui.inspectCursorValue.textContent = `${selectedLayer}@(${y},${x}) = ${vv}`;
+      }
+    }
+  } else {
+    renderInspectTable(state, y, x);
+  }
+}
+
+function _inspectClearPin() {
+  inspectPinnedCell = null;
+  if (ui.inspectCursorValue) ui.inspectCursorValue.textContent = "";
+  if (ui.inspectTable) ui.inspectTable.innerHTML = "";
+}
+
 function renderInspectSummary(state, layerName) {
   if (!ui.inspectSummaryStats || !ui.inspectCanvasHist) return;
   const meta = state.layers.find((l) => l.name === layerName) || null;
@@ -9600,7 +9630,19 @@ function _inspectPopulateHistMaskLayerSelect() {
   const avail = new Set(layerNames);
   if (inspectHistMaskLayer && !avail.has(String(inspectHistMaskLayer))) inspectHistMaskLayer = "";
   
-  const searchable = makeSearchableSelect(layerNames, inspectHistMaskLayer || "", "(none)");
+  const searchable = makeSearchableSelect(
+    layerNames,
+    inspectHistMaskLayer || "",
+    "(none)",
+    (val) => {
+      inspectHistMaskLayer = String(val || "").trim();
+      try {
+        localStorage.setItem(INSPECT_HIST_MASK_LAYER_KEY, String(inspectHistMaskLayer || ""));
+      } catch {}
+      inspectSummaryDirty = true;
+      _ensureInspectSummaryUpToDate();
+    }
+  );
   searchable.input.className = "input input--tiny";
   ui.inspectHistMaskLayer.replaceWith(searchable.wrapper);
   ui.inspectHistMaskLayer = searchable.input;
@@ -10106,6 +10148,9 @@ function updatePanels() {
   ui.editMode.parentElement.parentElement.style.opacity = (isPaintable || editMode === "clone") ? "1" : "0.55";
 
   _ensureInspectSummaryUpToDate();
+  if (inspectPinnedCell && (ui.inspectMode?.value || "cursor") === "summary") {
+    _inspectRenderAtCell(inspectPinnedCell.y, inspectPinnedCell.x);
+  }
 }
 
 function resizeIfNeeded(H, W) {
@@ -12468,7 +12513,11 @@ function _selectLayerByDelta(delta) {
 }
 document.addEventListener("keydown", (ev) => {
   if (_isTypingTarget(ev.target)) return;
-  if (ev.key === "j") {
+  if (ev.key === "Escape") {
+    if (inspectPinnedCell) {
+      _inspectClearPin();
+    }
+  } else if (ev.key === "j") {
     ev.preventDefault();
     _selectLayerByDelta(1);
   } else if (ev.key === "k") {
@@ -12889,6 +12938,9 @@ ui.canvas.addEventListener("pointerdown", (ev) => {
   const { y, x } = eventToCell(ev);
   lastCell = { y, x };
 
+  inspectPinnedCell = { y, x };
+  _inspectRenderAtCell(y, x);
+
   const mode = String(ui.editMode?.value || "brush");
   if (mode === "clone") {
     if (ev.altKey || !cloneSrc) {
@@ -12919,22 +12971,6 @@ ui.canvas.addEventListener("pointermove", (ev) => {
   ui.cursorInfo.textContent = `(y,x): (${y}, ${x})`;
 
   _cloneUpdateInfo();
-
-  const inspectMode = ui.inspectMode?.value || "cursor";
-  if (inspectMode === "summary") {
-    const meta = state.layers.find((l) => l.name === selectedLayer);
-    const a = state.data[selectedLayer];
-    if (ui.inspectCursorValue) {
-      if (!meta || !a) ui.inspectCursorValue.textContent = "";
-      else {
-        const v = a[y * state.W + x];
-        const vv = meta.kind === "categorical" || meta.kind === "counts" ? String(clampCounts(v)) : Number(v).toFixed(6);
-        ui.inspectCursorValue.textContent = `${selectedLayer}@(${y},${x}) = ${vv}`;
-      }
-    }
-  } else {
-    renderInspectTable(state, y, x);
-  }
 
   if (!isDown) return;
 
@@ -12992,6 +13028,11 @@ ui.canvas.addEventListener("pointerup", (ev) => {
 
 ui.canvas.addEventListener("pointerleave", () => {
   ui.cursorInfo.textContent = `(y,x): –`;
+});
+
+ui.canvas.addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  if (inspectPinnedCell) _inspectClearPin();
 });
 
 // Sync let ops with actual layers - create missing layers or remove orphaned ops

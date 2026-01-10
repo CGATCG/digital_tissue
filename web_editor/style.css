@@ -375,6 +375,12 @@ a.btn{
 .table th{background: rgba(255,255,255,.03); color:rgba(245,246,247,.72); font-weight:800; text-align:left;}
 .table tr:last-child td{border-bottom:none;}
 
+#inspectTable{overflow:auto;}
+#inspectTable table{table-layout:fixed;}
+#inspectTable th:nth-child(1), #inspectTable td:nth-child(1){width:160px;}
+#inspectTable th:nth-child(2), #inspectTable td:nth-child(2){width:90px;}
+#inspectTable th:nth-child(3), #inspectTable td:nth-child(3){width:140px;}
+
 .opsExprWrap{display:flex; gap:8px; align-items:flex-start;}
 .opsExprWrap .btn{margin-top:2px; white-space:nowrap;}
 
