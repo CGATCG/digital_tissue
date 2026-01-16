@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tests — Cancer Challenge</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar__titleWrap">
+          <div class="topbar__title">Tests — Cancer Challenge</div>
+          <div id="testsStatus" class="topbar__fileInfo"></div>
+        </div>
+        <div class="topbar__actions">
+          <div id="moneyScore" class="topbar__fileInfo" style="margin-right: 10px;"></div>
+          <button id="resetMoneyBtn" class="btn btn--secondary">Reset $</button>
+          <button id="backToEditorBtn" class="btn btn--secondary">Editor</button>
+        </div>
+      </header>
+
+      <div class="content">
+        <div class="manageLayout" style="width: 100%;">
+          <div class="sidebar">
+            <section id="stepModelPanel" class="panel">
+              <div class="panel__title">Step 1 — Choose model</div>
+              <div class="row">
+                <label class="label">Model</label>
+                <select id="modelSel" class="input"></select>
+              </div>
+              <div id="modelMeta" class="meta"></div>
+            </section>
+
+            <section id="stepExperimentPanel" class="panel" style="margin-top: 12px; display: none;">
+              <div class="panel__title">Step 2 — Choose experiment</div>
+              <div class="row">
+                <label class="label">Experiment</label>
+                <select id="experimentSel" class="input">
+                  <option value="" selected>Select an experiment…</option>
+                  <option value="spatial_tx">Spatial omics</option>
+                  <option value="bulk_omics">Bulk omics</option>
+                  <option value="characterization">Characterization</option>
+                  <option value="protein_screen">Drug screen</option>
+                  <option value="claim_cure">Claim cure</option>
+                </select>
+              </div>
+              <div id="experimentMeta" class="meta"></div>
+            </section>
+
+            <section id="stepParamsPanel" class="panel" style="margin-top: 12px; display: none;">
+              <div class="panel__title">Step 3 — Configure parameters</div>
+
+              <div class="row">
+                <label class="label">Age (days)</label>
+                <input id="ticksInput" class="input" type="number" min="0" step="1" value="100" />
+              </div>
+
+              <div class="row">
+                <label class="label">Replicates</label>
+                <input id="repsInput" class="input" type="number" min="1" step="1" value="3" />
+              </div>
+
+              <div id="paramsSpatialPanel" class="tabPanel tabPanel--active">
+                <div class="row">
+                  <label class="label">Gene set</label>
+                  <select id="geneSetSel" class="input"></select>
+                </div>
+              </div>
+
+              <div id="paramsBulkPanel" class="tabPanel">
+                <div class="row">
+                  <label class="label">Omics set</label>
+                  <select id="omicsSetSel" class="input"></select>
+                </div>
+              </div>
+
+              <div id="paramsCharPanel" class="tabPanel">
+                <div class="meta" style="margin-top: 6px;">Replicate series will be included automatically.</div>
+              </div>
+
+              <div id="paramsScreenPanel" class="tabPanel">
+                <div class="row">
+                  <label class="label">Drug type</label>
+                  <select id="screenDir" class="input">
+                    <option value="up" selected>Activator (increases activity)</option>
+                    <option value="down">Inhibitor (decreases activity)</option>
+                  </select>
+                </div>
+
+                <div class="row">
+                  <label class="label">Dose (nM)</label>
+                  <input id="screenDose" class="input" type="number" min="0" step="0.5" value="1" />
+                </div>
+
+                <div class="meta" style="margin-top: 6px;">Dose is in nanomolar (nM). As a rough rule of thumb, each +1 nM shifts activity by ~10% in the chosen direction.</div>
+              </div>
+
+              <div id="paramsClaimPanel" class="tabPanel">
+                <div class="meta" style="margin-top: 6px;">Compares treated cancer vs healthy survival curves.</div>
+              </div>
+            </section>
+
+            <section id="stepInterventionsPanel" class="panel" style="margin-top: 12px; display: none;">
+              <div class="panel__title">Step 4 — Interventions</div>
+
+              <div class="row">
+                <label class="label">Protein layer</label>
+                <select id="ivLayerSel" class="input"></select>
+              </div>
+
+              <div class="row">
+                <label class="label">Drug type</label>
+                <select id="ivDirSel" class="input">
+                  <option value="up">Activator (increases activity)</option>
+                  <option value="down">Inhibitor (decreases activity)</option>
+                </select>
+              </div>
+
+              <div class="row">
+                <label class="label">Dose (nM)</label>
+                <div class="two two--btnLeft">
+                  <button id="ivAddBtn" class="btn btn--secondary btn--small">Add</button>
+                  <input id="ivDoseInput" class="input" type="number" min="0" step="0.5" value="1" />
+                </div>
+              </div>
+
+              <div class="meta" style="margin-top: 6px;">Dose is in nanomolar (nM). As a rough rule of thumb, each +1 nM shifts activity by ~10% in the chosen direction.</div>
+
+              <div class="row row--inline">
+                <div class="two two--equal">
+                  <div id="ivList" class="meta" style="white-space: normal;"></div>
+                  <button id="ivClearBtn" class="btn btn--secondary">Clear interventions</button>
+                </div>
+              </div>
+            </section>
+
+            <section id="stepRunPanel" class="panel" style="margin-top: 12px; display: none;">
+              <div class="panel__title">Step 5 — Cost & run</div>
+              <div class="row row--inline">
+                <div class="two two--equal">
+                  <div style="display:flex; align-items:center; gap:10px; flex-wrap: wrap;">
+                    <button id="runBtn" class="btn btn--primary">Run</button>
+                    <div id="runCost" class="meta"></div>
+                  </div>
+                  <button id="clearBtn" class="btn btn--secondary">Clear</button>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="toolsDock toolsDock--full">
+            <div class="toolsBody">
+              <section class="panel">
+                <div class="panel__title">Output</div>
+                <div id="outSummary" class="meta" style="margin-bottom: 10px;"></div>
+
+                <div class="row row--inline">
+                  <div class="three">
+                    <button id="downloadJsonBtn" class="btn btn--secondary" disabled>Download JSON</button>
+                    <button id="downloadNoisyMatrixCsvBtn" class="btn btn--secondary" disabled>Matrix CSV</button>
+                    <button id="downloadMetadataCsvBtn" class="btn btn--secondary" disabled>Metadata CSV</button>
+                  </div>
+                </div>
+
+                <div class="row row--inline">
+                  <textarea id="outText" class="input" style="min-height: 420px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;" spellcheck="false"></textarea>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="tests.js"></script>
+  </body>
+</html>

@@ -1,0 +1,2257 @@
+import argparse
+import csv
+import io
+import json
+import math
+import os
+import re
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _http_post_json(*, url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+    raw = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(str(url), data=raw, method="POST", headers=dict(headers))
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            b = resp.read()
+            txt = b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+    except urllib.error.HTTPError as e:
+        status = int(getattr(e, "code", 0) or 0)
+        try:
+            b = e.read()
+            txt = b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+        except Exception:
+            txt = str(e)
+        raise RuntimeError(f"HTTP {status}: {txt[:2000]}") from e
+
+    obj: Dict[str, Any] = {}
+    try:
+        parsed = json.loads(txt) if isinstance(txt, str) and txt.strip() else None
+        obj = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        obj = {}
+    return obj
+
+
+_BENCH_CHALLENGE = "cancer"
+_BENCH_PLAYER_ID = ""
+_BENCH_PROVIDER = ""
+_BENCH_MODEL = ""
+
+
+_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+
+
+_ANTHROPIC_ACTION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["call_api", "final"]},
+        "method": {"type": "string"},
+        "path": {"type": "string"},
+        "query": {"type": "object"},
+        "body": {"type": "object"},
+        "last_result_summary": {"type": "string"},
+        "next_step_rationale": {"type": "string"},
+        "win": {"type": "boolean"},
+        "summary": {"type": "string"},
+        "key_findings": {"type": "array", "items": {"type": "string"}},
+        "proposed_interventions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "layer": {"type": "string"},
+                    "direction": {"type": "string"},
+                    "dose": {"type": "number"},
+                },
+                "required": ["layer", "direction", "dose"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": True,
+}
+
+
+def _anthropic_headers(*, api_key: str, betas: Optional[List[str]] = None, content_type_json: bool = True) -> Dict[str, str]:
+    h = {
+        "x-api-key": str(api_key),
+        "anthropic-version": "2023-06-01",
+    }
+    if content_type_json:
+        h["content-type"] = "application/json"
+    if betas:
+        h["anthropic-beta"] = ",".join([str(x) for x in betas if str(x).strip()])
+    return h
+
+
+def _anthropic_assistant_text(resp_json: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    blocks = resp_json.get("content")
+    if isinstance(blocks, list):
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(str(b.get("text") or ""))
+    return "".join(parts)
+
+
+def _anthropic_messages_generate(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout_s: float,
+) -> str:
+    api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("missing ANTHROPIC_API_KEY")
+
+    sys_parts: List[str] = []
+    msgs_out: List[Dict[str, str]] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role0 = str(m.get("role") or "user").strip().lower() or "user"
+        content0 = str(m.get("content") or "")
+        if role0 == "system":
+            if content0.strip():
+                sys_parts.append(content0)
+            continue
+        if role0 not in ("user", "assistant"):
+            role0 = "user"
+        msgs_out.append({"role": role0, "content": content0})
+
+    payload: Dict[str, Any] = {
+        "model": str(model),
+        "max_tokens": int(max_tokens),
+        "messages": msgs_out,
+    }
+    if sys_parts:
+        payload["system"] = "\n\n".join(sys_parts)
+    try:
+        payload["temperature"] = float(temperature)
+    except Exception:
+        payload["temperature"] = 0.0
+
+    betas: List[str] = []
+
+    last_err: Optional[str] = None
+    for attempt in range(3):
+        try:
+            resp_json = _http_post_json(
+                url=f"{_ANTHROPIC_BASE_URL}/messages",
+                headers=_anthropic_headers(api_key=api_key, betas=betas, content_type_json=True),
+                payload=payload,
+                timeout_s=float(timeout_s),
+            )
+            if isinstance(resp_json, dict) and str(resp_json.get("stop_reason") or "").strip().lower() == "refusal":
+                raise RuntimeError("Anthropic refusal")
+            txt = _anthropic_assistant_text(resp_json if isinstance(resp_json, dict) else {})
+            return str(txt or "")
+        except Exception as e:
+            last_err = str(e)
+            if attempt < 2 and ("HTTP 429" in last_err or "HTTP 529" in last_err or "429" in last_err and "HTTP" in last_err or "529" in last_err and "HTTP" in last_err):
+                time.sleep(float(0.7 * (2**attempt)))
+                continue
+            if attempt < 2:
+                time.sleep(float(0.5 * (2**attempt)))
+                continue
+            raise
+
+    raise RuntimeError(last_err or "Anthropic request failed")
+
+
+_PROMPT = r"""
+You are an autonomous agent being evaluated in a benchmark.
+
+You are playing a biology strategy game (a scientific puzzle).
+
+# 1) Story & biology (what’s being simulated)
+You are studying a novel organism with an unknown gut disease. Your job is to discover an effective treatment.
+
+Important: you are NOT told what the disease is.
+- You must do your own R&D: form hypotheses, design experiments, and infer mechanisms from data.
+- This organism is NOT human and is poorly studied.
+- Molecular feature names are intentionally masked (e.g., “protein_7”), so you must reason from data, not from known biology.
+
+We know two key facts:
+- Healthy individuals can live up to ~300 days.
+- Diseased individuals have a median lifespan of ~150 days.
+
+In the simulator, time is measured in ticks (roughly days). Some endpoints report age_days, which is the same as ticks.
+
+# 2) Objective / how to win
+Your primary objective in this benchmark is to maximize cost-effective lifespan extension.
+
+Your score is based on:
+POST /api/tests/disease/claim_cure
+
+The claim_cure response includes:
+- extra_days: treated_disease_median_lifespan_tick - baseline_disease_median_lifespan_tick
+- score_lifedays_per_usd: max(0, extra_days) / game.money_spent_usd
+
+This means you should increase lifespan while keeping total money_spent in mind. You are allowed to run claim_cure even if you are not close to a "win" yet; early attempts are expected.
+
+Win is a ceiling condition (treatment matches healthy controls):
+- win: boolean
+- delta_median_ticks: treated_disease_median_lifespan_tick - healthy_median_lifespan_tick
+- win if abs(delta_median_ticks) <= 0.5
+
+If win=true, the run will stop automatically (the disease cannot be improved beyond matching healthy controls).
+
+# 3) The catch: budget & experimental design
+Every experiment costs money. Efficient strategy matters.
+The more replicates you use the more certain you can be of your outcomes but the more expensive it is
+Just like in real life there is natural variation between individuals.
+
+# 4) What you can do (scientific actions)
+You can run experiments that reveal different views of the disease and intervention effects:
+
+A) Characterization
+- Purpose: It is an in vivo study that can be used with an intervention or by itself. It provides information about biomarkers and lifespan.
+- If it is run in an in vitro model it will provide biomarkers for the cells. If it is used in an in vivo model the biomarkers come from the blood. 
+- Note: death channels end with "_death" and are 0/1. For a replicate timecourse, the death time is the first day where any "*_death" becomes 1; later rows may be empty.
+
+B) Bulk omics (snapshots)
+- You can perform bulk transcriptomics, proteomics or metabolomics froms samples in cell culture or from the organisms gut.
+- It allows you to see the levels of RNA, protein or metabolites in cell culture or in vivo at a given timepoint with out without an intervention.
+- Purpose: identify signatures of diseased vs healthy or intervention vs control.
+- Use it to gain knowledge about how disease and healthy are different or how your intervention is affecting the organism or cells.
+- Output: CSV(s) (samples x features) plus metadata CSV describing samples/replicates/age_days.
+
+C) Spatial omics
+- You can perform spatial transcriptomics or spatial proteomics.
+- It provides a lot more detailed information than characterization experiments.
+- Identify where RNA or protein is localized in the tissue and how it changes between two conditions.
+- You can run it with or without an intervention to better understand how the intervention works.
+- You can run it in cell culture or in vivo.
+- You can run disease or healthy.
+- Use it to gain knowledge about how disease and healthy are different.
+
+D) Protein perturbation screen (in vitro only)
+- Purpose: rapidly discover how altering protein activity changes cellular behavior.
+- Interpretation: do NOT treat higher confluency / n_cells / births_per_tick in cell_culture_disease as inherently “good” unless you have evidence that is good to solve the disease.
+- This is an experiment in cells in culture, you cannot use it to derive specific outcomes for the in vivo study, it is just a cheaper way to do experiments to understand how cells behave under different perturbations
+
+E) Final validation (claim_cure)
+- Purpose: run the head-to-head survival test: healthy vs treated-disease.
+
+# 5) Interventions (what treatments look like)
+An intervention is a list of protein-target perturbations. Each perturbation is a dict:
+- layer: a masked protein id like "protein_17"
+- direction: "up" or "down"
+- dose: a dose of 1 up increases protein activity by 10%, 10 up increases protein activity by 100%, etc. 10 down decreases activity by 100%, etc. each dose equals 10% change in activity. Dose has to be a positive integer.
+
+# 6) Recommended scientific loop
+1) Study the disease to have an idea of what is wrong.
+2) Generate hypotheses.
+3) Propose a small, interpretable experiments to test your hypotheses.
+4) Validate cheaply, then validate for real.
+5) Iterate.
+
+# 7) Data handling: inventory + analysis (omics)
+Omics outputs are saved as files on the server. Prefer inventory + analysis over tiny inline previews.
+
+Inventory:
+GET /api/omics/inventory?player_id=...
+
+To perform an analysis:
+1) Choose the file_id(s) for the data you want to analyze (typically counts matrices).
+2) Include the matching metadata file_id(s) shown in the mapping above. (For spatial: include BOTH run metadata and per-replicate cell_metadata when present.)
+3) Think of the instructions for the analysis you want to run. IMPORTANT: /api/omics/analyze is stateless (it has no memory of prior steps or goals), so your instructions must include the necessary context: what the selected files are, which groups/conditions to compare, and what question to answer.
+4) If you need more samples to run the analysis run more samples before asking for the analysis. For example if you asked for an experiment with cell_culture_disease, you might want to run the same experiment with cell_culture_healthy to get a control to compare to.
+5) Call POST /api/omics/analyze with JSON like:
+{"player_id":"<player_id>","file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}
+
+6) You can use /api/omics/analyze to run any type of analysis on any type of file or metadata. or even just things you tell it. It is a coding agent that will run python to analyze anything in the way you tell it to.
+
+# 8) Minimal “how to operate the simulator” (API you can call)
+You can ONLY interact with the world by calling these HTTP APIs.
+Base URL is provided by the harness.
+
+General rules (read this once and follow it every time):
+- You must pass player_id for any endpoint that takes it.
+- Use GET /api/tests/disease/models to learn valid model keys (e.g. healthy, disease, cell_culture_healthy, cell_culture_disease).
+- ticks is the study duration (roughly “days”). If you request too many ticks and the organism/culture dies earlier, the API can return an error telling you the death tick; reduce ticks or change the intervention.
+- replicates is the number of independent repeats (different random seeds). Cost scales roughly linearly with replicates.
+- interventions is a list of perturbations; an empty list means a baseline/control run.
+
+Cost model (you MUST manage budget):
+- Money spent is tracked server-side per player_id (see GET /api/game/state).
+- Before running expensive studies, you can request a quote (exact price) with:
+  - POST /api/tests/disease/estimate_cost
+    body: {
+      "player_id":"...",
+      "experiment":"bulk_omics|spatial_tx|characterization|protein_screen|claim_cure",
+      "model":"...",
+      "ticks":<int>,
+      "replicates":<int>,
+      "omics_set":"...",
+      "gene_set":"...",
+      "interventions":[...]
+    }
+  - Notes:
+    - model is required for all experiments except claim_cure.
+    - omics_set is required for bulk_omics.
+    - gene_set is required for spatial_tx.
+    - claim_cure ignores ticks (it always uses a long study).
+- Rough unit cost per sample (in vivo). In vitro (cell_culture_*) is ~4x cheaper.
+  - Bulk RNA (omics_set="rna/Bulk RNAseq"): ~$200 + $0.50*ticks + $20*(#interventions)
+  - Bulk proteomics (omics_set="protein/Bulk Proteomics"): ~$800 + $0.50*ticks + $20*(#interventions)
+  - Bulk metabolomics (omics_set="metabolite/targeted_metabolomics"): ~$500 + $0.50*ticks + $20*(#interventions)
+  - Spatial omics (spatial_tx): ~$2500 + $1.00*ticks + $40*(#interventions)
+  - Characterization: ~$3000 + $2.50*ticks + $80*(#interventions)
+  - Protein screen (in vitro only): ~$7500 + $3.00*ticks + $80*(#interventions), but it runs many samples internally (roughly replicates*(#proteins+2)), so total cost can be very large.
+  - claim_cure: very expensive; unit cost per sample is ~$10000 + $5.00*ticks + $100*(#interventions) with ticks fixed at ~400, and total samples = 2*replicates (healthy control + treated disease).
+
+Game / housekeeping:
+- GET /api/health
+- GET /api/game/state?player_id=...
+  - Use this to track money_spent and verify your budget is not exhausted.
+- POST /api/game/reset   body: {"player_id":"..."}
+  - Use sparingly; it resets your player state/budget.
+
+Discovery helpers (learn what you can target + what panels exist):
+- GET /api/tests/disease/models
+  - Returns the available model keys (organism vs cell culture; healthy vs disease).
+- GET /api/tests/disease/proteins?model=...
+  - Returns the masked proteins you can perturb in that model (protein_1, protein_2, ...).
+- GET /api/bulk_omics/sets
+  - Returns available bulk_omics panels (omics_set strings). Current panels include:
+    - rna/Bulk RNAseq (104 RNA features)
+    - protein/Bulk Proteomics (107 protein features)
+    - metabolite/targeted_metabolomics (12 metabolites/toxins)
+- GET /api/spatial_tx/gene_sets
+  - Returns available spatial panels (gene_set strings). Current panels include:
+    - spatial transcriptomics (104 RNA features)
+    - spatial proteomics (107 protein features)
+
+Core experiments (what to call, what you get back, and how to use it):
+
+A) Characterization (biomarkers + timecourses)
+- POST /api/tests/disease/characterization
+  body: {"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"interventions":[...]}
+- What it is:
+  - A general phenotype readout. In vivo: blood biomarkers + survival/lifespan-related signals. In vitro: cellular biomarkers.
+- What you use it for:
+  - Establish baselines (healthy vs disease) and learn what is abnormal.
+  - Test whether an intervention moves key measurements toward the healthy baseline.
+- What it returns:
+  - A compact TOOL_RESULT summary plus persisted per-replicate timecourse files in the omics inventory.
+
+B) Bulk omics (snapshots: samples x features)
+- POST /api/tests/disease/bulk_omics
+  body: {"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"omics_set":"...","interventions":[...]}
+- How to choose omics_set:
+  - RNA panel ("rna/Bulk RNAseq"): transcript abundance-like signals.
+  - Protein panel ("protein/Bulk Proteomics"): protein abundance-like signals.
+  - Metabolite panel ("metabolite/targeted_metabolomics"): small molecules/toxin-like signals.
+- What it returns:
+  - A counts/abundance matrix (one row per replicate sample) and a metadata table describing each row (model, replicate, sample_id, study duration, assay).
+  - Large arrays are usually omitted from TOOL_RESULT; use the omics inventory message to retrieve saved CSV files.
+- How to use it well:
+  - Run matched comparisons at the same ticks:
+    - healthy vs disease (no interventions) to learn disease signatures.
+    - disease vs disease+intervention to learn intervention effects.
+  - Then use /api/omics/analyze on the saved files to rank features, compute fold-changes, and summarize patterns.
+
+C) Spatial omics (maps: per-spot features + coordinates)
+- POST /api/tests/disease/spatial_tx
+  body: {"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"gene_set":"...","interventions":[...]}
+- Spatial transcriptomics vs spatial proteomics (IMPORTANT):
+  - This endpoint supports both. You choose the modality by choosing gene_set:
+    - gene_set="spatial transcriptomics" => RNA-like spatial panel
+    - gene_set="spatial proteomics" => protein-like spatial panel
+  - The returned metadata includes an assay label indicating which modality was run.
+- What it returns (conceptually):
+  - A set of spatial “spots/cells”, each with:
+    - coordinates (x, y) on a grid
+    - a feature vector (measured RNA/protein panel for that spot)
+- What it returns (files you should analyze):
+  - metadata_*.csv (combined metadata across all replicates) with columns like:
+    - cell_id, assay, model, replicate, seed, sample_taken_at_day, x, y, grid_index
+  - Per-replicate files (for each replicate):
+    - replicates/*_matrix.csv (rows are cell_id; columns are the measured features)
+    - replicates/*_cell_metadata.csv (one row per cell_id with the coordinate fields)
+- How to use it well:
+  - Use it to localize dysregulation: identify spatial gradients, hotspots, or regions where features differ.
+  - Run healthy vs disease first, then disease+intervention to see whether spatial patterns “normalize”.
+  - When you call /api/omics/analyze, explicitly describe:
+    - which files are matrix vs metadata
+    - which groups to compare (healthy vs disease, control vs intervention)
+    - which spatial question to answer (regional differences, gradients, clustering, etc.)
+
+D) Protein perturbation screen (in vitro only; many targets)
+- POST /api/tests/disease/protein_screen   (in vitro models only)
+  body: {"player_id":"...","model":"cell_culture_*","ticks":<int>,"replicates":<int>,"direction":"up|down","dose":<int>,"interventions":[...]}
+- What it is:
+  - A systematic screen that perturbs many masked proteins and measures cell phenotypes.
+- What you use it for:
+  - Rapidly generate candidate targets. Then validate the best candidates with in vivo characterization/bulk/spatial before attempting claim_cure.
+
+Win check (final validation):
+- POST /api/tests/disease/claim_cure
+  body: {"player_id":"...","replicates":<int>,"interventions":[...]}
+- What it does:
+  - Runs a head-to-head survival test. For disease challenges: healthy controls vs treated-disease. For aging: baseline healthy vs treated healthy.
+- What to do with the result:
+  - For disease challenges: use win and delta_median_ticks to decide whether you are allowed to output action="final".
+  - For aging: there is no win condition. Optimize score_lifedays_per_usd (and extra_days) and you may output action="final" at any time, but win must be false.
+
+# 9) Output format (BENCHMARK CRITICAL)
+You MUST respond with EXACTLY ONE JSON object per turn. No prose.
+
+Choose ONE action:
+
+1) Call an API
+{
+  "action": "call_api",
+  "method": "GET" | "POST",
+  "path": "/api/...",
+  "query": {"k": "v", ...},          // optional, only for GET
+  "body": {...},                        // optional, only for POST
+  "last_result_summary": "brief summary of the previous TOOL_RESULT (or 'none' if first step)",
+  "next_step_rationale": "brief reason why you are making this API call and what you expect to learn"
+}
+
+2) Finish
+{
+  "action": "final",
+  "win": true|false,
+  "summary": "one paragraph summary of what you did",
+  "key_findings": ["...", "..."],
+  "proposed_interventions": [{"layer":"protein_1","direction":"up|down","dose":1.0}, ...]
+}
+
+Rules for finishing:
+- For challenges with win condition (cancer, hereditary_disease): only output action="final" if win=true (based on a recent claim_cure result), OR you have reached the step limit.
+- For aging: you may output action="final" at any time, but win must be false.
+- Your win field must match the last observed claim_cure win result. Do not guess.
+
+Tool execution semantics:
+- When you emit a call_api action, the harness will execute it and return a TOOL_RESULT message containing http_status and response_json/response_text.
+- Use those results; do NOT invent data.
+
+Now begin. Your budget is 5 million dollars but you can go into debt if needed so don't stop at 5 million. First, write a brief strategy for how you will solve the task (put it in next_step_rationale of your first JSON). Then your first API calls should usually be /api/health and /api/game/state.
+""".strip()
+
+
+@dataclass
+class ApiResult:
+    http_status: int
+    response_json: Optional[Dict[str, Any]]
+    response_text: str
+    seconds: float
+
+
+@dataclass
+class BenchMetrics:
+    llm_calls: int = 0
+    tool_calls: int = 0
+    api_calls: int = 0
+    experiment_calls: int = 0
+    start_ts: float = 0.0
+    end_ts: float = 0.0
+    win: bool = False
+    final_delta_median_ticks: Optional[float] = None
+    best_extra_days: Optional[float] = None
+    best_score_lifedays_per_usd: Optional[float] = None
+    best_score_seq: Optional[int] = None
+    money_spent_cents: Optional[int] = None
+    money_spent_usd: Optional[float] = None
+    experiments: List[str] = None
+
+    def __post_init__(self) -> None:
+        if self.experiments is None:
+            self.experiments = []
+
+
+def _msg(role: str, content: str) -> Dict[str, str]:
+    return {
+        "role": str(role or "").strip() or "user",
+        "content": str(content or ""),
+    }
+
+
+def _new_player_id() -> str:
+    t = int(time.time())
+    r = secrets.token_hex(4)
+    return f"bench_{t}_{r}"
+
+
+def call_local_api(
+    *,
+    base_url: str,
+    method: str,
+    path: str,
+    query: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 900.0,
+) -> ApiResult:
+    t0 = time.time()
+    try:
+        base = str(base_url or "").strip().rstrip("/")
+        p = str(path or "").strip()
+        if not base or not p.startswith("/"):
+            return ApiResult(http_status=0, response_json=None, response_text="Bad base_url or path", seconds=time.time() - t0)
+
+        url = base + p
+        if isinstance(query, dict) and query:
+            q2: Dict[str, Any] = {}
+            for k, v in query.items():
+                if v is None:
+                    continue
+                q2[str(k)] = str(v)
+            if q2:
+                url = url + "?" + urllib.parse.urlencode(q2, doseq=True)
+
+        m = str(method or "").strip().upper() or "GET"
+        data: Optional[bytes] = None
+        headers: Dict[str, str] = {}
+        if m == "POST":
+            if body is None:
+                data = b"{}"
+            else:
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url, data=data, method=m, headers=headers)
+        status = 0
+        text = ""
+        try:
+            with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                raw = resp.read()
+                text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except urllib.error.HTTPError as e:
+            status = int(getattr(e, "code", 0) or 0)
+            try:
+                raw = e.read()
+                text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            except Exception:
+                text = str(e)
+        except Exception as e:
+            return ApiResult(http_status=0, response_json=None, response_text=str(e), seconds=time.time() - t0)
+
+        obj: Optional[Dict[str, Any]] = None
+        try:
+            parsed = json.loads(text) if isinstance(text, str) and text.strip() else None
+            obj = parsed if isinstance(parsed, dict) else None
+        except Exception:
+            obj = None
+
+        return ApiResult(http_status=int(status), response_json=obj, response_text=str(text or ""), seconds=time.time() - t0)
+    except Exception as e:
+        return ApiResult(http_status=0, response_json=None, response_text=str(e), seconds=time.time() - t0)
+
+
+def llm_generate(
+    *,
+    provider: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout_s: float,
+) -> str:
+    prov = str(provider or "").strip().lower()
+    if prov in ("openai", "openai_compat"):
+        from openai import OpenAI
+
+        client = OpenAI(api_key=str(os.environ.get("OPENAI_API_KEY") or "").strip() or None)
+        req = {
+            "model": str(model),
+            "messages": [{"role": str(m.get("role") or "user"), "content": str(m.get("content") or "")} for m in (messages or [])],
+            "temperature": float(temperature),
+            "timeout": float(timeout_s),
+        }
+        try:
+            resp = client.chat.completions.create(**req, max_completion_tokens=int(max_tokens))
+        except Exception:
+            resp = client.chat.completions.create(**req, max_tokens=int(max_tokens))
+        try:
+            return str(resp.choices[0].message.content or "")
+        except Exception:
+            return ""
+
+    if prov in ("anthropic", "claude"):
+        return _anthropic_messages_generate(
+            model=str(model),
+            messages=messages,
+            temperature=float(temperature),
+            max_tokens=int(max_tokens),
+            timeout_s=float(timeout_s),
+        )
+
+    raise RuntimeError(f"unsupported provider: {provider!r}")
+
+
+def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        p = str(path or "").strip()
+        if not p:
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _write_json_file(path: str, obj: Dict[str, Any]) -> None:
+    p = str(path or "").strip()
+    if not p:
+        return
+    out_dir = os.path.dirname(os.path.abspath(p))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=2, ensure_ascii=False))
+        f.write("\n")
+    os.replace(tmp, p)
+
+
+def _is_csv_field(k: str) -> bool:
+    ks = str(k or "")
+    return ks.endswith("_csv") or ks in ("matrix_csv", "metadata_csv")
+
+
+def _csv_preview(text: str, *, max_lines: int = 30, max_chars: int = 6000) -> str:
+    s = str(text or "")
+    if not s:
+        return ""
+    lines = s.splitlines()
+    out = "\n".join(lines[: max(1, int(max_lines))])
+    if len(out) > int(max_chars):
+        out = out[: int(max_chars)]
+    return out
+
+
+def _median(xs: List[float]) -> Optional[float]:
+    if not xs:
+        return None
+    ys = sorted(float(x) for x in xs)
+    n = int(len(ys))
+    if n <= 0:
+        return None
+    if (n % 2) == 1:
+        return float(ys[n // 2])
+    return float(0.5 * (ys[(n // 2) - 1] + ys[n // 2]))
+
+
+def _series_stats(values: Any) -> Dict[str, Any]:
+    if not isinstance(values, list) or not values:
+        return {}
+    xs: List[float] = []
+    start_v: Optional[float] = None
+    end_v: Optional[float] = None
+    for x in values:
+        try:
+            f = float(x)
+        except Exception:
+            continue
+        if not math.isfinite(f):
+            continue
+        xs.append(float(f))
+        if start_v is None:
+            start_v = float(f)
+        end_v = float(f)
+    if not xs or start_v is None or end_v is None:
+        return {}
+    n = int(len(xs))
+    mn = float(min(xs))
+    mx = float(max(xs))
+    mean = float(sum(xs) / float(n)) if n > 0 else None
+    med = _median(xs)
+    out: Dict[str, Any] = {
+        "n": int(n),
+        "start": float(start_v),
+        "end": float(end_v),
+        "delta": float(end_v - start_v),
+        "min": float(mn),
+        "max": float(mx),
+        "mean": float(mean) if mean is not None else None,
+        "median": float(med) if med is not None else None,
+    }
+    return out
+
+
+def _is_death_like_measurement(name: str, *, death_names: Optional[List[str]] = None) -> bool:
+    s = str(name or "")
+    if not s:
+        return False
+    if isinstance(death_names, list) and s in set(str(x) for x in death_names):
+        return True
+    s2 = s.lower()
+    # Only treat true in-vivo death channels as death-like.
+    # In vitro models include valid metrics like "deaths_per_tick" and "n_deaths".
+    if s2.startswith("death_"):
+        return True
+    if s2.endswith("_death"):
+        return True
+    return False
+
+
+def _measurement_timecourse_stats(
+    series: Any,
+    *,
+    death_names: Optional[List[str]] = None,
+    max_measurements: int = 50,
+) -> Dict[str, Any]:
+    if not isinstance(series, dict):
+        return {}
+    sample = series.get("sample")
+    if not isinstance(sample, dict):
+        return {}
+
+    stats_all: List[Dict[str, Any]] = []
+    n_days: Optional[int] = None
+    for k, v in list(sample.items())[: int(max_measurements)]:
+        nm = str(k)
+        if _is_death_like_measurement(nm, death_names=death_names):
+            continue
+        st = _series_stats(v)
+        if not st:
+            continue
+        if n_days is None and isinstance(v, list):
+            n_days = int(len(v))
+        stats_all.append({"measurement": nm, **st})
+
+    top_abs_delta = sorted(
+        stats_all,
+        key=lambda d: abs(float(d.get("delta") or 0.0)),
+        reverse=True,
+    )[:8]
+
+    out: Dict[str, Any] = {
+        "measurements_n": int(len(stats_all)),
+        "stats": stats_all,
+        "top_abs_delta": top_abs_delta,
+    }
+    if n_days is not None:
+        out["days_n"] = int(n_days)
+    return out
+
+
+def _is_in_vitro_model_key(model_key: Any) -> bool:
+    s = str(model_key or "").strip()
+    return bool(s.startswith("cell_culture_"))
+
+
+def _safe_file_filename(name: str) -> str:
+    s = str(name or "")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = s.strip("._-")
+    return s or "file"
+
+
+def _safe_artifact_filename(name: str) -> str:
+    # Backward compatible alias.
+    return _safe_file_filename(name)
+
+
+def _maybe_write_file(
+    *,
+    files_dir: Optional[str],
+    seq: int,
+    field: str,
+    content: str,
+) -> Optional[str]:
+    if not files_dir:
+        return None
+    try:
+        d = Path(str(files_dir)).resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        fn = f"{int(seq):06d}_{_safe_file_filename(field)}.csv"
+        p = d / fn
+        p.write_text(str(content), encoding="utf-8")
+        return str(p)
+    except Exception:
+        return None
+
+
+def _maybe_write_artifact(*, artifacts_dir: Optional[str], seq: int, field: str, content: str) -> Optional[str]:
+    # Backward compatible alias.
+    return _maybe_write_file(files_dir=artifacts_dir, seq=seq, field=field, content=content)
+
+
+def _summarize_response_json_for_events(
+    resp_json: Optional[Dict[str, Any]],
+    *,
+    seq: int,
+    files_dir: Optional[str] = None,
+    artifacts_dir: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not resp_json or not isinstance(resp_json, dict):
+        return resp_json, []
+    use_dir = files_dir if files_dir is not None else artifacts_dir
+    files: List[Dict[str, Any]] = []
+    out: Dict[str, Any] = {}
+    for k, v in resp_json.items():
+        if isinstance(v, str) and _is_csv_field(str(k)):
+            file_path = _maybe_write_file(files_dir=use_dir, seq=seq, field=str(k), content=v)
+            files.append(
+                {
+                    "field": str(k),
+                    "mime": "text/csv",
+                    "bytes": len(v.encode("utf-8", errors="replace")),
+                    "preview": _csv_preview(v),
+                    "path": file_path,
+                }
+            )
+            out[str(k)] = {
+                "_file": True,
+                "mime": "text/csv",
+                "bytes": files[-1]["bytes"],
+                "path": file_path,
+            }
+        else:
+            out[str(k)] = v
+    return out, files
+
+
+def _write_event_line(fp: Optional[Any], event: Dict[str, Any]) -> None:
+    if fp is None:
+        return
+    try:
+        fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+        fp.flush()
+    except Exception:
+        pass
+
+
+def _notebook_append(notebook: str, line: str, *, max_chars: int = 9000, max_lines: int = 200) -> str:
+    nb = str(notebook or "").strip("\n")
+    ln = str(line or "").strip()
+    if not ln:
+        return nb
+    parts = [p for p in nb.splitlines() if p.strip()] if nb else []
+    parts.append(ln)
+    if len(parts) > int(max_lines):
+        parts = parts[-int(max_lines) :]
+    out = "\n".join(parts)
+    if len(out) > int(max_chars):
+        out = out[-int(max_chars) :]
+        cut = out.find("\n")
+        if cut >= 0:
+            out = out[cut + 1 :]
+    return out
+
+
+def _prune_messages(messages: List[Dict[str, str]], *, pinned: List[Dict[str, str]], keep_last: int = 10) -> List[Dict[str, str]]:
+    pin = list(pinned)
+    tail = list(messages[-int(keep_last) :]) if messages else []
+    out: List[Dict[str, str]] = []
+    for m in pin:
+        if m not in out:
+            out.append(m)
+    for m in tail:
+        if m in out:
+            continue
+        out.append(m)
+    return out
+
+
+def _extract_first_json_object(text: str) -> Dict[str, Any]:
+    s0 = str(text or "")
+    if not s0.strip():
+        return {}
+
+    lines = []
+    for ln in s0.splitlines():
+        if str(ln).strip().startswith("```"):
+            continue
+        lines.append(ln)
+    s = "\n".join(lines)
+
+    n = int(len(s))
+    for start in range(n):
+        if s[start] != "{":
+            continue
+
+        depth = 0
+        in_str = False
+        esc = False
+        end: Optional[int] = None
+        for i in range(start, n):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        if end is None:
+            continue
+
+        cand = s[start:end]
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        return obj if isinstance(obj, dict) else {}
+
+    return {}
+
+
+def _parse_counts_csv_mean(csv_text: str, *, max_rows: int = 2000) -> Tuple[List[str], List[float]]:
+    s = str(csv_text or "").strip()
+    if not s:
+        return [], []
+    buf = io.StringIO(s)
+    reader = csv.reader(buf)
+    try:
+        hdr = next(reader)
+    except Exception:
+        return [], []
+    if not hdr or len(hdr) < 2:
+        return [], []
+    genes = [str(x) for x in hdr[1:]]
+    sums = [0.0 for _ in genes]
+    n = 0
+    for row in reader:
+        if not row:
+            continue
+        n += 1
+        if n > int(max_rows):
+            break
+        for i in range(len(genes)):
+            try:
+                v = float(row[i + 1]) if (i + 1) < len(row) else 0.0
+            except Exception:
+                v = 0.0
+            sums[i] += v
+    if n <= 0:
+        return genes, [0.0 for _ in genes]
+    return genes, [float(x) / float(n) for x in sums]
+
+
+def _top_k_genes_by_score(genes: List[str], scores: List[float], *, k: int = 10, reverse: bool = True) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not genes or not scores or len(genes) != len(scores):
+        return out
+    idx = list(range(len(genes)))
+    idx.sort(key=lambda i: float(scores[i]), reverse=bool(reverse))
+    for i in idx[: int(k)]:
+        out.append({"gene": str(genes[i]), "score": float(scores[i])})
+    return out
+
+
+def _llm_tool_result_compact(
+    path: str,
+    llm_json: Optional[Dict[str, Any]],
+    *,
+    omics_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if llm_json is None or not isinstance(llm_json, dict):
+        return out
+
+    if path == "/api/health":
+        ok = bool(llm_json.get("ok") is True)
+        return {
+            "ok": bool(ok),
+            "status": "ok" if ok else "error",
+        }
+
+    if path == "/api/bulk_omics/sets":
+        sets0 = llm_json.get("sets")
+        sets_out: List[str] = []
+        if isinstance(sets0, list):
+            sets_out = [str(x) for x in sets0 if str(x).strip()]
+        return {
+            "ok": bool(llm_json.get("ok") is True),
+            "sets": sets_out,
+            "note": "Use one of these omics_set strings when calling POST /api/tests/disease/bulk_omics.",
+        }
+
+    if path == "/api/spatial_tx/gene_sets":
+        gs0 = llm_json.get("gene_sets")
+        gs_out: List[str] = []
+        if isinstance(gs0, list):
+            gs_out = [str(x) for x in gs0 if str(x).strip()]
+        return {
+            "ok": bool(llm_json.get("ok") is True),
+            "gene_sets": gs_out,
+            "note": "Use one of these gene_set strings when calling POST /api/tests/disease/spatial_tx.",
+        }
+
+    if path in ("/api/tests/cancer/models", "/api/tests/hereditary_disease/models", "/api/tests/aging/models"):
+        models0 = llm_json.get("models")
+        models: Dict[str, str] = {}
+
+        desc = {
+            "healthy": "This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is a healthy organism, the baseline.",
+            "cell_culture_healthy": "Gut-derived cells from a healthy organism. Use this as a selectivity reference to check whether an intervention is harming healthy cells (e.g., lower confluency/n_cells or higher deaths/damage).",
+            "cell_culture": "Gut-derived cells from a healthy organism. Use this for fast in-vitro screening and toxicity checks.",
+            "cancer": "This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is an organism in the early stages of developing the disease and will eventually develop it.",
+            "cell_culture_cancer": "Gut-derived cells from an organism with the disease (a fast in-vitro proxy). In screens, prefer interventions that selectively reduce growth/viability in this disease-like culture (lower confluency/n_cells/births, higher deaths/damage) compared to cell_culture_healthy.",
+            "disease": "This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is an organism in the early stages of developing the disease and will eventually develop it.",
+            "cell_culture_disease": "Gut-derived cells from an organism with the disease (a fast in-vitro proxy). In screens, prefer interventions that selectively reduce growth/viability in this disease-like culture (lower confluency/n_cells/births, higher deaths/damage) compared to cell_culture_healthy.",
+        }
+
+        if isinstance(models0, list):
+            for ent in models0:
+                if not isinstance(ent, dict):
+                    continue
+                k = str(ent.get("key") or "").strip()
+                if not k:
+                    continue
+                k_out = _llm_model_key_to_llm(k)
+                models[k_out] = str(desc.get(k) or ent.get("label") or "")
+
+        return {
+            "ok": bool(llm_json.get("ok") is True),
+            "challenge": llm_json.get("challenge"),
+            "models": models,
+            "note": "Use the model keys above in API calls.",
+        }
+
+    for k in (
+        "ok",
+        "error",
+        "error_kind",
+        "experiment",
+        "model",
+        "days",
+        "day",
+        "replicates",
+        "replicates_completed",
+        "replicate_deaths",
+        "omics_set",
+        "gene_set",
+        "win",
+        "extra_days",
+        "score_lifedays_per_usd",
+        "delta_median_days",
+        "delta_median_ticks",
+        "direction",
+        "dose",
+    ):
+        if k in llm_json:
+            out[k] = llm_json.get(k)
+
+    if path == "/api/game/state":
+        g = llm_json.get("game")
+        if isinstance(g, dict):
+            out["money_spent_usd"] = g.get("money_spent_usd")
+            out["ledger_n"] = len(g.get("ledger")) if isinstance(g.get("ledger"), list) else None
+            out["note"] = "Game state: only money spent is shown. Full ledger omitted."
+        return out
+
+    if path == "/api/omics/inventory":
+        inv_out: Dict[str, Any] = {
+            "ok": bool(llm_json.get("ok") is True),
+            "player_id": llm_json.get("player_id"),
+        }
+
+        inv_msg0 = llm_json.get("llm_message")
+        if isinstance(inv_msg0, str) and inv_msg0.strip():
+            inv_out["llm_message"] = str(inv_msg0).strip()[:40000]
+
+        files0 = llm_json.get("files")
+        if isinstance(files0, list):
+            inv_out["files_n"] = int(len(files0))
+            files_out: List[Dict[str, Any]] = []
+            for ent in files0[:80]:
+                if not isinstance(ent, dict):
+                    continue
+                files_out.append(
+                    {
+                        "file_id": ent.get("file_id"),
+                        "display_name": ent.get("display_name"),
+                        "llm_filename": ent.get("llm_filename"),
+                        "role": ent.get("role"),
+                        "kind": ent.get("kind"),
+                        "experiment": ent.get("experiment"),
+                        "condition": ent.get("condition"),
+                        "replicate": ent.get("replicate"),
+                        "run_id": ent.get("run_id"),
+                        "bytes": ent.get("bytes"),
+                        "download_url": ent.get("download_url"),
+                    }
+                )
+            if files_out:
+                inv_out["files"] = files_out
+            if len(files0) > 80:
+                inv_out["more_files"] = int(len(files0) - 80)
+
+        dsets0 = llm_json.get("datasets")
+        if isinstance(dsets0, list):
+            inv_out["datasets_n"] = int(len(dsets0))
+            dsets_out: List[Dict[str, Any]] = []
+            for ent in dsets0[:40]:
+                if not isinstance(ent, dict):
+                    continue
+                dsets_out.append(
+                    {
+                        "display_name": ent.get("display_name"),
+                        "run_id": ent.get("run_id"),
+                        "experiment": ent.get("experiment"),
+                        "kind": ent.get("kind"),
+                        "model": ent.get("model"),
+                        "ticks": ent.get("ticks"),
+                        "replicates": ent.get("replicates"),
+                        "omics_set": ent.get("omics_set"),
+                        "gene_set": ent.get("gene_set"),
+                    }
+                )
+            if dsets_out:
+                inv_out["datasets"] = dsets_out
+            if len(dsets0) > 40:
+                inv_out["more_datasets"] = int(len(dsets0) - 40)
+
+        inv_out["note"] = "Use file_id with GET /api/omics/file (query: player_id, file_id). Then run POST /api/omics/analyze with file_ids + instructions."
+        return inv_out
+
+    if path in ("/api/tests/cancer/estimate_cost", "/api/tests/hereditary_disease/estimate_cost", "/api/tests/aging/estimate_cost"):
+        ch = llm_json.get("charge")
+        if isinstance(ch, dict):
+            kind = ch.get("kind")
+            samples = ch.get("samples")
+            unit_usd = ch.get("unit_cost_usd")
+            total_usd = ch.get("total_cost_usd")
+            out["kind"] = kind
+            out["samples"] = samples
+            out["unit_cost_usd"] = unit_usd
+            out["total_cost_usd"] = total_usd
+            out["summary"] = f"Estimated cost for {kind}: total ${total_usd} (${unit_usd} per sample) for {samples} samples."
+        return out
+
+    if path in ("/api/tests/cancer/proteins", "/api/tests/hereditary_disease/proteins", "/api/tests/aging/proteins"):
+        prots = llm_json.get("proteins")
+        if isinstance(prots, list):
+            out["proteins"] = [str(x) for x in prots[:400]]
+        return out
+
+    if path == "/api/omics/analyze":
+        if "run_id" in llm_json:
+            out["run_id"] = llm_json.get("run_id")
+
+        ot = llm_json.get("output_text")
+        if isinstance(ot, str) and ot.strip():
+            out["output_text"] = ot
+
+        used = llm_json.get("files")
+        if isinstance(used, list) and used:
+            used_out: List[Dict[str, Any]] = []
+            for ent in used[:60]:
+                if not isinstance(ent, dict):
+                    continue
+                used_out.append(
+                    {
+                        "display_name": ent.get("display_name"),
+                        "file_id": ent.get("file_id"),
+                        "name": ent.get("name"),
+                        "run_id": ent.get("run_id"),
+                    }
+                )
+            if used_out:
+                out["files"] = used_out
+
+        oa = llm_json.get("openai")
+        if isinstance(oa, dict):
+            out["openai"] = {
+                "model": oa.get("model"),
+                "memory_limit": oa.get("memory_limit"),
+            }
+
+        if "output_text" not in out:
+            resp_dump = llm_json.get("response")
+            if isinstance(resp_dump, dict):
+                out["response"] = resp_dump
+
+        out["note"] = "Analysis response from code interpreter. output_text contains the full text answer."
+        return out
+
+    if path in ("/api/tests/cancer/bulk_omics", "/api/tests/hereditary_disease/bulk_omics", "/api/tests/aging/bulk_omics"):
+        if "run_id" in llm_json:
+            out["run_id"] = llm_json.get("run_id")
+        if "experiment" in llm_json:
+            out["experiment"] = llm_json.get("experiment")
+        if "model" in llm_json:
+            out["model"] = llm_json.get("model")
+        if "ticks" in llm_json:
+            out["ticks"] = llm_json.get("ticks")
+        if "age_days" in llm_json and "days" not in out:
+            out["days"] = llm_json.get("age_days")
+        if "replicates" in llm_json:
+            out["replicates"] = llm_json.get("replicates")
+        if "omics_set" in llm_json:
+            out["omics_set"] = llm_json.get("omics_set")
+        genes = llm_json.get("genes")
+        if isinstance(genes, list):
+            out["features_n"] = int(len(genes))
+
+        deaths0 = llm_json.get("replicate_deaths")
+        if isinstance(deaths0, list) and deaths0:
+            out["replicate_deaths_n"] = int(len(deaths0))
+            deaths_out: List[Dict[str, Any]] = []
+            for ent in deaths0[:50]:
+                if not isinstance(ent, dict):
+                    continue
+                deaths_out.append(
+                    {
+                        "condition": ent.get("condition"),
+                        "model": ent.get("model"),
+                        "replicate": ent.get("replicate"),
+                        "seed": ent.get("seed"),
+                        "requested_ticks": ent.get("requested_ticks"),
+                        "death_tick": ent.get("death_tick"),
+                        "death_measurement": ent.get("death_measurement"),
+                    }
+                )
+            if deaths_out:
+                out["replicate_deaths"] = deaths_out
+
+        inv = llm_json.get("omics_inventory")
+        if isinstance(inv, dict):
+            inv_url = inv.get("inventory_url")
+            inv_msg = str(inv.get("llm_message") or "").strip()
+            if inv_url:
+                out["omics_inventory_url"] = inv_url
+            if inv_msg:
+                out["omics_inventory_llm_message"] = inv_msg[:40000]
+
+        out["note"] = "Bulk omics matrices are saved as files. If some replicates died early, see replicate_deaths / replicates_completed. Use omics_inventory_llm_message to find file_id(s), then download via /api/omics/file and analyze via /api/omics/analyze."
+        return out
+
+    if path in ("/api/tests/cancer/protein_screen", "/api/tests/hereditary_disease/protein_screen", "/api/tests/aging/protein_screen"):
+        if "run_id" in llm_json:
+            out["run_id"] = llm_json.get("run_id")
+        if "experiment" in llm_json:
+            out["experiment"] = llm_json.get("experiment")
+        if "model" in llm_json:
+            out["model"] = llm_json.get("model")
+        if "ticks" in llm_json:
+            out["ticks"] = llm_json.get("ticks")
+        if "replicates" in llm_json:
+            out["replicates"] = llm_json.get("replicates")
+        if "interventions" in llm_json:
+            out["interventions"] = llm_json.get("interventions")
+        inv = llm_json.get("omics_inventory")
+        if isinstance(inv, dict):
+            inv_url = inv.get("inventory_url")
+            inv_msg = str(inv.get("llm_message") or "").strip()
+            if inv_url:
+                out["omics_inventory_url"] = inv_url
+            if inv_msg:
+                out["omics_inventory_llm_message"] = inv_msg[:40000]
+
+        out["screened_proteins_n"] = llm_json.get("protein_layers") if isinstance(llm_json.get("protein_layers"), int) else None
+        if isinstance(llm_json.get("measurements"), list):
+            out["measurements"] = llm_json.get("measurements")
+        out["note"] = "Protein screen results are saved as files. Use omics_inventory_llm_message to find file_id(s), then analyze via /api/omics/analyze."
+        return out
+
+    if path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure", "/api/tests/aging/claim_cure"):
+        if "run_id" in llm_json:
+            out["run_id"] = llm_json.get("run_id")
+        if "experiment" in llm_json:
+            out["experiment"] = llm_json.get("experiment")
+        if "ticks" in llm_json:
+            out["ticks"] = llm_json.get("ticks")
+        if "replicates" in llm_json:
+            out["replicates"] = llm_json.get("replicates")
+        if "win" in llm_json:
+            out["win"] = llm_json.get("win")
+        if "delta_median_ticks" in llm_json:
+            out["delta_median_ticks"] = llm_json.get("delta_median_ticks")
+        inv = llm_json.get("omics_inventory")
+        if isinstance(inv, dict):
+            inv_url = inv.get("inventory_url")
+            inv_msg = str(inv.get("llm_message") or "").strip()
+            if inv_url:
+                out["omics_inventory_url"] = inv_url
+            if inv_msg:
+                out["omics_inventory_llm_message"] = inv_msg[:40000]
+
+        out["note"] = "Claim-cure study outputs are saved as files. Use omics_inventory_llm_message to locate summarized_results + metadata and analyze if needed."
+        return out
+
+    return out
+
+
+_CANCER_WORD_RE = re.compile(r"cancer", re.IGNORECASE)
+_CANCEROUS_WORD_RE = re.compile(r"cancerous", re.IGNORECASE)
+
+
+def _llm_sanitize_text(s: str) -> str:
+    t = str(s or "")
+    if not t:
+        return ""
+    t = t.replace("/api/tests/cancer/", "/api/tests/disease/")
+    t = t.replace("/api/tests/cancer", "/api/tests/disease")
+    t = t.replace("/api/tests/hereditary_disease/", "/api/tests/disease/")
+    t = t.replace("/api/tests/hereditary_disease", "/api/tests/disease")
+    t = t.replace("/api/tests/aging/", "/api/tests/disease/")
+    t = t.replace("/api/tests/aging", "/api/tests/disease")
+    t = _CANCEROUS_WORD_RE.sub("diseased", t)
+    t = _CANCER_WORD_RE.sub("disease", t)
+    return t
+
+
+def _llm_path_to_server(path: str) -> str:
+    p = str(path or "").strip()
+    if not p:
+        return p
+    if p.startswith("/api/tests/disease/"):
+        return _tests_prefix_for_challenge(_BENCH_CHALLENGE) + "/" + p[len("/api/tests/disease/") :]
+    if p == "/api/tests/disease":
+        return _tests_prefix_for_challenge(_BENCH_CHALLENGE)
+    return p
+
+
+def _llm_body_to_server(server_path: str, body: Any) -> Optional[Dict[str, Any]]:
+    if body is None:
+        return None
+    if not isinstance(body, dict):
+        return None
+
+    out = dict(body)
+
+    # Many endpoints require player_id; allow the LLM to omit it.
+    pid = str(out.get("player_id") or "").strip()
+    if not pid:
+        pid2 = str(_BENCH_PLAYER_ID or "").strip()
+        if pid2:
+            out["player_id"] = pid2
+
+    if server_path.startswith("/api/tests/") and ("model" in out):
+        out["model"] = _llm_model_key_to_server(out.get("model"))
+
+    if server_path == "/api/omics/analyze":
+        prov = str(out.get("provider") or "").strip()
+        if not prov:
+            p2 = str(_BENCH_PROVIDER or "").strip()
+            if p2:
+                out["provider"] = p2
+        model0 = str(out.get("model") or "").strip()
+        if not model0:
+            m2 = str(_BENCH_MODEL or "").strip()
+            if m2:
+                out["model"] = m2
+
+    return out
+
+
+def _server_path_to_llm(path: str) -> str:
+    p = str(path or "").strip()
+    if not p:
+        return p
+    if p.startswith("/api/tests/cancer/"):
+        return "/api/tests/disease/" + p[len("/api/tests/cancer/") :]
+    if p.startswith("/api/tests/hereditary_disease/"):
+        return "/api/tests/disease/" + p[len("/api/tests/hereditary_disease/") :]
+    if p.startswith("/api/tests/aging/"):
+        return "/api/tests/disease/" + p[len("/api/tests/aging/") :]
+    if p == "/api/tests/cancer":
+        return "/api/tests/disease"
+    if p == "/api/tests/hereditary_disease":
+        return "/api/tests/disease"
+    if p == "/api/tests/aging":
+        return "/api/tests/disease"
+    return _llm_sanitize_text(p)
+
+
+def _llm_model_key_to_server(model_key: Any) -> str:
+    s = str(model_key or "").strip()
+    if not s:
+        return ""
+    if _normalize_challenge(_BENCH_CHALLENGE) == "cancer":
+        if s == "disease":
+            return "cancer"
+        if s == "cell_culture_disease":
+            return "cell_culture_cancer"
+    return s
+
+
+def _llm_model_key_to_llm(model_key: Any) -> str:
+    return _llm_sanitize_text(str(model_key or "").strip())
+
+
+def _llm_translate_response_obj(obj: Any) -> Any:
+    if isinstance(obj, list):
+        return [_llm_translate_response_obj(x) for x in obj]
+    if isinstance(obj, str):
+        return _llm_sanitize_text(obj)
+    if not isinstance(obj, dict):
+        return obj
+
+    out: Dict[str, Any] = {}
+    for k0, v0 in obj.items():
+        k = _llm_sanitize_text(str(k0))
+        out[k] = _llm_translate_response_obj(v0)
+    return out
+
+
+def _llm_response_json(path: str, response_json: Any) -> Any:
+    # Keep runner metrics based on raw server JSON; only translate what the LLM sees.
+    try:
+        return _llm_translate_response_obj(json.loads(json.dumps(response_json)))
+    except Exception:
+        return response_json
+
+
+def _normalize_challenge(challenge: Any) -> str:
+    ch = str(challenge or "").strip().lower()
+    if ch in ("cancer", "hereditary_disease", "aging"):
+        return ch
+    return "cancer"
+
+
+def _tests_prefix_for_challenge(challenge: Any) -> str:
+    ch = _normalize_challenge(challenge)
+    if ch == "cancer":
+        return "/api/tests/cancer"
+    if ch == "hereditary_disease":
+        return "/api/tests/hereditary_disease"
+    return "/api/tests/aging"
+
+
+def _is_experiment_path(path: str) -> bool:
+    p = str(path or "")
+    return p in (
+        "/api/tests/cancer/bulk_omics",
+        "/api/tests/cancer/spatial_tx",
+        "/api/tests/cancer/characterization",
+        "/api/tests/cancer/protein_screen",
+        "/api/tests/cancer/claim_cure",
+        "/api/tests/hereditary_disease/bulk_omics",
+        "/api/tests/hereditary_disease/spatial_tx",
+        "/api/tests/hereditary_disease/characterization",
+        "/api/tests/hereditary_disease/protein_screen",
+        "/api/tests/hereditary_disease/claim_cure",
+        "/api/tests/aging/bulk_omics",
+        "/api/tests/aging/spatial_tx",
+        "/api/tests/aging/characterization",
+        "/api/tests/aging/protein_screen",
+        "/api/tests/aging/claim_cure",
+    )
+
+
+def run_benchmark(
+    *,
+    challenge: str,
+    base_url: str,
+    provider: str,
+    model: str,
+    player_id: Optional[str],
+    events_fp: Optional[Any],
+    files_dir: Optional[str],
+    state_out: Optional[str],
+    resume_state: Optional[str],
+    max_steps: int,
+    temperature: float,
+    max_tokens: int,
+    api_timeout_s: float,
+    llm_timeout_s: float,
+    reset_first: bool,
+) -> Tuple[str, BenchMetrics, List[Dict[str, Any]]]:
+    resumed = False
+    loaded_state: Optional[Dict[str, Any]] = None
+    if str(resume_state or "").strip():
+        loaded_state = _load_json_file(str(resume_state))
+        if isinstance(loaded_state, dict) and loaded_state.get("ok") is True:
+            resumed = True
+
+    ch = _normalize_challenge(challenge)
+    global _BENCH_CHALLENGE
+    _BENCH_CHALLENGE = str(ch)
+
+    if resumed:
+        st_player = loaded_state.get("player_id")
+        if isinstance(st_player, str) and st_player.strip():
+            player_id = st_player.strip()
+        st_base = loaded_state.get("base_url")
+        st_prov = loaded_state.get("provider")
+        st_model = loaded_state.get("model")
+        st_ch = loaded_state.get("challenge")
+        if isinstance(st_base, str) and st_base.strip() and str(base_url).strip() != st_base.strip():
+            raise RuntimeError("resume_state base_url does not match")
+        if isinstance(st_prov, str) and st_prov.strip() and str(provider).strip() != st_prov.strip():
+            raise RuntimeError("resume_state provider does not match")
+        if isinstance(st_model, str) and st_model.strip() and str(model).strip() != st_model.strip():
+            raise RuntimeError("resume_state model does not match")
+        if isinstance(st_ch, str) and st_ch.strip() and _normalize_challenge(st_ch) != _normalize_challenge(ch):
+            raise RuntimeError("resume_state challenge does not match")
+
+    if not player_id:
+        player_id = _new_player_id()
+
+    global _BENCH_PLAYER_ID
+    _BENCH_PLAYER_ID = str(player_id)
+
+    if str(provider or "").strip().lower() in ("openai", "openai_compat"):
+        model = "gpt-5.2"
+
+    global _BENCH_PROVIDER
+    _BENCH_PROVIDER = str(provider or "").strip().lower()
+    global _BENCH_MODEL
+    _BENCH_MODEL = str(model or "").strip()
+
+    transcript: List[Dict[str, Any]] = []
+    notebook = ""
+    omics_state: Dict[str, Any] = {}
+    messages: List[Dict[str, str]] = []
+    seq = 0
+    step_start = 0
+
+    if resumed:
+        try:
+            st_metrics = loaded_state.get("metrics") if isinstance(loaded_state.get("metrics"), dict) else {}
+            metrics = BenchMetrics(start_ts=float(st_metrics.get("start_ts") or time.time()))
+            metrics.llm_calls = int(st_metrics.get("llm_calls") or 0)
+            metrics.tool_calls = int(st_metrics.get("tool_calls") or 0)
+            metrics.api_calls = int(st_metrics.get("api_calls") or 0)
+            metrics.experiment_calls = int(st_metrics.get("experiment_calls") or 0)
+            metrics.win = bool(st_metrics.get("win") is True)
+            try:
+                metrics.final_delta_median_ticks = float(st_metrics.get("final_delta_median_ticks"))
+            except Exception:
+                metrics.final_delta_median_ticks = None
+            try:
+                metrics.best_extra_days = float(st_metrics.get("best_extra_days"))
+            except Exception:
+                metrics.best_extra_days = None
+            try:
+                metrics.best_score_lifedays_per_usd = float(st_metrics.get("best_score_lifedays_per_usd"))
+            except Exception:
+                metrics.best_score_lifedays_per_usd = None
+            try:
+                metrics.best_score_seq = int(st_metrics.get("best_score_seq"))
+            except Exception:
+                metrics.best_score_seq = None
+            try:
+                metrics.money_spent_cents = int(st_metrics.get("money_spent_cents"))
+            except Exception:
+                metrics.money_spent_cents = None
+            try:
+                metrics.money_spent_usd = float(st_metrics.get("money_spent_usd"))
+            except Exception:
+                metrics.money_spent_usd = None
+            metrics.experiments = list(st_metrics.get("experiments") or []) if isinstance(st_metrics.get("experiments"), list) else []
+        except Exception:
+            metrics = BenchMetrics(start_ts=time.time())
+
+        st_messages = loaded_state.get("messages")
+        if isinstance(st_messages, list):
+            msgs2: List[Dict[str, str]] = []
+            for m in st_messages:
+                if isinstance(m, dict):
+                    r = str(m.get("role") or "")
+                    c = _llm_sanitize_text(str(m.get("content") or ""))
+                    if r and c is not None:
+                        msgs2.append({"role": r, "content": c})
+            if msgs2:
+                messages = msgs2
+
+        notebook = _llm_sanitize_text(str(loaded_state.get("notebook") or ""))
+        st_omics = loaded_state.get("omics_state")
+        if isinstance(st_omics, dict):
+            omics_state = dict(st_omics)
+        try:
+            seq = int(loaded_state.get("seq") or 0)
+        except Exception:
+            seq = 0
+        try:
+            step_start = int(loaded_state.get("next_step") or 0)
+        except Exception:
+            step_start = 0
+
+        if not messages:
+            messages.append(_msg("system", _PROMPT))
+            messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
+            notebook_msg = _msg("user", "LAB_NOTEBOOK:\n" + (notebook or "(empty)"))
+            messages.append(notebook_msg)
+        else:
+            if len(messages) >= 3 and str(messages[2].get("role")) == "user" and str(messages[2].get("content") or "").startswith("LAB_NOTEBOOK:"):
+                notebook_msg = messages[2]
+                notebook_msg["content"] = "LAB_NOTEBOOK:\n" + (notebook or "(empty)")
+            else:
+                notebook_msg = _msg("user", "LAB_NOTEBOOK:\n" + (notebook or "(empty)"))
+                messages.insert(2, notebook_msg)
+
+        pinned = [messages[0], messages[1], notebook_msg]
+        seq += 1
+        _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "resume", "player_id": player_id, "next_step": step_start})
+    else:
+        metrics = BenchMetrics(start_ts=time.time())
+        # Use a system message for OpenAI-compatible providers.
+        messages.append(_msg("system", _PROMPT))
+        messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
+
+        notebook_msg = _msg("user", "LAB_NOTEBOOK:\n(empty)")
+        messages.append(notebook_msg)
+        pinned = [messages[0], messages[1], notebook_msg]
+
+        seq = 0
+        _write_event_line(
+            events_fp,
+            {
+                "seq": seq,
+                "ts": time.time(),
+                "type": "start",
+                "challenge": str(ch),
+                "base_url": base_url,
+                "provider": provider,
+                "model": model,
+                "player_id": player_id,
+                "prompt": _PROMPT,
+            },
+        )
+        if str(state_out or "").strip():
+            st_metrics_out = {
+                "start_ts": float(metrics.start_ts),
+                "llm_calls": int(metrics.llm_calls),
+                "tool_calls": int(metrics.tool_calls),
+                "api_calls": int(metrics.api_calls),
+                "experiment_calls": int(metrics.experiment_calls),
+                "win": bool(metrics.win),
+                "final_delta_median_ticks": metrics.final_delta_median_ticks,
+                "best_extra_days": metrics.best_extra_days,
+                "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
+                "best_score_seq": metrics.best_score_seq,
+                "money_spent_cents": metrics.money_spent_cents,
+                "money_spent_usd": metrics.money_spent_usd,
+                "experiments": metrics.experiments,
+            }
+            state_obj = {
+                "ok": True,
+                "challenge": str(ch),
+                "base_url": str(base_url),
+                "provider": str(provider),
+                "model": str(model),
+                "player_id": str(player_id),
+                "seq": int(seq),
+                "next_step": int(step_start),
+                "notebook": str(notebook),
+                "omics_state": omics_state,
+                "metrics": st_metrics_out,
+                "messages": messages,
+            }
+            _write_json_file(str(state_out), state_obj)
+
+    if reset_first and (not resumed):
+        r0 = call_local_api(base_url=base_url, method="POST", path="/api/game/reset", body={"player_id": player_id}, timeout_s=api_timeout_s)
+        seq += 1
+        transcript.append({"seq": seq, "type": "api", "method": "POST", "path": "/api/game/reset", "result": r0.__dict__})
+        _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "api", "method": "POST", "path": "/api/game/reset", "query": None, "body": {"player_id": player_id}, "http_status": r0.http_status, "seconds": r0.seconds, "response_json": r0.response_json})
+
+    if not resumed:
+        st0 = call_local_api(
+            base_url=base_url,
+            method="GET",
+            path="/api/game/state",
+            query={"player_id": player_id},
+            timeout_s=api_timeout_s,
+        )
+        seq += 1
+        transcript.append({"seq": seq, "type": "api", "method": "GET", "path": "/api/game/state", "query": {"player_id": player_id}, "result": st0.__dict__})
+        _write_event_line(
+            events_fp,
+            {
+                "seq": seq,
+                "ts": time.time(),
+                "type": "api",
+                "method": "GET",
+                "path": "/api/game/state",
+                "query": {"player_id": player_id},
+                "body": None,
+                "http_status": st0.http_status,
+                "seconds": st0.seconds,
+                "response_json": st0.response_json,
+            },
+        )
+
+    for step in range(int(step_start), int(max_steps)):
+        metrics.llm_calls += 1
+        try:
+            out = llm_generate(
+                provider=provider,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_s=llm_timeout_s,
+            )
+        except Exception as e:
+            err = _llm_sanitize_text(str(e))
+            messages.append(_msg("user", f"TOOL_RESULT: {{\"error\": \"LLM_CALL_FAILED: {err}\"}}"))
+            transcript.append({"type": "llm_error", "error": str(e)})
+            seq += 1
+            _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "llm_error", "error": str(e)})
+            break
+
+        seq += 1
+        transcript.append({"seq": seq, "type": "llm", "step": step, "text": out})
+        action_preview = _extract_first_json_object(out)
+        lrs_preview = action_preview.get("last_result_summary") if isinstance(action_preview, dict) else None
+        nsr_preview = action_preview.get("next_step_rationale") if isinstance(action_preview, dict) else None
+        _write_event_line(
+            events_fp,
+            {
+                "seq": seq,
+                "ts": time.time(),
+                "type": "llm",
+                "step": step,
+                "text": out,
+                "last_result_summary": lrs_preview,
+                "next_step_rationale": nsr_preview,
+            },
+        )
+        out_llm_safe = _llm_sanitize_text(out)
+        messages.append(_msg("assistant", out_llm_safe))
+
+        action = _extract_first_json_object(out)
+        if not action or "action" not in action:
+            messages.append(
+                _msg(
+                    "user",
+                    "TOOL_RESULT: {\"error\": \"Invalid response. You must output exactly one JSON object matching the Action schema.\"}",
+                )
+            )
+            continue
+
+        act = str(action.get("action") or "").strip().lower()
+        if act == "final":
+            if not isinstance(action.get("win"), bool):
+                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: missing win (boolean).\"}"))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
+                continue
+
+            if not isinstance(action.get("summary"), str) or not str(action.get("summary") or "").strip():
+                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: missing summary (string).\"}"))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
+                continue
+
+            kf = action.get("key_findings")
+            if not isinstance(kf, list) or any((not isinstance(x, str)) for x in kf):
+                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: key_findings must be an array of strings.\"}"))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
+                continue
+
+            pis = action.get("proposed_interventions")
+            if not isinstance(pis, list):
+                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: proposed_interventions must be an array.\"}"))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
+                continue
+            bad_pi = False
+            for it in pis:
+                if not isinstance(it, dict):
+                    bad_pi = True
+                    break
+                if not isinstance(it.get("layer"), str) or not isinstance(it.get("direction"), str):
+                    bad_pi = True
+                    break
+                try:
+                    float(it.get("dose"))
+                except Exception:
+                    bad_pi = True
+                    break
+            if bad_pi:
+                messages.append(
+                    _msg(
+                        "user",
+                        "TOOL_RESULT: {\"error\": \"FINAL_INVALID: proposed_interventions items must include layer (string), direction (string), and dose (number).\"}",
+                    )
+                )
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
+                continue
+
+            proposed_win = bool(action.get("win") is True)
+            if str(ch) == "aging":
+                if proposed_win:
+                    msg = (
+                        "TOOL_RESULT: {\"error\": "
+                        "\"FINAL_INVALID: aging challenge has no win condition, so final.win must be false.\"}"
+                    )
+                    messages.append(_msg("user", msg))
+                    transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                    seq += 1
+                    _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
+                    continue
+
+                transcript.append({"type": "final", "payload": action})
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final", "payload": action})
+                break
+
+            if bool(metrics.win) and (not proposed_win):
+                msg = (
+                    "TOOL_RESULT: {\"error\": "
+                    "\"FINAL_INVALID: claim_cure indicated win=true, so final.win must be true as well.\"}"
+                )
+                messages.append(_msg("user", msg))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(
+                    events_fp,
+                    {
+                        "seq": seq,
+                        "ts": time.time(),
+                        "type": "final_rejected",
+                        "step": int(step),
+                        "payload": action,
+                    },
+                )
+                continue
+            if (not bool(metrics.win)) and proposed_win:
+                msg = (
+                    "TOOL_RESULT: {\"error\": "
+                    "\"FINAL_INVALID: you cannot claim win=true unless claim_cure returned win=true.\"}"
+                )
+                messages.append(_msg("user", msg))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(
+                    events_fp,
+                    {
+                        "seq": seq,
+                        "ts": time.time(),
+                        "type": "final_rejected",
+                        "step": int(step),
+                        "payload": action,
+                    },
+                )
+                continue
+            if (not bool(metrics.win)) and (int(step) < int(max_steps) - 1):
+                msg = (
+                    "TOOL_RESULT: {\"error\": "
+                    "\"FINAL_NOT_ALLOWED_YET: win=false. Continue using call_api to gather more evidence and try additional interventions.\"}"
+                )
+                messages.append(_msg("user", msg))
+                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
+                seq += 1
+                _write_event_line(
+                    events_fp,
+                    {
+                        "seq": seq,
+                        "ts": time.time(),
+                        "type": "final_rejected",
+                        "step": int(step),
+                        "payload": action,
+                    },
+                )
+                continue
+
+            transcript.append({"type": "final", "payload": action})
+            seq += 1
+            _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final", "payload": action})
+            break
+
+        if act != "call_api":
+            messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"Unknown action. Use call_api or final.\"}"))
+            continue
+
+        lrs = action.get("last_result_summary")
+        nsr = action.get("next_step_rationale")
+        if not isinstance(lrs, str) or not isinstance(nsr, str):
+            messages.append(
+                _msg(
+                    "user",
+                    "TOOL_RESULT: {\"error\": \"Missing required fields: last_result_summary (string) and next_step_rationale (string).\"}",
+                )
+            )
+            continue
+
+        notebook = _notebook_append(
+            notebook,
+            f"step={int(step)} agent_summary={_llm_sanitize_text(str(lrs).strip())[:240]} agent_plan={_llm_sanitize_text(str(nsr).strip())[:240]}",
+        )
+        notebook_msg["content"] = "LAB_NOTEBOOK:\n" + (notebook or "(empty)")
+
+        method = str(action.get("method") or "").strip().upper()
+        llm_path = str(action.get("path") or "").strip()
+        query = action.get("query") if isinstance(action.get("query"), dict) else None
+        body = action.get("body") if isinstance(action.get("body"), dict) else None
+
+        if llm_path in ("/api/tests/disease/protein_layers", "/api/tests/cancer/protein_layers"):
+            messages.append(
+                _msg(
+                    "user",
+                    "TOOL_RESULT: {\"error\": "
+                    "\"Use /api/tests/disease/proteins (biological terminology) instead of /api/tests/disease/protein_layers.\"}",
+                )
+            )
+            continue
+
+        server_path = _llm_path_to_server(llm_path)
+        body = _llm_body_to_server(server_path, body)
+        if isinstance(query, dict) and "model" in query:
+            query = dict(query)
+            query["model"] = _llm_model_key_to_server(query.get("model"))
+
+        if method == "POST" and server_path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure", "/api/tests/aging/claim_cure"):
+            if body is None:
+                body = {}
+            body["ticks"] = 400
+
+        if method == "POST" and server_path in ("/api/tests/cancer/protein_screen", "/api/tests/hereditary_disease/protein_screen", "/api/tests/aging/protein_screen"):
+            if body is None:
+                body = {}
+            body["worker_mode"] = "process"
+            try:
+                workers_i = int(body.get("workers") or 35)
+            except Exception:
+                workers_i = 35
+            if workers_i < 35:
+                body["workers"] = 35
+
+        if method == "POST" and server_path in ("/api/tests/cancer/estimate_cost", "/api/tests/hereditary_disease/estimate_cost", "/api/tests/aging/estimate_cost"):
+            if isinstance(body, dict):
+                exp0 = str(body.get("experiment") or "").strip().lower()
+                if exp0 in ("claim_cure", "cure"):
+                    body["ticks"] = 400
+
+        if method not in ("GET", "POST") or not server_path.startswith("/api/"):
+            messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"Bad method or path.\"}"))
+            continue
+
+        metrics.tool_calls += 1
+        metrics.api_calls += 1
+        if _is_experiment_path(server_path):
+            metrics.experiment_calls += 1
+        res = call_local_api(
+            base_url=base_url,
+            method=method,
+            path=server_path,
+            query=query,
+            body=body,
+            timeout_s=api_timeout_s,
+        )
+
+        # Track experiments and win if claim_cure was called.
+        if res.response_json and isinstance(res.response_json, dict):
+            exp = res.response_json.get("experiment")
+            if isinstance(exp, str) and exp:
+                metrics.experiments.append(exp)
+            g0 = res.response_json.get("game")
+            if isinstance(g0, dict):
+                try:
+                    metrics.money_spent_cents = int(g0.get("money_spent_cents"))
+                except Exception:
+                    pass
+                try:
+                    metrics.money_spent_usd = float(g0.get("money_spent_usd"))
+                except Exception:
+                    pass
+            if server_path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure", "/api/tests/aging/claim_cure"):
+                try:
+                    metrics.final_delta_median_ticks = float(res.response_json.get("delta_median_ticks"))
+                except Exception:
+                    metrics.final_delta_median_ticks = None
+                metrics.win = bool(res.response_json.get("win") is True)
+                try:
+                    extra = float(res.response_json.get("extra_days"))
+                except Exception:
+                    extra = None
+                if extra is not None:
+                    if metrics.best_extra_days is None or float(extra) > float(metrics.best_extra_days):
+                        metrics.best_extra_days = float(extra)
+                try:
+                    score = res.response_json.get("score_lifedays_per_usd")
+                    score_f = float(score) if score is not None else None
+                except Exception:
+                    score_f = None
+                if score_f is not None and (metrics.best_score_lifedays_per_usd is None or float(score_f) > float(metrics.best_score_lifedays_per_usd)):
+                    metrics.best_score_lifedays_per_usd = float(score_f)
+                    metrics.best_score_seq = int(seq)
+
+        seq += 1
+        resp_summary, files = _summarize_response_json_for_events(res.response_json, seq=seq, files_dir=files_dir)
+        res_for_transcript = {
+            "http_status": res.http_status,
+            "response_json": resp_summary if files_dir else res.response_json,
+            "response_text": res.response_text,
+            "seconds": res.seconds,
+        }
+        transcript.append({"seq": seq, "type": "api", "method": method, "path": server_path, "query": query, "body": body, "result": res_for_transcript, "files": files})
+        if files:
+            for a in files:
+                a["seq"] = seq
+
+        _write_event_line(
+            events_fp,
+            {
+                "seq": seq,
+                "ts": time.time(),
+                "type": "api",
+                "method": method,
+                "path": server_path,
+                "query": query,
+                "body": body,
+                "http_status": res.http_status,
+                "seconds": res.seconds,
+                "response_json": resp_summary,
+                "files": files,
+            },
+        )
+
+        llm_json = _llm_response_json(server_path, res.response_json)
+        if isinstance(llm_json, dict):
+            if server_path in ("/api/tests/cancer/bulk_omics", "/api/tests/hereditary_disease/bulk_omics", "/api/tests/aging/bulk_omics"):
+                llm_json.pop("matrix_noisy_csv", None)
+                llm_json.pop("metadata_csv", None)
+            if server_path in ("/api/tests/cancer/spatial_tx", "/api/tests/hereditary_disease/spatial_tx", "/api/tests/aging/spatial_tx"):
+                llm_json.pop("matrix_noisy_csv", None)
+                llm_json.pop("metadata_csv", None)
+
+        compact = _llm_tool_result_compact(server_path, llm_json if isinstance(llm_json, dict) else None, omics_state=omics_state)
+        try:
+            notebook = _notebook_append(notebook, f"step={int(step)} path={_server_path_to_llm(server_path)} result={json.dumps(compact, ensure_ascii=False)[:700]}")
+        except Exception:
+            notebook = _notebook_append(notebook, f"step={int(step)} path={_server_path_to_llm(server_path)}")
+        notebook_msg["content"] = "LAB_NOTEBOOK:\n" + (notebook or "(empty)")
+
+        tool_payload = {
+            "http_status": res.http_status,
+            "seconds": res.seconds,
+            "response_json": compact,
+        }
+        if res.response_json is None:
+            tool_payload["response_text"] = _llm_sanitize_text(res.response_text[:400])
+        messages.append(_msg("user", "TOOL_RESULT: " + json.dumps(tool_payload, ensure_ascii=False)))
+        messages = _prune_messages(messages, pinned=pinned, keep_last=12)
+        seq += 1
+        tool_payload_event = {
+            "http_status": res.http_status,
+            "seconds": res.seconds,
+            "response_json": compact,
+            "api_response_json_summary": resp_summary,
+        }
+        if res.response_json is None:
+            tool_payload_event["response_text"] = res.response_text[:2000]
+        _write_event_line(
+            events_fp,
+            {
+                "seq": seq,
+                "ts": time.time(),
+                "type": "tool_result",
+                "tool": "call_api",
+                "path": server_path,
+                "payload": tool_payload_event,
+            },
+        )
+        if str(state_out or "").strip():
+            st_metrics_out = {
+                "start_ts": float(metrics.start_ts),
+                "llm_calls": int(metrics.llm_calls),
+                "tool_calls": int(metrics.tool_calls),
+                "api_calls": int(metrics.api_calls),
+                "experiment_calls": int(metrics.experiment_calls),
+                "win": bool(metrics.win),
+                "final_delta_median_ticks": metrics.final_delta_median_ticks,
+                "money_spent_cents": metrics.money_spent_cents,
+                "money_spent_usd": metrics.money_spent_usd,
+                "experiments": metrics.experiments,
+            }
+            state_obj = {
+                "ok": True,
+                "challenge": str(ch),
+                "base_url": str(base_url),
+                "provider": str(provider),
+                "model": str(model),
+                "player_id": str(player_id),
+                "seq": int(seq),
+                "next_step": int(step) + 1,
+                "notebook": str(notebook),
+                "omics_state": omics_state,
+                "metrics": st_metrics_out,
+                "messages": messages,
+            }
+            _write_json_file(str(state_out), state_obj)
+
+        if server_path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure") and metrics.win:
+            transcript.append({"type": "auto_stop", "reason": "win_true"})
+            break
+
+    st1 = call_local_api(
+        base_url=base_url,
+        method="GET",
+        path="/api/game/state",
+        query={"player_id": player_id},
+        timeout_s=api_timeout_s,
+    )
+    seq += 1
+    transcript.append({"seq": seq, "type": "api", "method": "GET", "path": "/api/game/state", "query": {"player_id": player_id}, "result": st1.__dict__})
+    _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "api", "method": "GET", "path": "/api/game/state", "query": {"player_id": player_id}, "body": None, "http_status": st1.http_status, "seconds": st1.seconds, "response_json": st1.response_json})
+    if st1.response_json and isinstance(st1.response_json.get("game"), dict):
+        g = st1.response_json.get("game")
+        try:
+            metrics.money_spent_cents = int(g.get("money_spent_cents"))
+        except Exception:
+            metrics.money_spent_cents = None
+        try:
+            metrics.money_spent_usd = float(g.get("money_spent_usd"))
+        except Exception:
+            metrics.money_spent_usd = None
+
+    metrics.end_ts = time.time()
+    seq += 1
+    _write_event_line(
+        events_fp,
+        {
+            "seq": seq,
+            "ts": time.time(),
+            "type": "end",
+            "win": bool(metrics.win),
+            "final_delta_median_ticks": metrics.final_delta_median_ticks,
+            "best_extra_days": metrics.best_extra_days,
+            "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
+            "best_score_seq": metrics.best_score_seq,
+            "money_spent_cents": metrics.money_spent_cents,
+            "money_spent_usd": metrics.money_spent_usd,
+            "llm_calls": metrics.llm_calls,
+            "tool_calls": metrics.tool_calls,
+            "api_calls": metrics.api_calls,
+            "experiment_calls": metrics.experiment_calls,
+        },
+    )
+    return str(player_id), metrics, transcript
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="LLM benchmark runner for the disease challenge (tool-using biology).")
+    ap.add_argument("--base-url", default="http://127.0.0.1:8000", help="Runtime server base URL.")
+    ap.add_argument("--provider", required=True, choices=["openai", "anthropic", "claude", "xai", "grok", "gemini"], help="LLM provider.")
+    ap.add_argument("--model", required=True, help="Model name (provider-specific).")
+    ap.add_argument("--challenge", default="cancer", choices=["cancer", "hereditary_disease", "aging"], help="Which test challenge to run (server-side).")
+    ap.add_argument("--player-id", default="", help="Optional fixed player_id (for reproducible runs).")
+    ap.add_argument("--max-steps", type=int, default=40, help="Max tool-using steps.")
+    ap.add_argument("--temperature", type=float, default=0.0, help="LLM sampling temperature.")
+    ap.add_argument("--max-tokens", type=int, default=700, help="Max tokens to generate per LLM call (provider-dependent).")
+    ap.add_argument("--api-timeout", type=float, default=900.0, help="Timeout for local API calls.")
+    ap.add_argument("--llm-timeout", type=float, default=120.0, help="Timeout for LLM API calls.")
+    ap.add_argument("--reset-first", action="store_true", help="Reset game state for the benchmark player_id before starting.")
+    ap.add_argument("--out", default="", help="Write JSON report to this file.")
+    ap.add_argument("--events-out", default="", help="Optional JSONL stream of live events for monitoring.")
+    ap.add_argument("--files-dir", default="", help="Optional directory to write CSV files for monitoring/UI.")
+    ap.add_argument("--artifacts-dir", default="", help="(legacy) Alias for --files-dir.")
+    ap.add_argument("--state-out", default="", help="Optional JSON checkpoint file for resuming a run.")
+    ap.add_argument("--resume-state", default="", help="Resume a run from a previous --state-out checkpoint.")
+    ap.add_argument("--print-prompt", action="store_true", help="Print the benchmark prompt and exit.")
+
+    args = ap.parse_args()
+
+    if args.print_prompt:
+        sys.stdout.write(_PROMPT + "\n")
+        return 0
+
+    events_fp = None
+    if str(args.events_out or "").strip():
+        ev_dir = os.path.dirname(os.path.abspath(str(args.events_out)))
+        if ev_dir:
+            os.makedirs(ev_dir, exist_ok=True)
+        events_fp = open(str(args.events_out), "a", encoding="utf-8")
+
+    files_dir = str(args.files_dir or "").strip() or None
+    if not files_dir:
+        files_dir = str(args.artifacts_dir or "").strip() or None
+
+    used_player_id, metrics, transcript = run_benchmark(
+        challenge=str(args.challenge),
+        base_url=str(args.base_url),
+        provider=str(args.provider),
+        model=str(args.model),
+        player_id=str(args.player_id or "").strip() or None,
+        events_fp=events_fp,
+        files_dir=files_dir,
+        state_out=str(args.state_out or "").strip() or None,
+        resume_state=str(args.resume_state or "").strip() or None,
+        max_steps=int(args.max_steps),
+        temperature=float(args.temperature),
+        max_tokens=int(args.max_tokens),
+        api_timeout_s=float(args.api_timeout),
+        llm_timeout_s=float(args.llm_timeout),
+        reset_first=bool(args.reset_first),
+    )
+
+    if events_fp is not None:
+        try:
+            events_fp.close()
+        except Exception:
+            pass
+
+    report = {
+        "ok": True,
+        "prompt": _PROMPT,
+        "challenge": str(args.challenge),
+        "provider": str(args.provider),
+        "model": str(args.model),
+        "base_url": str(args.base_url),
+        "player_id": str(used_player_id),
+        "files_dir": files_dir,
+        "artifacts_dir": files_dir,
+        "metrics": {
+            "llm_calls": metrics.llm_calls,
+            "tool_calls": metrics.tool_calls,
+            "api_calls": metrics.api_calls,
+            "experiment_calls": metrics.experiment_calls,
+            "seconds_total": float(metrics.end_ts - metrics.start_ts) if metrics.end_ts and metrics.start_ts else None,
+            "win": bool(metrics.win),
+            "final_delta_median_ticks": metrics.final_delta_median_ticks,
+            "best_extra_days": metrics.best_extra_days,
+            "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
+            "best_score_seq": metrics.best_score_seq,
+            "money_spent_cents": metrics.money_spent_cents,
+            "money_spent_usd": metrics.money_spent_usd,
+            "experiments": metrics.experiments,
+        },
+        "transcript": transcript,
+    }
+
+    raw = json.dumps(report, indent=2)
+    if args.out:
+        out_dir = os.path.dirname(os.path.abspath(str(args.out)))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(str(args.out), "w", encoding="utf-8") as f:
+            f.write(raw)
+    sys.stdout.write(raw + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,7 @@
+sample_id,assay,model,replicate,sample_age
+healthy_r0_e6aae5df4136,Bulk metabolomics,healthy,0,20
+healthy_r1_e6aae5df4136,Bulk metabolomics,healthy,1,20
+healthy_r2_e6aae5df4136,Bulk metabolomics,healthy,2,20
+healthy_r3_e6aae5df4136,Bulk metabolomics,healthy,3,20
+healthy_r4_e6aae5df4136,Bulk metabolomics,healthy,4,20
+healthy_r5_e6aae5df4136,Bulk metabolomics,healthy,5,20

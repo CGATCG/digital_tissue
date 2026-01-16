@@ -6,7 +6,7 @@ import time
 import functools
 import zlib
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import copy
 import re
@@ -828,7 +828,56 @@ def apply_layer_ops_inplace(
         arr = layers.get(name)
         if arr is None:
             return zeros_counts2d
-        return np.clip(np.rint(arr.reshape(H, W)), 0, None).astype(np.int64)
+        arr2d = np.nan_to_num(arr.reshape(H, W), nan=0.0, posinf=0.0, neginf=0.0)
+        return np.clip(np.rint(arr2d), 0, None).astype(np.int64)
+
+    tick_interventions = payload.get("_tick_interventions")
+    if isinstance(tick_interventions, list) and tick_interventions:
+        huge = float(1e9)
+        for iv in tick_interventions:
+            if not isinstance(iv, dict):
+                continue
+            layer = str(iv.get("layer") or "").strip()
+            if not layer:
+                continue
+
+            direction = str(iv.get("direction") or "").strip().lower()
+            if direction in ("+", "inc", "increase", "up", "pos", "positive"):
+                direction = "up"
+            elif direction in ("-", "dec", "decrease", "down", "neg", "negative"):
+                direction = "down"
+            else:
+                raise ValueError(f"invalid intervention direction for layer '{layer}': {direction!r}")
+
+            try:
+                dose = float(iv.get("dose") or 0.0)
+            except Exception:
+                dose = 0.0
+            if not np.isfinite(dose) or dose < 0.0:
+                dose = 0.0
+
+            delta = 0.1 * float(dose)
+            factor = (1.0 + delta) if direction == "up" else (1.0 - delta)
+            if factor < 0.0:
+                factor = 0.0
+            if abs(factor - 1.0) < 1e-12:
+                continue
+
+            kind = kinds.get(layer) or "continuous"
+            if kind == "categorical":
+                raise ValueError(f"cannot apply interventions to categorical layer '{layer}'")
+
+            arr = layers.get(layer)
+            if arr is None:
+                raise ValueError(f"unknown float32 layer: {layer}")
+            arr2 = np.asarray(arr, dtype=np.float32) * np.float32(factor)
+            arr2 = np.nan_to_num(arr2, nan=0.0, posinf=huge, neginf=0.0)
+            arr2 = np.clip(arr2, 0.0, huge)
+            if kind == "counts":
+                arr2 = np.clip(np.rint(arr2), 0.0, huge)
+            layers[layer] = np.asarray(arr2, dtype=np.float32).reshape(H * W)
+            _env_update_layer(layer)
+            dirty_layers.add(layer)
 
     def _hash_u01_2d(idx_u32: np.ndarray, seed_u32: np.uint32) -> np.ndarray:
         x = (idx_u32 ^ seed_u32).astype(np.uint32)
@@ -2030,6 +2079,7 @@ def apply_layer_ops_inplace(
             final_signal = np.where(is_cell, final_signal, 0.0)
             
             # Calculate how much output to produce (integer counts)
+            final_signal = np.nan_to_num(final_signal, nan=0.0, posinf=0.0, neginf=0.0)
             output_amount = np.clip(np.floor(final_signal), 0, None).astype(np.int64)
             
             # Calculate how much input to consume
@@ -2040,7 +2090,8 @@ def apply_layer_ops_inplace(
                     continue
                 if kinds.get(inp_name) not in ("counts", None):
                     continue
-                inp_arr = np.clip(np.rint(layers[inp_name].reshape(H, W)), 0, None).astype(np.int64)
+                inp_raw = np.nan_to_num(layers[inp_name].reshape(H, W), nan=0.0, posinf=0.0, neginf=0.0)
+                inp_arr = np.clip(np.rint(inp_raw), 0, None).astype(np.int64)
                 consume_from_this = np.minimum(inp_arr, remaining_to_consume)
                 new_inp = (inp_arr - consume_from_this).astype(np.float32)
                 layers[inp_name] = new_inp.ravel()
@@ -2057,7 +2108,8 @@ def apply_layer_ops_inplace(
                     continue
                 if kinds.get(out_name) not in ("counts", None):
                     continue
-                out_arr = np.clip(np.rint(layers[out_name].reshape(H, W)), 0, None).astype(np.int64)
+                out_raw = np.nan_to_num(layers[out_name].reshape(H, W), nan=0.0, posinf=0.0, neginf=0.0)
+                out_arr = np.clip(np.rint(out_raw), 0, None).astype(np.int64)
                 add_amount = output_per_layer + (1 if idx == 0 else 0) * remainder
                 new_out = (out_arr + add_amount).astype(np.float32)
                 layers[out_name] = new_out.ravel()

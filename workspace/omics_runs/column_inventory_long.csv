@@ -1,0 +1,219 @@
+API endpoint,file type,column
+/api/tests/cancer/bulk_omics,metadata,assay
+/api/tests/cancer/bulk_omics,metadata,model
+/api/tests/cancer/bulk_omics,metadata,replicate
+/api/tests/cancer/bulk_omics,metadata,sample_id
+/api/tests/cancer/bulk_omics,metadata,study_ran_for_days
+/api/tests/cancer/bulk_omics,sample,CaCl2
+/api/tests/cancer/bulk_omics,sample,FeSO4
+/api/tests/cancer/bulk_omics,sample,H2O
+/api/tests/cancer/bulk_omics,sample,KH2PO4
+/api/tests/cancer/bulk_omics,sample,MgSO4
+/api/tests/cancer/bulk_omics,sample,NH4Cl
+/api/tests/cancer/bulk_omics,sample,NaCl
+/api/tests/cancer/bulk_omics,sample,O2
+/api/tests/cancer/bulk_omics,sample,ZnCl2
+/api/tests/cancer/bulk_omics,sample,glucose
+/api/tests/cancer/bulk_omics,sample,replacement_factor
+/api/tests/cancer/bulk_omics,sample,sample_id
+/api/tests/cancer/bulk_omics,sample,toxin
+/api/tests/cancer/characterization,metadata,age_days
+/api/tests/cancer/characterization,metadata,assay
+/api/tests/cancer/characterization,metadata,model
+/api/tests/cancer/characterization,metadata,replicate
+/api/tests/cancer/characterization,metadata,run_id
+/api/tests/cancer/characterization,metadata,sample_id
+/api/tests/cancer/characterization,metadata,seed
+/api/tests/cancer/characterization,metadata,study_ran_for_days
+/api/tests/cancer/characterization,metadata,timecourse_file_id
+/api/tests/cancer/characterization,metadata,timecourse_filename
+/api/tests/cancer/characterization,metadata,timecourse_relpath
+/api/tests/cancer/characterization,metadata,timecourse_url
+/api/tests/cancer/characterization,replicate timecourse,CaCl2_levels
+/api/tests/cancer/characterization,replicate timecourse,FeSO4_levels
+/api/tests/cancer/characterization,replicate timecourse,H2O_levels
+/api/tests/cancer/characterization,replicate timecourse,KH2PO4_levels
+/api/tests/cancer/characterization,replicate timecourse,MgSO4_levels
+/api/tests/cancer/characterization,replicate timecourse,NH4Cl_levels
+/api/tests/cancer/characterization,replicate timecourse,NaCl_levels
+/api/tests/cancer/characterization,replicate timecourse,ZnCl2_levels
+/api/tests/cancer/characterization,replicate timecourse,births_per_tick
+/api/tests/cancer/characterization,replicate timecourse,confluency
+/api/tests/cancer/characterization,replicate timecourse,damage_per_cell
+/api/tests/cancer/characterization,replicate timecourse,day
+/api/tests/cancer/characterization,replicate timecourse,deaths_per_tick
+/api/tests/cancer/characterization,replicate timecourse,glucose_levels
+/api/tests/cancer/characterization,replicate timecourse,n_cells
+/api/tests/cancer/characterization,replicate timecourse,n_deaths
+/api/tests/cancer/characterization,replicate timecourse,oxygen_levels
+/api/tests/cancer/claim_cure,metadata,assay
+/api/tests/cancer/claim_cure,metadata,interventions
+/api/tests/cancer/claim_cure,metadata,interventions_in_cancer_model
+/api/tests/cancer/claim_cure,metadata,replicates_per_group
+/api/tests/cancer/claim_cure,metadata,run_id
+/api/tests/cancer/claim_cure,metadata,sample_id
+/api/tests/cancer/claim_cure,metadata,study_observed_until_days
+/api/tests/cancer/claim_cure,metadata,win
+/api/tests/cancer/claim_cure,summary,age_at_death_days
+/api/tests/cancer/claim_cure,summary,cause_of_death
+/api/tests/cancer/claim_cure,summary,sample_type
+/api/tests/cancer/claim_cure,summary,study_observed_until_days
+/api/tests/cancer/protein_screen,metadata,assay
+/api/tests/cancer/protein_screen,metadata,direction
+/api/tests/cancer/protein_screen,metadata,dose
+/api/tests/cancer/protein_screen,metadata,measurements_file_id
+/api/tests/cancer/protein_screen,metadata,measurements_filename
+/api/tests/cancer/protein_screen,metadata,measurements_relpath
+/api/tests/cancer/protein_screen,metadata,measurements_url
+/api/tests/cancer/protein_screen,metadata,model
+/api/tests/cancer/protein_screen,metadata,protein_layers
+/api/tests/cancer/protein_screen,metadata,replicate
+/api/tests/cancer/protein_screen,metadata,replicates
+/api/tests/cancer/protein_screen,metadata,run_id
+/api/tests/cancer/protein_screen,metadata,sample_id
+/api/tests/cancer/protein_screen,metadata,seed
+/api/tests/cancer/protein_screen,metadata,study_ran_for_days
+/api/tests/cancer/protein_screen,replicate measurements,CaCl2_levels
+/api/tests/cancer/protein_screen,replicate measurements,FeSO4_levels
+/api/tests/cancer/protein_screen,replicate measurements,H2O_levels
+/api/tests/cancer/protein_screen,replicate measurements,KH2PO4_levels
+/api/tests/cancer/protein_screen,replicate measurements,MgSO4_levels
+/api/tests/cancer/protein_screen,replicate measurements,NH4Cl_levels
+/api/tests/cancer/protein_screen,replicate measurements,NaCl_levels
+/api/tests/cancer/protein_screen,replicate measurements,ZnCl2_levels
+/api/tests/cancer/protein_screen,replicate measurements,births_per_tick
+/api/tests/cancer/protein_screen,replicate measurements,condition
+/api/tests/cancer/protein_screen,replicate measurements,confluency
+/api/tests/cancer/protein_screen,replicate measurements,damage_per_cell
+/api/tests/cancer/protein_screen,replicate measurements,deaths_per_tick
+/api/tests/cancer/protein_screen,replicate measurements,glucose_levels
+/api/tests/cancer/protein_screen,replicate measurements,n_cells
+/api/tests/cancer/protein_screen,replicate measurements,n_deaths
+/api/tests/cancer/protein_screen,replicate measurements,oxygen_levels
+/api/tests/cancer/protein_screen,replicate measurements,protein
+/api/tests/cancer/spatial_tx,metadata,assay
+/api/tests/cancer/spatial_tx,metadata,cell_id
+/api/tests/cancer/spatial_tx,metadata,grid_index
+/api/tests/cancer/spatial_tx,metadata,model
+/api/tests/cancer/spatial_tx,metadata,replicate
+/api/tests/cancer/spatial_tx,metadata,sample_taken_at_day
+/api/tests/cancer/spatial_tx,metadata,seed
+/api/tests/cancer/spatial_tx,metadata,x
+/api/tests/cancer/spatial_tx,metadata,y
+/api/tests/cancer/spatial_tx,replicate cell_metadata,assay
+/api/tests/cancer/spatial_tx,replicate cell_metadata,cell_id
+/api/tests/cancer/spatial_tx,replicate cell_metadata,grid_index
+/api/tests/cancer/spatial_tx,replicate cell_metadata,model
+/api/tests/cancer/spatial_tx,replicate cell_metadata,replicate
+/api/tests/cancer/spatial_tx,replicate cell_metadata,sample_taken_at_day
+/api/tests/cancer/spatial_tx,replicate cell_metadata,seed
+/api/tests/cancer/spatial_tx,replicate cell_metadata,x
+/api/tests/cancer/spatial_tx,replicate cell_metadata,y
+/api/tests/cancer/spatial_tx,replicate matrix,cell_id
+/api/tests/cancer/spatial_tx,replicate matrix,protein_1
+/api/tests/cancer/spatial_tx,replicate matrix,protein_10
+/api/tests/cancer/spatial_tx,replicate matrix,protein_100
+/api/tests/cancer/spatial_tx,replicate matrix,protein_101
+/api/tests/cancer/spatial_tx,replicate matrix,protein_102
+/api/tests/cancer/spatial_tx,replicate matrix,protein_103
+/api/tests/cancer/spatial_tx,replicate matrix,protein_104
+/api/tests/cancer/spatial_tx,replicate matrix,protein_105
+/api/tests/cancer/spatial_tx,replicate matrix,protein_106
+/api/tests/cancer/spatial_tx,replicate matrix,protein_107
+/api/tests/cancer/spatial_tx,replicate matrix,protein_11
+/api/tests/cancer/spatial_tx,replicate matrix,protein_12
+/api/tests/cancer/spatial_tx,replicate matrix,protein_13
+/api/tests/cancer/spatial_tx,replicate matrix,protein_14
+/api/tests/cancer/spatial_tx,replicate matrix,protein_15
+/api/tests/cancer/spatial_tx,replicate matrix,protein_16
+/api/tests/cancer/spatial_tx,replicate matrix,protein_17
+/api/tests/cancer/spatial_tx,replicate matrix,protein_18
+/api/tests/cancer/spatial_tx,replicate matrix,protein_19
+/api/tests/cancer/spatial_tx,replicate matrix,protein_2
+/api/tests/cancer/spatial_tx,replicate matrix,protein_20
+/api/tests/cancer/spatial_tx,replicate matrix,protein_21
+/api/tests/cancer/spatial_tx,replicate matrix,protein_22
+/api/tests/cancer/spatial_tx,replicate matrix,protein_23
+/api/tests/cancer/spatial_tx,replicate matrix,protein_24
+/api/tests/cancer/spatial_tx,replicate matrix,protein_25
+/api/tests/cancer/spatial_tx,replicate matrix,protein_26
+/api/tests/cancer/spatial_tx,replicate matrix,protein_27
+/api/tests/cancer/spatial_tx,replicate matrix,protein_28
+/api/tests/cancer/spatial_tx,replicate matrix,protein_29
+/api/tests/cancer/spatial_tx,replicate matrix,protein_3
+/api/tests/cancer/spatial_tx,replicate matrix,protein_30
+/api/tests/cancer/spatial_tx,replicate matrix,protein_31
+/api/tests/cancer/spatial_tx,replicate matrix,protein_32
+/api/tests/cancer/spatial_tx,replicate matrix,protein_33
+/api/tests/cancer/spatial_tx,replicate matrix,protein_34
+/api/tests/cancer/spatial_tx,replicate matrix,protein_35
+/api/tests/cancer/spatial_tx,replicate matrix,protein_36
+/api/tests/cancer/spatial_tx,replicate matrix,protein_37
+/api/tests/cancer/spatial_tx,replicate matrix,protein_38
+/api/tests/cancer/spatial_tx,replicate matrix,protein_39
+/api/tests/cancer/spatial_tx,replicate matrix,protein_4
+/api/tests/cancer/spatial_tx,replicate matrix,protein_40
+/api/tests/cancer/spatial_tx,replicate matrix,protein_41
+/api/tests/cancer/spatial_tx,replicate matrix,protein_42
+/api/tests/cancer/spatial_tx,replicate matrix,protein_43
+/api/tests/cancer/spatial_tx,replicate matrix,protein_44
+/api/tests/cancer/spatial_tx,replicate matrix,protein_45
+/api/tests/cancer/spatial_tx,replicate matrix,protein_46
+/api/tests/cancer/spatial_tx,replicate matrix,protein_47
+/api/tests/cancer/spatial_tx,replicate matrix,protein_48
+/api/tests/cancer/spatial_tx,replicate matrix,protein_49
+/api/tests/cancer/spatial_tx,replicate matrix,protein_5
+/api/tests/cancer/spatial_tx,replicate matrix,protein_50
+/api/tests/cancer/spatial_tx,replicate matrix,protein_51
+/api/tests/cancer/spatial_tx,replicate matrix,protein_52
+/api/tests/cancer/spatial_tx,replicate matrix,protein_53
+/api/tests/cancer/spatial_tx,replicate matrix,protein_54
+/api/tests/cancer/spatial_tx,replicate matrix,protein_55
+/api/tests/cancer/spatial_tx,replicate matrix,protein_56
+/api/tests/cancer/spatial_tx,replicate matrix,protein_57
+/api/tests/cancer/spatial_tx,replicate matrix,protein_58
+/api/tests/cancer/spatial_tx,replicate matrix,protein_59
+/api/tests/cancer/spatial_tx,replicate matrix,protein_6
+/api/tests/cancer/spatial_tx,replicate matrix,protein_60
+/api/tests/cancer/spatial_tx,replicate matrix,protein_61
+/api/tests/cancer/spatial_tx,replicate matrix,protein_62
+/api/tests/cancer/spatial_tx,replicate matrix,protein_63
+/api/tests/cancer/spatial_tx,replicate matrix,protein_64
+/api/tests/cancer/spatial_tx,replicate matrix,protein_65
+/api/tests/cancer/spatial_tx,replicate matrix,protein_66
+/api/tests/cancer/spatial_tx,replicate matrix,protein_67
+/api/tests/cancer/spatial_tx,replicate matrix,protein_68
+/api/tests/cancer/spatial_tx,replicate matrix,protein_69
+/api/tests/cancer/spatial_tx,replicate matrix,protein_7
+/api/tests/cancer/spatial_tx,replicate matrix,protein_70
+/api/tests/cancer/spatial_tx,replicate matrix,protein_71
+/api/tests/cancer/spatial_tx,replicate matrix,protein_72
+/api/tests/cancer/spatial_tx,replicate matrix,protein_73
+/api/tests/cancer/spatial_tx,replicate matrix,protein_74
+/api/tests/cancer/spatial_tx,replicate matrix,protein_75
+/api/tests/cancer/spatial_tx,replicate matrix,protein_76
+/api/tests/cancer/spatial_tx,replicate matrix,protein_77
+/api/tests/cancer/spatial_tx,replicate matrix,protein_78
+/api/tests/cancer/spatial_tx,replicate matrix,protein_79
+/api/tests/cancer/spatial_tx,replicate matrix,protein_8
+/api/tests/cancer/spatial_tx,replicate matrix,protein_80
+/api/tests/cancer/spatial_tx,replicate matrix,protein_81
+/api/tests/cancer/spatial_tx,replicate matrix,protein_82
+/api/tests/cancer/spatial_tx,replicate matrix,protein_83
+/api/tests/cancer/spatial_tx,replicate matrix,protein_84
+/api/tests/cancer/spatial_tx,replicate matrix,protein_85
+/api/tests/cancer/spatial_tx,replicate matrix,protein_86
+/api/tests/cancer/spatial_tx,replicate matrix,protein_87
+/api/tests/cancer/spatial_tx,replicate matrix,protein_88
+/api/tests/cancer/spatial_tx,replicate matrix,protein_89
+/api/tests/cancer/spatial_tx,replicate matrix,protein_9
+/api/tests/cancer/spatial_tx,replicate matrix,protein_90
+/api/tests/cancer/spatial_tx,replicate matrix,protein_91
+/api/tests/cancer/spatial_tx,replicate matrix,protein_92
+/api/tests/cancer/spatial_tx,replicate matrix,protein_93
+/api/tests/cancer/spatial_tx,replicate matrix,protein_94
+/api/tests/cancer/spatial_tx,replicate matrix,protein_95
+/api/tests/cancer/spatial_tx,replicate matrix,protein_96
+/api/tests/cancer/spatial_tx,replicate matrix,protein_97
+/api/tests/cancer/spatial_tx,replicate matrix,protein_98
+/api/tests/cancer/spatial_tx,replicate matrix,protein_99

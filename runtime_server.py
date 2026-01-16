@@ -1,11 +1,16 @@
 import concurrent.futures
+import copy
 import faulthandler
+import gzip
 import hashlib
+import io
 import json
 import logging
 import logging.handlers
 import multiprocessing as mp
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,8 +25,161 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
+import urllib.error
+import urllib.request
 
 import numpy as np
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
+
+
+_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+
+
+def _anthropic_headers(*, api_key: str, betas: Optional[list[str]] = None, content_type: Optional[str] = "application/json") -> Dict[str, str]:
+    h = {
+        "x-api-key": str(api_key),
+        "anthropic-version": "2023-06-01",
+    }
+    if content_type:
+        h["content-type"] = str(content_type)
+    if betas:
+        h["anthropic-beta"] = ",".join([str(x) for x in betas if str(x).strip()])
+    return h
+
+
+def _http_post_json(*, url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+    raw = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(str(url), data=raw, method="POST", headers=dict(headers))
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            b = resp.read()
+            txt = b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+    except urllib.error.HTTPError as e:
+        try:
+            b = e.read()
+            txt = b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+        except Exception:
+            txt = str(e)
+        raise ValueError(f"HTTP {int(getattr(e, 'code', 0) or 0)}: {txt[:2000]}") from e
+    obj = {}
+    try:
+        parsed = json.loads(txt) if isinstance(txt, str) and txt.strip() else None
+        obj = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        obj = {}
+    return obj
+
+
+def _anthropic_upload_file(*, api_key: str, filename: str, file_bytes: bytes, timeout_s: float) -> Dict[str, Any]:
+    betas = ["files-api-2025-04-14"]
+    return _http_post_multipart_file(
+        url=f"{_ANTHROPIC_BASE_URL}/files",
+        headers=_anthropic_headers(api_key=api_key, betas=betas, content_type=None),
+        field_name="file",
+        filename=str(filename),
+        file_bytes=(file_bytes or b""),
+        mime_type="application/octet-stream",
+        timeout_s=float(timeout_s),
+    )
+
+
+def _anthropic_messages_code_execution(
+    *,
+    api_key: str,
+    model: str,
+    instructions: str,
+    file_ids: list[str],
+    timeout_s: float,
+) -> Dict[str, Any]:
+    betas = ["code-execution-2025-08-25", "files-api-2025-04-14"]
+
+    content_blocks: list[Dict[str, Any]] = [{"type": "text", "text": str(instructions)}]
+    for fid in file_ids:
+        if str(fid or "").strip():
+            content_blocks.append({"type": "container_upload", "file_id": str(fid)})
+
+    payload: Dict[str, Any] = {
+        "model": str(model),
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": content_blocks,
+            }
+        ],
+        "tools": [
+            {
+                "type": "code_execution_20250825",
+                "name": "code_execution",
+            }
+        ],
+    }
+
+    return _http_post_json(
+        url=f"{_ANTHROPIC_BASE_URL}/messages",
+        headers=_anthropic_headers(api_key=api_key, betas=betas, content_type="application/json"),
+        payload=payload,
+        timeout_s=float(timeout_s),
+    )
+
+
+def _anthropic_message_text(resp_json: Dict[str, Any]) -> str:
+    parts: list[str] = []
+    blocks = resp_json.get("content")
+    if isinstance(blocks, list):
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(str(b.get("text") or ""))
+    return "".join(parts)
+
+
+def _http_post_multipart_file(
+    *,
+    url: str,
+    headers: Dict[str, str],
+    field_name: str,
+    filename: str,
+    file_bytes: bytes,
+    mime_type: str,
+    timeout_s: float,
+) -> Dict[str, Any]:
+    boundary = "----digital_tissue_" + uuid.uuid4().hex
+    pre = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode("utf-8")
+    post = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    body = pre + (file_bytes or b"") + post
+
+    h2 = dict(headers)
+    h2["content-type"] = f"multipart/form-data; boundary={boundary}"
+
+    req = urllib.request.Request(str(url), data=body, method="POST", headers=h2)
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            b = resp.read()
+            txt = b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+    except urllib.error.HTTPError as e:
+        try:
+            b = e.read()
+            txt = b.decode("utf-8", errors="replace") if isinstance(b, (bytes, bytearray)) else str(b)
+        except Exception:
+            txt = str(e)
+        raise ValueError(f"HTTP {int(getattr(e, 'code', 0) or 0)}: {txt[:2000]}") from e
+    obj = {}
+    try:
+        parsed = json.loads(txt) if isinstance(txt, str) and txt.strip() else None
+        obj = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        obj = {}
+    return obj
 
 from apply_layer_ops import _decode_float32_b64, _encode_float32_b64, apply_layer_ops_inplace
 from output_calc import _ExprEval
@@ -882,6 +1040,9 @@ _WEB_DIR = Path(__file__).resolve().parent / "web_editor"
 _RUNS_DIR = Path(__file__).resolve().parent / "runs" / "evolution"
 _DOCS_DIR = Path(os.environ.get("DT_DOCS_DIR") or (Path(__file__).resolve().parent / "documents"))
 _WORKSPACE_DIR = Path(os.environ.get("DT_WORKSPACE_DIR") or (Path(__file__).resolve().parent / "workspace"))
+_OMICS_RUNS_DIR = _WORKSPACE_DIR / "omics_runs"
+_TESTS_DIR = Path(__file__).resolve().parent / "tests"
+_TESTS_PRICING_PATH = _TESTS_DIR / "pricing.json"
 
 _GAME_STATE_PATH = _WORKSPACE_DIR / "game_state.json"
 _GAME_LOCK = threading.RLock()
@@ -892,6 +1053,458 @@ _COST_MODEL_CENTS = {
     "spatial_transcriptomics": 250000,
     "in_vivo_trial": 500000,
 }
+
+_TESTS_CANCER_MODELS = {
+    "healthy": "healthy.json",
+    "cancer": "cancer.json",
+    "cell_culture_healthy": "cell_culture_healthy.json",
+    "cell_culture_cancer": "cell_culture_cancer.json",
+}
+
+_TESTS_HEREDITARY_DISEASE_MODELS = {
+    "healthy": "healthy.json",
+    "disease": "heredetary_disease.json",
+    "cell_culture_healthy": "cell_culture.json",
+    "cell_culture_disease": "cell_culture_heredetary_disease.json",
+}
+
+_TESTS_AGING_MODELS = {
+    "healthy": "healthy.json",
+    "cell_culture": "cell_culture.json",
+}
+
+def _tests_cancer_model_list() -> list[Dict[str, Any]]:
+    return [
+        {"key": "healthy", "label": "Healthy (organism)", "domain": "in_vivo"},
+        {"key": "cancer", "label": "Cancer (organism)", "domain": "in_vivo"},
+        {"key": "cell_culture_healthy", "label": "Healthy (cell culture)", "domain": "in_vitro"},
+        {"key": "cell_culture_cancer", "label": "Cancer (cell culture)", "domain": "in_vitro"},
+    ]
+
+def _tests_cancer_model_path(model_key: Any) -> Path:
+    key = str(model_key or "").strip()
+    fn = _TESTS_CANCER_MODELS.get(key)
+    if not fn:
+        raise ValueError("unknown model")
+    base = (_TESTS_DIR / "cancer").resolve()
+    p = (base / str(fn)).resolve()
+    if base not in p.parents:
+        raise ValueError("invalid model")
+    if not p.exists() or not p.is_file():
+        raise ValueError("model missing")
+    return p
+
+def _tests_load_cancer_model_payload(model_key: Any) -> Dict[str, Any]:
+    p = _tests_cancer_model_path(model_key)
+    obj = _safe_read_json(p)
+    if not isinstance(obj, dict):
+        raise ValueError("model JSON invalid")
+    return obj
+
+def _tests_hereditary_disease_model_list() -> list[Dict[str, Any]]:
+    return [
+        {"key": "healthy", "label": "Healthy (organism)", "domain": "in_vivo"},
+        {"key": "disease", "label": "Disease (organism)", "domain": "in_vivo"},
+        {"key": "cell_culture_healthy", "label": "Healthy (cell culture)", "domain": "in_vitro"},
+        {"key": "cell_culture_disease", "label": "Disease (cell culture)", "domain": "in_vitro"},
+    ]
+
+
+def _tests_aging_model_list() -> list[Dict[str, Any]]:
+    return [
+        {"key": "healthy", "label": "Healthy (organism)", "domain": "in_vivo"},
+        {"key": "cell_culture", "label": "Healthy (cell culture)", "domain": "in_vitro"},
+    ]
+
+def _tests_hereditary_disease_model_path(model_key: Any) -> Path:
+    key = str(model_key or "").strip()
+    fn = _TESTS_HEREDITARY_DISEASE_MODELS.get(key)
+    if not fn:
+        raise ValueError("unknown model")
+    base = (_TESTS_DIR / "hereditary_disease").resolve()
+    p = (base / str(fn)).resolve()
+    if base not in p.parents:
+        raise ValueError("invalid model")
+    if not p.exists() or not p.is_file():
+        raise ValueError("model missing")
+    return p
+
+def _tests_load_hereditary_disease_model_payload(model_key: Any) -> Dict[str, Any]:
+    p = _tests_hereditary_disease_model_path(model_key)
+    obj = _safe_read_json(p)
+    if not isinstance(obj, dict):
+        raise ValueError("model JSON invalid")
+    return obj
+
+
+def _tests_aging_model_path(model_key: Any) -> Path:
+    key = str(model_key or "").strip()
+    fn = _TESTS_AGING_MODELS.get(key)
+    if not fn:
+        raise ValueError("unknown model")
+    base = (_TESTS_DIR / "aging").resolve()
+    p = (base / str(fn)).resolve()
+    if base not in p.parents:
+        raise ValueError("invalid model")
+    if not p.exists() or not p.is_file():
+        raise ValueError("model missing")
+    return p
+
+
+def _tests_load_aging_model_payload(model_key: Any) -> Dict[str, Any]:
+    p = _tests_aging_model_path(model_key)
+    obj = _safe_read_json(p)
+    if not isinstance(obj, dict):
+        raise ValueError("model JSON invalid")
+    return obj
+
+def _tests_normalize_challenge(challenge: Any) -> str:
+    ch = str(challenge or "").strip().lower()
+    if ch in ("cancer", "hereditary_disease", "aging"):
+        return ch
+    raise ValueError("unknown challenge")
+
+def _tests_model_list_for_challenge(challenge: Any) -> list[Dict[str, Any]]:
+    ch = _tests_normalize_challenge(challenge)
+    if ch == "cancer":
+        return _tests_cancer_model_list()
+    if ch == "hereditary_disease":
+        return _tests_hereditary_disease_model_list()
+    return _tests_aging_model_list()
+
+def _tests_load_model_payload_for_challenge(challenge: Any, model_key: Any) -> Dict[str, Any]:
+    ch = _tests_normalize_challenge(challenge)
+    if ch == "cancer":
+        return _tests_load_cancer_model_payload(model_key)
+    if ch == "hereditary_disease":
+        return _tests_load_hereditary_disease_model_payload(model_key)
+    return _tests_load_aging_model_payload(model_key)
+
+def _tests_claim_cure_disease_model_key_for_challenge(challenge: Any) -> str:
+    ch = _tests_normalize_challenge(challenge)
+    if ch == "cancer":
+        return "cancer"
+    if ch == "hereditary_disease":
+        return "disease"
+    return "healthy"
+
+def _tests_is_in_vitro_model(model_key: Any) -> bool:
+    key = str(model_key or "").strip().lower()
+    return "cell_culture" in key
+
+def _tests_pricing_for_challenge(challenge: str) -> Dict[str, Any]:
+    dd = _safe_read_json(_TESTS_PRICING_PATH)
+    if not isinstance(dd, dict):
+        return {}
+    tests = dd.get("tests")
+    if not isinstance(tests, dict):
+        return {}
+    ch = tests.get(str(challenge or "").strip())
+    if not isinstance(ch, dict):
+        return {}
+    return ch
+
+
+def _tests_compute_unit_cost_cents(
+    *,
+    challenge: str,
+    kind: str,
+    model_key: Any,
+    ticks: int,
+    interventions_n: int,
+) -> int:
+    cfg = _tests_pricing_for_challenge(challenge)
+    kinds = cfg.get("kinds") if isinstance(cfg, dict) else None
+    kcfg = kinds.get(str(kind)) if isinstance(kinds, dict) else None
+    if not isinstance(kcfg, dict):
+        return 0
+
+    try:
+        base = int(kcfg.get("unit_cents") or 0)
+    except Exception:
+        base = 0
+    try:
+        per_tick = int(kcfg.get("unit_per_tick_cents") or 0)
+    except Exception:
+        per_tick = 0
+    try:
+        per_iv = int(kcfg.get("unit_per_intervention_cents") or 0)
+    except Exception:
+        per_iv = 0
+
+    ticks_i = max(0, int(ticks))
+    iv_i = max(0, int(interventions_n))
+    unit = int(base) + int(per_tick) * int(ticks_i) + int(per_iv) * int(iv_i)
+
+    mults = cfg.get("multipliers") if isinstance(cfg, dict) else None
+    mult = 1.0
+    if isinstance(mults, dict):
+        k = "in_vitro" if _tests_is_in_vitro_model(model_key) else "in_vivo"
+        try:
+            mult = float(mults.get(k) or 1.0)
+        except Exception:
+            mult = 1.0
+    if not np.isfinite(mult) or mult <= 0.0:
+        mult = 1.0
+
+    return int(max(0, int(round(float(unit) * float(mult)))))
+
+
+def _tests_make_charge(*, kind: str, samples: int, unit_cost_cents: int, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    n = max(0, int(samples))
+    unit = max(0, int(unit_cost_cents))
+    total = int(unit) * int(n)
+    out = {
+        "id": uuid.uuid4().hex[:12],
+        "ts": float(time.time()),
+        "currency": "USD",
+        "kind": str(kind or ""),
+        "samples": int(n),
+        "unit_cost_cents": int(unit),
+        "total_cost_cents": int(total),
+        "cost_cents": int(total),
+        "unit_cost_usd": float(unit) / 100.0,
+        "total_cost_usd": float(total) / 100.0,
+        "cost_usd": float(total) / 100.0,
+    }
+    if isinstance(meta, dict) and meta:
+        out["meta"] = meta
+    return out
+
+
+def _tests_validate_protein_interventions(interventions_in: Any) -> list[Dict[str, Any]]:
+    if interventions_in is None:
+        return []
+    if not isinstance(interventions_in, list):
+        raise ValueError("interventions must be a list")
+    out: list[Dict[str, Any]] = []
+    for iv in interventions_in:
+        if not isinstance(iv, dict):
+            continue
+        layer = str(iv.get("layer") or "").strip()
+        if not layer:
+            continue
+        if not layer.startswith("protein_"):
+            raise ValueError("targeted interventions must be masked protein_<int> ids")
+        tail = layer[len("protein_") :]
+        if not tail.isdigit():
+            raise ValueError("targeted interventions must be masked protein_<int> ids")
+        out.append(iv)
+    return out
+
+
+_TESTS_PROTEIN_MASK_LOCK = threading.Lock()
+_TESTS_PROTEIN_MASK_CACHE: Dict[str, tuple[Dict[str, str], Dict[str, str]]] = {}
+
+
+def _tests_get_protein_mask_maps(model_key: Any, *, challenge: str = "cancer") -> tuple[Dict[str, str], Dict[str, str]]:
+    ch = str(challenge or "").strip().lower() or "cancer"
+    mk = str(model_key or "").strip().lower()
+    if not mk:
+        if ch == "cancer":
+            mk = "cancer"
+        elif ch == "hereditary_disease":
+            mk = "disease"
+        else:
+            mk = "healthy"
+    cache_key = f"{ch}:{mk}"
+    with _TESTS_PROTEIN_MASK_LOCK:
+        cached = _TESTS_PROTEIN_MASK_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    if ch == "cancer":
+        payload = _tests_load_cancer_model_payload(mk)
+    elif ch == "hereditary_disease":
+        payload = _tests_load_hereditary_disease_model_payload(mk)
+    elif ch == "aging":
+        payload = _tests_load_aging_model_payload(mk)
+    else:
+        raise ValueError("unknown challenge")
+    real_layers = _protein_layer_names_from_payload(payload)
+    real_to_mask: Dict[str, str] = {}
+    mask_to_real: Dict[str, str] = {}
+    for i, real in enumerate(real_layers):
+        masked = f"protein_{int(i + 1)}"
+        real_to_mask[str(real)] = str(masked)
+        mask_to_real[str(masked)] = str(real)
+
+    with _TESTS_PROTEIN_MASK_LOCK:
+        _TESTS_PROTEIN_MASK_CACHE[cache_key] = (real_to_mask, mask_to_real)
+        return _TESTS_PROTEIN_MASK_CACHE[cache_key]
+
+
+def _tests_translate_interventions_masked_to_real(
+    interventions: list[Dict[str, Any]], *, model_key: Any, challenge: str = "cancer"
+) -> list[Dict[str, Any]]:
+    if not interventions:
+        return []
+    _, mask_to_real = _tests_get_protein_mask_maps(model_key, challenge=str(challenge))
+    out: list[Dict[str, Any]] = []
+    for iv in interventions:
+        if not isinstance(iv, dict):
+            continue
+        layer = str(iv.get("layer") or "").strip()
+        if not layer:
+            continue
+        real = mask_to_real.get(layer)
+        if not real:
+            raise ValueError(f"unknown masked protein id: {layer}")
+        iv2 = dict(iv)
+        iv2["layer"] = str(real)
+        out.append(iv2)
+    return out
+
+
+def _tests_mask_gene_list(genes: list[str]) -> tuple[list[str], Dict[str, str]]:
+    out: list[str] = []
+    real_to_mask: Dict[str, str] = {}
+    for i, g in enumerate(list(genes)):
+        masked = f"gene_{int(i + 1)}"
+        out.append(masked)
+        real_to_mask[str(g)] = str(masked)
+    return out, real_to_mask
+
+
+def _tests_mask_feature_list(features: list[str], prefix: str) -> tuple[list[str], Dict[str, str]]:
+    out: list[str] = []
+    real_to_mask: Dict[str, str] = {}
+    pfx = str(prefix or "").strip().lower() or "feature"
+    for i, f in enumerate(list(features)):
+        masked = f"{str(pfx)}_{int(i + 1)}"
+        out.append(masked)
+        real_to_mask[str(f)] = str(masked)
+    return out, real_to_mask
+
+
+_BULK_OMICS_CORE_INDEX_MAP: Optional[Dict[str, int]] = None
+
+
+def _bulk_omics_core_key(name: Any) -> str:
+    s = str(name or "")
+    if s.startswith("rna_"):
+        return s[len("rna_") :]
+    if s.startswith("protein_"):
+        return s[len("protein_") :]
+    return s
+
+
+def _bulk_omics_get_core_index_map() -> Dict[str, int]:
+    global _BULK_OMICS_CORE_INDEX_MAP
+    if isinstance(_BULK_OMICS_CORE_INDEX_MAP, dict) and _BULK_OMICS_CORE_INDEX_MAP:
+        return _BULK_OMICS_CORE_INDEX_MAP
+
+    m: Dict[str, int] = {}
+    next_i = 1
+
+    sets = _list_bulk_omics_sets()
+    prot_sets = sorted([s for s in sets if str(s).startswith("protein/")])
+    rna_sets = sorted([s for s in sets if str(s).startswith("rna/")])
+
+    for s in prot_sets:
+        try:
+            _, feats = _load_bulk_omics_set(str(s))
+        except Exception:
+            feats = []
+        for f in feats:
+            core = _bulk_omics_core_key(f)
+            if not core or core in m:
+                continue
+            m[str(core)] = int(next_i)
+            next_i += 1
+
+    for s in rna_sets:
+        try:
+            _, feats = _load_bulk_omics_set(str(s))
+        except Exception:
+            feats = []
+        for f in feats:
+            core = _bulk_omics_core_key(f)
+            if not core or core in m:
+                continue
+            m[str(core)] = int(next_i)
+            next_i += 1
+
+    _BULK_OMICS_CORE_INDEX_MAP = m
+    return m
+
+
+def _bulk_omics_mask_feature_headers(features: list[str], kind: str) -> list[str]:
+    k = str(kind or "")
+    if k == "bulk_metabolomics":
+        return [
+            (str(f)[len("molecule_") :] if str(f).startswith("molecule_") else str(f))
+            for f in list(features)
+        ]
+
+    if k not in ("bulk_rnaseq", "bulk_proteomics"):
+        return list(features)
+
+    prefix = "rna" if k == "bulk_rnaseq" else "protein"
+    core_to_idx = _bulk_omics_get_core_index_map()
+
+    out: list[str] = []
+    for f in list(features):
+        core = _bulk_omics_core_key(f)
+        idx = core_to_idx.get(str(core))
+        if idx is None:
+            idx = int(len(core_to_idx) + 1)
+            core_to_idx[str(core)] = int(idx)
+        out.append(f"{str(prefix)}_{int(idx)}")
+    return out
+
+
+def _stx_kind_from_gene_set_and_genes(gene_set_name: Any, genes: list[str]) -> str:
+    nm = str(gene_set_name or "").strip().lower()
+    if "proteom" in nm or "protein" in nm:
+        return "bulk_proteomics"
+    if "transcript" in nm or nm.startswith("rna"):
+        return "bulk_rnaseq"
+    for g in list(genes):
+        s = str(g or "")
+        if s.startswith("protein_"):
+            return "bulk_proteomics"
+        if s.startswith("rna_"):
+            return "bulk_rnaseq"
+    return "bulk_rnaseq"
+
+
+def _tests_lifespan_stats(dts: list[int], *, ticks: int) -> Dict[str, Any]:
+    ticks_i = max(0, int(ticks))
+    arr = np.asarray([int(x) for x in dts], dtype=np.float64) if dts else np.asarray([], dtype=np.float64)
+    if arr.size:
+        med = float(np.median(arr))
+        mean = float(np.mean(arr))
+        try:
+            p25 = float(np.quantile(arr, 0.25))
+        except Exception:
+            p25 = float(med)
+        try:
+            p75 = float(np.quantile(arr, 0.75))
+        except Exception:
+            p75 = float(med)
+        mn = float(np.min(arr))
+        mx = float(np.max(arr))
+    else:
+        med = float(ticks_i)
+        mean = float(ticks_i)
+        p25 = float(ticks_i)
+        p75 = float(ticks_i)
+        mn = float(ticks_i)
+        mx = float(ticks_i)
+    deaths = int(sum(1 for dt in dts if int(dt) < int(ticks_i)))
+    return {
+        "n": int(len(dts)),
+        "ticks": int(ticks_i),
+        "median_lifespan_tick": float(med),
+        "mean_lifespan_tick": float(mean),
+        "p25_lifespan_tick": float(p25),
+        "p75_lifespan_tick": float(p75),
+        "min_lifespan_tick": float(mn),
+        "max_lifespan_tick": float(mx),
+        "deaths": int(deaths),
+        "survivors": int(len(dts) - deaths),
+    }
 
 
 def _sanitize_player_id(player_id: Any) -> str:
@@ -1206,10 +1819,308 @@ def _death_measurement_names_from_payload(payload: Dict[str, Any]) -> list[str]:
     names = _measurement_names_from_payload(payload)
     out: list[str] = []
     for nm in names:
-        if "death" not in str(nm).lower():
+        s = str(nm or "")
+        s2 = s.lower()
+        if not s2:
             continue
-        out.append(nm)
+        # In vivo death channels are named like "*_death" (e.g. glucose_death).
+        # In vitro models may include measurements like "deaths_per_tick" which are not organism death triggers.
+        if s2.endswith("_death") or s2.startswith("death_"):
+            out.append(s)
     return out
+
+
+def _cell_culture_metrics_from_payload(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed0: int,
+) -> Dict[str, Any]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+    expected_len = int(H * W)
+
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+    cell0 = layers0.get("cell") if isinstance(layers0, dict) else None
+    n_cells_start = 0
+    if cell0 is not None:
+        try:
+            n_cells_start = int((np.asarray(cell0, dtype=np.float32).reshape(-1) > 0.5).sum())
+        except Exception:
+            n_cells_start = 0
+
+    ticks_i = max(0, int(ticks))
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+
+    ev = p.get("event_counters") if isinstance(p, dict) else None
+    op_totals = ev.get("op_totals") if isinstance(ev, dict) else None
+    births_total = int(op_totals.get("divides_cells") or 0) if isinstance(op_totals, dict) else 0
+    deaths_total = int(op_totals.get("cell_death") or 0) if isinstance(op_totals, dict) else 0
+
+    layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+    cell_arr = layers.get("cell") if isinstance(layers, dict) else None
+    n_cells_end = 0
+    if cell_arr is not None:
+        try:
+            n_cells_end = int((np.asarray(cell_arr, dtype=np.float32).reshape(-1) > 0.5).sum())
+        except Exception:
+            n_cells_end = 0
+
+    confluency_end = float(n_cells_end) / float(expected_len) if expected_len > 0 else 0.0
+    return {
+        "n_cells_start": int(n_cells_start),
+        "n_cells_end": int(n_cells_end),
+        "confluency_end": float(confluency_end),
+        "births_total": int(births_total),
+        "deaths_total": int(deaths_total),
+        "net_births_total": int(int(births_total) - int(deaths_total)),
+    }
+
+
+def _run_cell_culture_measurement_series_and_metrics(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed0: int,
+    names: list[str],
+) -> tuple[Dict[str, list[float]], Dict[str, Any]]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+    expected_len = int(H * W)
+
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    # Initial metrics (before running)
+    cell0 = _layers_dict_from_payload_data(p, expected_len=expected_len).get("cell")
+    n_cells_start = 0
+    if cell0 is not None:
+        try:
+            n_cells_start = int((np.asarray(cell0, dtype=np.float32).reshape(-1) > 0.5).sum())
+        except Exception:
+            n_cells_start = 0
+
+    ticks_i = max(0, int(ticks))
+    selected = set(str(x) for x in names if str(x).strip())
+    series: Dict[str, list[float]] = {nm: [] for nm in names}
+
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        sel = _compute_selected_measurements_from_layers(p, layers, H, W, selected)
+        for nm in names:
+            try:
+                v = float(sel.get(nm) or 0.0)
+            except Exception:
+                v = 0.0
+            if not np.isfinite(v):
+                v = 0.0
+            series[nm].append(float(v))
+
+    ev = p.get("event_counters") if isinstance(p, dict) else None
+    op_totals = ev.get("op_totals") if isinstance(ev, dict) else None
+    births_total = int(op_totals.get("divides_cells") or 0) if isinstance(op_totals, dict) else 0
+    deaths_total = int(op_totals.get("cell_death") or 0) if isinstance(op_totals, dict) else 0
+
+    layers_end = _layers_dict_from_payload_data(p, expected_len=expected_len)
+    cell_end = layers_end.get("cell") if isinstance(layers_end, dict) else None
+    n_cells_end = 0
+    if cell_end is not None:
+        try:
+            n_cells_end = int((np.asarray(cell_end, dtype=np.float32).reshape(-1) > 0.5).sum())
+        except Exception:
+            n_cells_end = 0
+
+    confluency_end = float(n_cells_end) / float(expected_len) if expected_len > 0 else 0.0
+    metrics = {
+        "n_cells_start": int(n_cells_start),
+        "n_cells_end": int(n_cells_end),
+        "confluency_end": float(confluency_end),
+        "births_total": int(births_total),
+        "deaths_total": int(deaths_total),
+        "net_births_total": int(int(births_total) - int(deaths_total)),
+    }
+    return series, metrics
+
+
+def _cell_culture_measurements_end_from_payload(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed0: int,
+    selected_names: list[str],
+) -> Dict[str, Any]:
+    p = _deepcopy_payload(base)
+    p.pop("event_counters", None)
+    p.pop("_profile_layer_ops", None)
+    p.pop("_profile_step_names", None)
+    p.pop("_profile_expr", None)
+    p["_skip_b64_writeback"] = True
+    _ensure_layer_ops_opts(p)
+
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+    expected_len = int(H * W)
+
+    data = p.get("data")
+    if isinstance(data, dict):
+        layers0 = _layers_dict_from_payload_data(p, expected_len=expected_len)
+        for nm0, arr0 in layers0.items():
+            ent0 = data.get(nm0)
+            if not isinstance(ent0, dict) or ent0.get("dtype") != "float32":
+                continue
+            ent0["arr"] = np.asarray(arr0, dtype=np.float32).reshape(expected_len)
+            ent0["b64"] = ""
+
+    ticks_i = max(0, int(ticks))
+    for t in range(ticks_i):
+        apply_layer_ops_inplace(p, seed_offset=int(seed0) + int(t))
+
+    layers_end = _layers_dict_from_payload_data(p, expected_len=expected_len)
+    selected = set(str(x) for x in (selected_names or []) if isinstance(x, str) and x)
+    out_raw = _compute_selected_measurements_from_layers(p, layers_end, H, W, selected)
+    out: Dict[str, Any] = {}
+    for k, v in out_raw.items():
+        if v is None:
+            out[str(k)] = None
+            continue
+        if isinstance(v, (int, float, np.floating)):
+            out[str(k)] = float(v)
+            continue
+        try:
+            out[str(k)] = float(v)
+        except Exception:
+            out[str(k)] = None
+    return out
+
+
+def _cell_culture_measurements_end_summary_from_payload(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed: int,
+    replicates: int,
+    selected_names: list[str],
+    condition_index: int,
+) -> Dict[str, Any]:
+    names = [str(x) for x in (selected_names or []) if isinstance(x, str) and x]
+    vals_by_name: Dict[str, list[float]] = {nm: [] for nm in names}
+
+    for ri in range(max(0, int(replicates))):
+        seed0 = int(seed) + (int(condition_index) * 1000003) + (int(ri) * 97)
+        m_end = _cell_culture_measurements_end_from_payload(
+            base,
+            ticks=int(ticks),
+            seed0=int(seed0),
+            selected_names=names,
+        )
+        for nm in names:
+            v = m_end.get(nm)
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except Exception:
+                continue
+            if not np.isfinite(vf):
+                continue
+            vals_by_name[nm].append(float(vf))
+
+    out_meas: Dict[str, Any] = {}
+    for nm in names:
+        out_meas[nm] = _float_list_summary([float(x) for x in vals_by_name.get(nm) or []])
+
+    return {
+        "replicates": int(replicates),
+        "ticks": int(ticks),
+        "measurements_end": out_meas,
+    }
+
+
+def _cell_culture_measurements_end_sample_from_payload(
+    base: Dict[str, Any],
+    *,
+    ticks: int,
+    seed: int,
+    replicates: int,
+    selected_names: list[str],
+    condition_index: int,
+) -> Dict[str, Any]:
+    names = [str(x) for x in (selected_names or []) if isinstance(x, str) and x]
+    out_sample: list[Dict[str, Any]] = []
+    for ri in range(max(0, int(replicates))):
+        seed0 = int(seed) + (int(condition_index) * 1000003) + (int(ri) * 97)
+        m_end = _cell_culture_measurements_end_from_payload(
+            base,
+            ticks=int(ticks),
+            seed0=int(seed0),
+            selected_names=names,
+        )
+        out_sample.append(
+            {
+                "replicate": int(ri),
+                "seed": int(seed0),
+                "measurements_end": dict(m_end),
+            }
+        )
+    return {
+        "replicates": int(replicates),
+        "ticks": int(ticks),
+        "measurements_end_sample": out_sample,
+    }
+
+
+def _float_list_summary(xs: list[float]) -> Dict[str, Any]:
+    arr = np.asarray([float(x) for x in xs], dtype=np.float64) if xs else np.asarray([], dtype=np.float64)
+    if arr.size <= 0:
+        return {"n": 0, "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "n": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
 
 
 def _run_lifespan_death_tick(
@@ -1501,6 +2412,14 @@ _INVIVO_SCREEN_WORKER_REPS: Optional[int] = None
 _INVIVO_SCREEN_WORKER_DIRECTION: Optional[str] = None
 _INVIVO_SCREEN_WORKER_DOSE: Optional[float] = None
 
+_VITRO_SCREEN_WORKER_BASE: Optional[Dict[str, Any]] = None
+_VITRO_SCREEN_WORKER_TICKS: Optional[int] = None
+_VITRO_SCREEN_WORKER_SEED: Optional[int] = None
+_VITRO_SCREEN_WORKER_REPS: Optional[int] = None
+_VITRO_SCREEN_WORKER_DIRECTION: Optional[str] = None
+_VITRO_SCREEN_WORKER_DOSE: Optional[float] = None
+_VITRO_SCREEN_WORKER_MEAS_NAMES: Optional[list[str]] = None
+
 
 def _invivo_screen_worker_init(
     base: Dict[str, Any],
@@ -1518,13 +2437,83 @@ def _invivo_screen_worker_init(
     global _INVIVO_SCREEN_WORKER_REPS
     global _INVIVO_SCREEN_WORKER_DIRECTION
     global _INVIVO_SCREEN_WORKER_DOSE
+
     _INVIVO_SCREEN_WORKER_BASE = base
     _INVIVO_SCREEN_WORKER_DEATH_NAMES = list(death_names)
     _INVIVO_SCREEN_WORKER_TICKS = int(ticks)
     _INVIVO_SCREEN_WORKER_SEED = int(seed)
     _INVIVO_SCREEN_WORKER_REPS = int(replicates)
-    _INVIVO_SCREEN_WORKER_DIRECTION = str(direction or "up").strip().lower()
+    _INVIVO_SCREEN_WORKER_DIRECTION = str(direction)
     _INVIVO_SCREEN_WORKER_DOSE = float(dose)
+
+
+def _vitro_screen_worker_init(
+    base: Dict[str, Any],
+    ticks: int,
+    seed: int,
+    replicates: int,
+    direction: str,
+    dose: float,
+    meas_names: list[str],
+) -> None:
+    global _VITRO_SCREEN_WORKER_BASE
+    global _VITRO_SCREEN_WORKER_TICKS
+    global _VITRO_SCREEN_WORKER_SEED
+    global _VITRO_SCREEN_WORKER_REPS
+    global _VITRO_SCREEN_WORKER_DIRECTION
+    global _VITRO_SCREEN_WORKER_DOSE
+    global _VITRO_SCREEN_WORKER_MEAS_NAMES
+
+    _VITRO_SCREEN_WORKER_BASE = base
+    _VITRO_SCREEN_WORKER_TICKS = int(ticks)
+    _VITRO_SCREEN_WORKER_SEED = int(seed)
+    _VITRO_SCREEN_WORKER_REPS = int(replicates)
+    _VITRO_SCREEN_WORKER_DIRECTION = str(direction)
+    _VITRO_SCREEN_WORKER_DOSE = float(dose)
+    _VITRO_SCREEN_WORKER_MEAS_NAMES = [str(x) for x in (meas_names or []) if isinstance(x, str) and x]
+
+
+def _vitro_screen_worker_eval(layer_index: int, layer_name: str) -> Dict[str, Any]:
+    if (
+        _VITRO_SCREEN_WORKER_BASE is None
+        or _VITRO_SCREEN_WORKER_TICKS is None
+        or _VITRO_SCREEN_WORKER_SEED is None
+        or _VITRO_SCREEN_WORKER_REPS is None
+        or _VITRO_SCREEN_WORKER_DIRECTION is None
+        or _VITRO_SCREEN_WORKER_DOSE is None
+        or _VITRO_SCREEN_WORKER_MEAS_NAMES is None
+    ):
+        raise ValueError("in vitro screen worker not initialized")
+
+    base = _VITRO_SCREEN_WORKER_BASE
+    ticks_i = int(_VITRO_SCREEN_WORKER_TICKS)
+    seed_i = int(_VITRO_SCREEN_WORKER_SEED)
+    reps_i = int(_VITRO_SCREEN_WORKER_REPS)
+    direction = str(_VITRO_SCREEN_WORKER_DIRECTION)
+    dose = float(_VITRO_SCREEN_WORKER_DOSE)
+    names = [str(x) for x in (_VITRO_SCREEN_WORKER_MEAS_NAMES or []) if isinstance(x, str) and x]
+
+    p = _deepcopy_payload(base)
+    layer = str(layer_name or "").strip()
+    if layer:
+        tiv0 = p.get("_tick_interventions")
+        tiv = list(tiv0) if isinstance(tiv0, list) else []
+        tiv.append({"layer": layer, "direction": direction, "dose": dose})
+        p["_tick_interventions"] = tiv
+
+    out0 = _cell_culture_measurements_end_sample_from_payload(
+        p,
+        ticks=int(ticks_i),
+        seed=int(seed_i),
+        replicates=int(reps_i),
+        selected_names=names,
+        condition_index=int(layer_index + 2),
+    )
+    return {
+        "layer": str(layer),
+        "layer_index": int(layer_index),
+        "measurements_end_sample": out0.get("measurements_end_sample"),
+    }
 
 
 def _invivo_screen_worker_eval(layer_index: int, layer_name: str) -> Dict[str, Any]:
@@ -1550,7 +2539,10 @@ def _invivo_screen_worker_eval(layer_index: int, layer_name: str) -> Dict[str, A
     p = _deepcopy_payload(base)
     layer = str(layer_name or "").strip()
     if layer:
-        _apply_interventions_to_payload_inplace(p, [{"layer": layer, "direction": direction, "dose": dose}])
+        tiv0 = p.get("_tick_interventions")
+        tiv = list(tiv0) if isinstance(tiv0, list) else []
+        tiv.append({"layer": layer, "direction": direction, "dose": dose})
+        p["_tick_interventions"] = tiv
 
     death_ticks: list[int] = []
     for ri in range(int(reps_i)):
@@ -2240,6 +3232,13 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def _sha256_text(text: str) -> str:
     h = hashlib.sha256()
     h.update(text.encode("utf-8"))
@@ -2253,6 +3252,10 @@ def _ensure_dirs() -> None:
         pass
     try:
         _WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        _OMICS_RUNS_DIR.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
 
@@ -2277,6 +3280,749 @@ def _docs_safe_path(name: str) -> Path:
     if str(out).startswith(str(base) + os.sep) or out == base:
         return out
     raise ValueError("bad name")
+
+
+def _omics_safe_run_id(run_id: Any) -> str:
+    rid = str(run_id or "").strip()
+    if not rid:
+        raise ValueError("missing run_id")
+    if "\x00" in rid:
+        raise ValueError("bad run_id")
+    if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in rid):
+        raise ValueError("bad run_id")
+    if len(rid) > 80:
+        raise ValueError("bad run_id")
+    return rid
+
+
+def _omics_safe_relpath(name: Any) -> Path:
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("missing name")
+    if "\x00" in nm:
+        raise ValueError("bad name")
+    if nm.startswith("/") or nm.startswith("\\"):
+        raise ValueError("bad name")
+    if ":" in nm:
+        raise ValueError("bad name")
+    p = Path(nm)
+    if p.is_absolute():
+        raise ValueError("bad name")
+    if any(part in ("..", "") for part in p.parts):
+        raise ValueError("bad name")
+    return p
+
+
+def _omics_safe_label(v: Any, default: str = "item") -> str:
+    s = str(v or "").strip()
+    if not s:
+        s = str(default or "item")
+    out: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch in ("_", "-"):
+            out.append(ch)
+        else:
+            out.append("_")
+    ss = "".join(out).strip("_")
+    if not ss:
+        ss = str(default or "item")
+    return ss[:80]
+
+
+class _OmicsWorkspace:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        try:
+            _ensure_dirs()
+        except Exception:
+            pass
+
+    def _run_dir(self, run_id: str) -> Path:
+        rid = _omics_safe_run_id(run_id)
+        out = (_OMICS_RUNS_DIR / rid).resolve()
+        base = _OMICS_RUNS_DIR.resolve()
+        if str(out).startswith(str(base) + os.sep):
+            return out
+        raise ValueError("bad run_id")
+
+    def _run_manifest_path(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "manifest.json"
+
+    def create_run(self, manifest: Dict[str, Any], files_text: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            created_at = time.time()
+
+            rid_in: Optional[str] = None
+            if isinstance(manifest, dict):
+                try:
+                    rid_in = str(manifest.get("run_id") or "").strip() or None
+                except Exception:
+                    rid_in = None
+
+            rid = ""
+            if rid_in:
+                try:
+                    rid_cand = _omics_safe_run_id(rid_in)
+                    run_dir_cand = (_OMICS_RUNS_DIR / rid_cand).resolve()
+                    base = _OMICS_RUNS_DIR.resolve()
+                    if str(run_dir_cand).startswith(str(base) + os.sep) and not run_dir_cand.exists():
+                        rid = rid_cand
+                except Exception:
+                    rid = ""
+            if not rid:
+                rid = uuid.uuid4().hex
+
+        run_dir = self._run_dir(rid)
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        mf: Dict[str, Any] = dict(manifest) if isinstance(manifest, dict) else {}
+        mf["run_id"] = str(rid)
+        mf["created_at"] = float(mf.get("created_at") or created_at)
+
+        written: list[Dict[str, Any]] = []
+        if isinstance(files_text, dict):
+            for name, content in files_text.items():
+                rel = _omics_safe_relpath(name)
+                p = (run_dir / rel).resolve()
+                if run_dir not in p.parents:
+                    raise ValueError("bad name")
+                try:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                if isinstance(content, (bytes, bytearray)):
+                    _atomic_write_bytes(p, bytes(content))
+                else:
+                    _atomic_write_text(p, str(content or ""))
+                try:
+                    sz = int(p.stat().st_size)
+                except Exception:
+                    sz = 0
+                written.append({"name": str(rel.as_posix()), "bytes": int(sz)})
+
+        mf["files"] = list(written)
+        _atomic_write_json(self._run_manifest_path(rid), mf)
+        return {"run_id": str(rid), "created_at": float(mf.get("created_at") or created_at), "files": list(written)}
+
+    def list_runs(self, limit: int = 200) -> list[Dict[str, Any]]:
+        out: list[Dict[str, Any]] = []
+        try:
+            base = _OMICS_RUNS_DIR.resolve()
+            if not base.exists() or not base.is_dir():
+                return []
+            for ent in base.iterdir():
+                if not ent.is_dir():
+                    continue
+                mp = (ent / "manifest.json").resolve()
+                if not mp.exists() or not mp.is_file():
+                    continue
+                dd = _safe_read_json(mp)
+                if isinstance(dd, dict):
+                    out.append(dd)
+        except Exception:
+            return []
+
+        def _key(d: Dict[str, Any]) -> float:
+            try:
+                return float(d.get("created_at") or 0.0)
+            except Exception:
+                return 0.0
+
+        out.sort(key=_key, reverse=True)
+        return out[: max(1, int(limit))]
+
+    def _file_id(self, run_id: str, name: str) -> str:
+        rid = _omics_safe_run_id(run_id)
+        rel = _omics_safe_relpath(name)
+        s = f"{rid}:{rel.as_posix()}".encode("utf-8")
+        return hashlib.sha1(s).hexdigest()[:12]
+
+    def _friendly_kind(self, kind: Any) -> str:
+        k = str(kind or "").strip().lower()
+        if k == "bulk_rnaseq":
+            return "Bulk RNA-seq"
+        if k == "bulk_proteomics":
+            return "Bulk proteomics"
+        if k == "bulk_metabolomics":
+            return "Bulk metabolomics"
+        if k == "spatial_transcriptomics":
+            return "Spatial transcriptomics"
+        if k == "characterization":
+            return "Characterization"
+        if k == "protein_screen":
+            return "Drug screen"
+        if k == "claim_cure":
+            return "In vivo lifespan study (win claim)"
+        if k:
+            return str(kind)
+        return "Omics"
+
+    def _file_role(self, name: str) -> str:
+        n = str(name or "")
+        if n.endswith("_cell_metadata.csv"):
+            return "cell_metadata"
+        if n.endswith("_matrix.csv"):
+            return "counts_matrix"
+        if n.endswith("_measurements.csv"):
+            return "measurements"
+        bn = Path(n).name
+        if bn.startswith("summarized_results_") and bn.endswith(".csv"):
+            return "summarized_results"
+        if n.endswith("_metadata.csv") or bn == "metadata.csv" or (bn.startswith("metadata_") and bn.endswith(".csv")):
+            return "run_metadata"
+        if n.startswith("samples_truth/") or ("/samples_truth/" in n) or ("samples_truth/" in n):
+            return "counts_truth"
+        if n.startswith("samples_noisy/") or ("/samples_noisy/" in n) or ("samples_noisy/" in n):
+            return "counts_noisy"
+        if n.startswith("samples/"):
+            return "counts_noisy"
+        if n.endswith("_timecourse_n.csv"):
+            return "timecourse_n"
+        if n.endswith("_timecourse.csv"):
+            return "timecourse"
+        if n.endswith("_death.csv"):
+            return "death"
+        if n.endswith("_survival.csv"):
+            return "survival"
+        if n.endswith("_culture_metrics.csv"):
+            return "culture_metrics"
+        return "file"
+
+    def _extract_condition_replicate(self, name: str) -> tuple[str, Optional[int]]:
+        n = str(name or "")
+        bn = Path(n).name
+        if bn == "metadata.csv" or (bn.startswith("metadata_") and bn.endswith(".csv")):
+            return "", None
+        if bn.startswith("summarized_results_") and bn.endswith(".csv"):
+            return "", None
+        base = Path(n).stem
+        m = re.search(r"_r(\d+)", base)
+        rep = None
+        if m:
+            try:
+                rep = int(m.group(1))
+            except Exception:
+                rep = None
+        cond = ""
+        if base:
+            cond = base
+            if "_r" in cond:
+                cond = cond.split("_r", 1)[0]
+            if "_c" in cond:
+                cond = cond.split("_c", 1)[0]
+            if cond.startswith("replicates/"):
+                cond = cond.split("/", 1)[-1]
+            for suf in ("_timecourse_n", "_timecourse", "_death", "_survival", "_culture_metrics", "_measurements"):
+                if cond.endswith(suf):
+                    cond = cond[: -len(suf)]
+                    break
+        return str(cond or ""), rep
+
+    def inventory(self, player_id_in: Any, *, limit_runs: int = 2000) -> Dict[str, Any]:
+        pid = _sanitize_player_id(player_id_in)
+        runs = self.list_runs(limit=int(limit_runs))
+        files_out: list[Dict[str, Any]] = []
+        datasets_out: list[Dict[str, Any]] = []
+
+        for mf in runs:
+            if not isinstance(mf, dict):
+                continue
+            if str(mf.get("player_id") or "") != str(pid):
+                continue
+            rid = str(mf.get("run_id") or "")
+            if not rid:
+                continue
+            created_at = mf.get("created_at")
+            exp = str(mf.get("experiment") or "")
+            kind = str(mf.get("kind") or "")
+            friendly_kind = self._friendly_kind(kind)
+
+            model_s = str(mf.get("model") or "")
+            ticks_i = 0
+            age_days_i = 0
+            reps_i = 0
+            try:
+                ticks_i = int(mf.get("ticks") or 0)
+            except Exception:
+                ticks_i = 0
+            try:
+                age_days_i = int(mf.get("age_days") or ticks_i)
+            except Exception:
+                age_days_i = int(ticks_i)
+            try:
+                reps_i = int(mf.get("replicates") or 0)
+            except Exception:
+                reps_i = 0
+            omics_set_s = str(mf.get("omics_set") or "")
+            gene_set_s = str(mf.get("gene_set") or "")
+
+            ds_parts: list[str] = []
+            if exp:
+                ds_parts.append(exp)
+            if friendly_kind:
+                ds_parts.append(friendly_kind)
+            if model_s:
+                ds_parts.append(f"model={model_s}")
+            if omics_set_s:
+                ds_parts.append(f"omics_set={omics_set_s}")
+            if gene_set_s:
+                ds_parts.append(f"gene_set={gene_set_s}")
+            if age_days_i:
+                ds_parts.append(f"age_days={int(age_days_i)}")
+            if reps_i:
+                ds_parts.append(f"replicates={int(reps_i)}")
+            dataset_display_name = " | ".join([p for p in ds_parts if str(p).strip()])
+            if not dataset_display_name:
+                dataset_display_name = f"{friendly_kind} | run_id={rid}"
+
+            prefix_parts: list[str] = []
+            if exp:
+                prefix_parts.append(str(exp))
+            if kind:
+                prefix_parts.append(str(kind))
+            if model_s:
+                prefix_parts.append(str(model_s))
+            if omics_set_s:
+                prefix_parts.append(str(omics_set_s))
+            if gene_set_s:
+                prefix_parts.append(str(gene_set_s))
+            if age_days_i:
+                prefix_parts.append(f"age_{int(age_days_i)}")
+            dataset_prefix = _omics_safe_label("_".join([x for x in prefix_parts if str(x).strip()]), default="omics")
+
+            dataset_obj: Dict[str, Any] = {
+                "run_id": str(rid),
+                "created_at": created_at,
+                "experiment": str(exp),
+                "kind": str(kind),
+                "friendly_kind": str(friendly_kind),
+                "model": str(model_s),
+                "ticks": int(ticks_i),
+                "age_days": int(age_days_i),
+                "replicates": int(reps_i),
+                "omics_set": str(omics_set_s),
+                "gene_set": str(gene_set_s),
+                "display_name": str(dataset_display_name),
+                "dataset_prefix": str(dataset_prefix),
+                "files": [],
+                "data_files": [],
+                "metadata_files": [],
+                "metadata_map": {},
+            }
+
+            f0 = mf.get("files")
+            if not isinstance(f0, list):
+                f0 = []
+
+            by_name: Dict[str, Dict[str, Any]] = {}
+            for ent in f0:
+                if not isinstance(ent, dict):
+                    continue
+                name = str(ent.get("name") or "")
+                if not name:
+                    continue
+                try:
+                    fid = self._file_id(rid, name)
+                except Exception:
+                    continue
+                role = self._file_role(name)
+                cond, rep = self._extract_condition_replicate(name)
+
+                llm_fn = ""
+                if role in ("counts_noisy", "counts_truth", "counts_matrix"):
+                    suf = ""
+                    if role == "counts_noisy":
+                        suf = "counts_noisy"
+                    elif role == "counts_truth":
+                        suf = "counts_truth"
+                    else:
+                        suf = "counts_matrix"
+                    if rep is not None:
+                        llm_fn = f"{dataset_prefix}_replicate_{int(rep)}_{suf}.csv"
+                    elif cond:
+                        llm_fn = f"{dataset_prefix}_{_omics_safe_label(cond, default='condition')}_{suf}.csv"
+                    else:
+                        llm_fn = f"{dataset_prefix}_{suf}.csv"
+                elif role == "measurements":
+                    if rep is not None:
+                        llm_fn = f"{dataset_prefix}_replicate_{int(rep)}_measurements.csv"
+                    elif cond:
+                        llm_fn = f"{dataset_prefix}_{_omics_safe_label(cond, default='condition')}_measurements.csv"
+                    else:
+                        llm_fn = f"{dataset_prefix}_measurements.csv"
+                elif role == "summarized_results":
+                    llm_fn = f"{dataset_prefix}_summarized_results.csv"
+                elif role == "timecourse":
+                    if rep is not None:
+                        llm_fn = f"{dataset_prefix}_replicate_{int(rep)}_timecourse.csv"
+                    else:
+                        llm_fn = f"{dataset_prefix}_timecourse.csv"
+                elif role == "timecourse_n":
+                    if rep is not None:
+                        llm_fn = f"{dataset_prefix}_replicate_{int(rep)}_timecourse_n.csv"
+                    else:
+                        llm_fn = f"{dataset_prefix}_timecourse_n.csv"
+                elif role == "death":
+                    llm_fn = f"{dataset_prefix}_death.csv"
+                elif role == "survival":
+                    llm_fn = f"{dataset_prefix}_survival.csv"
+                elif role == "culture_metrics":
+                    llm_fn = f"{dataset_prefix}_culture_metrics.csv"
+                elif role == "run_metadata":
+                    llm_fn = f"{dataset_prefix}_metadata.csv"
+                elif role == "cell_metadata":
+                    if rep is not None:
+                        llm_fn = f"{dataset_prefix}_replicate_{int(rep)}_cell_metadata.csv"
+                    else:
+                        llm_fn = f"{dataset_prefix}_cell_metadata.csv"
+                else:
+                    llm_fn = f"{dataset_prefix}_{_omics_safe_label(Path(name).name, default='file')}"
+
+                display = friendly_kind
+                if role == "counts_matrix":
+                    display += " counts matrix"
+                elif role == "counts_noisy":
+                    display += " counts (noisy)"
+                elif role == "counts_truth":
+                    display += " counts (truth)"
+                elif role == "measurements":
+                    display += " measurements"
+                elif role == "summarized_results":
+                    display += " summarized results"
+                elif role == "timecourse":
+                    display += " timecourse"
+                elif role == "timecourse_n":
+                    display += " timecourse_n"
+                elif role == "death":
+                    display += " death table"
+                elif role == "survival":
+                    display += " survival"
+                elif role == "culture_metrics":
+                    display += " culture metrics"
+                elif role == "cell_metadata":
+                    display += " cell metadata"
+                elif role == "run_metadata":
+                    display += " run metadata"
+                else:
+                    display += " file"
+                if cond:
+                    display += f" — {cond}"
+                if rep is not None:
+                    display += f" (replicate {int(rep)})"
+                if exp:
+                    display += f" [{exp}]"
+
+                files_out.append(
+                    {
+                        "file_id": str(fid),
+                        "llm_filename": str(llm_fn),
+                        "display_name": str(display),
+                        "role": str(role),
+                        "kind": str(kind),
+                        "experiment": str(exp),
+                        "condition": str(cond),
+                        "replicate": int(rep) if rep is not None else None,
+                        "run_id": str(rid),
+                        "name": str(name),
+                        "bytes": int(ent.get("bytes") or 0),
+                        "created_at": created_at,
+                        "download_url": f"/api/omics/file?player_id={pid}&file_id={fid}",
+                    }
+                )
+
+                f_ent = dict(files_out[-1])
+                dataset_obj["files"].append(f_ent)
+                by_name[str(name)] = f_ent
+                if str(role) in (
+                    "counts_noisy",
+                    "counts_truth",
+                    "counts_matrix",
+                    "measurements",
+                    "summarized_results",
+                    "timecourse",
+                    "timecourse_n",
+                    "death",
+                    "survival",
+                    "culture_metrics",
+                ):
+                    dataset_obj["data_files"].append(f_ent)
+                if str(role) in ("run_metadata", "cell_metadata"):
+                    dataset_obj["metadata_files"].append(f_ent)
+
+            run_meta_file = None
+            for f_ent in dataset_obj.get("files") or []:
+                if not isinstance(f_ent, dict):
+                    continue
+                if str(f_ent.get("role") or "") == "run_metadata":
+                    run_meta_file = f_ent
+                    break
+
+            metadata_map: Dict[str, Any] = {}
+            for f_ent in dataset_obj.get("data_files") or []:
+                if not isinstance(f_ent, dict):
+                    continue
+                nm = str(f_ent.get("name") or "")
+                metas: list[Dict[str, Any]] = []
+                if isinstance(run_meta_file, dict):
+                    metas.append(run_meta_file)
+                if nm.endswith("_matrix.csv"):
+                    meta_name = nm[:-len("_matrix.csv")] + "_cell_metadata.csv"
+                    m2 = by_name.get(meta_name)
+                    if isinstance(m2, dict):
+                        metas.append(m2)
+                metadata_map[str(f_ent.get("file_id") or "")] = {
+                    "data_file": f_ent,
+                    "metadata_files": metas,
+                }
+            dataset_obj["metadata_map"] = metadata_map
+
+            datasets_out.append(dataset_obj)
+
+        files_out.sort(key=lambda d: (str(d.get("kind") or ""), str(d.get("condition") or ""), str(d.get("role") or ""), int(d.get("replicate") or -1), str(d.get("file_id") or "")))
+
+        groups: Dict[str, Dict[str, Any]] = {}
+        for f in files_out:
+            role = str(f.get("role") or "")
+            kind = str(f.get("kind") or "")
+            cond = str(f.get("condition") or "")
+            if role not in ("counts_noisy", "counts_truth", "counts_matrix"):
+                continue
+            gid = f"{kind}:{cond}:{role}".strip(":")
+            if gid not in groups:
+                gname = self._friendly_kind(kind)
+                if role == "counts_noisy":
+                    gname += " counts (noisy)"
+                elif role == "counts_truth":
+                    gname += " counts (truth)"
+                else:
+                    gname += " counts matrix"
+                if cond:
+                    gname += f" — {cond}"
+                groups[gid] = {
+                    "group_id": gid,
+                    "display_name": gname,
+                    "kind": kind,
+                    "role": role,
+                    "condition": cond,
+                    "file_ids": [],
+                }
+            groups[gid]["file_ids"].append(str(f.get("file_id") or ""))
+
+        groups_out = list(groups.values())
+        groups_out.sort(key=lambda d: str(d.get("group_id") or ""))
+
+        def _ds_key(d: Dict[str, Any]) -> float:
+            try:
+                return float(d.get("created_at") or 0.0)
+            except Exception:
+                return 0.0
+
+        datasets_out.sort(key=_ds_key, reverse=True)
+
+        llm_lines: list[str] = []
+        analysis_data_hint = "data files"
+        analysis_step2_note = ""
+        if datasets_out:
+            recent = datasets_out[0]
+            rk = str(recent.get("kind") or "").strip().lower()
+
+            is_spatial = bool(str(recent.get("gene_set") or "").strip())
+            if not is_spatial:
+                for f_ent in (recent.get("metadata_files") or []):
+                    if not isinstance(f_ent, dict):
+                        continue
+                    if str(f_ent.get("role") or "") == "cell_metadata":
+                        is_spatial = True
+                        break
+
+            if rk == "characterization":
+                llm_lines.append("Your most recent characterization run produced the following files:")
+                analysis_data_hint = "timecourse tables"
+            elif rk == "claim_cure":
+                llm_lines.append("Your most recent in vivo lifespan study (win claim) produced the following files:")
+                analysis_data_hint = "summarized results tables"
+            elif rk == "protein_screen":
+                llm_lines.append("Your most recent drug screen run produced the following files:")
+                analysis_data_hint = "measurements tables"
+            elif is_spatial:
+                if rk == "bulk_proteomics":
+                    llm_lines.append("Your most recent spatial proteomics run produced the following files:")
+                else:
+                    llm_lines.append("Your most recent spatial transcriptomics run produced the following files:")
+                analysis_data_hint = "spatial count matrices"
+                analysis_step2_note = " (For spatial: include BOTH run metadata and per-replicate cell_metadata when present.)"
+            elif rk.startswith("bulk_"):
+                llm_lines.append("Your most recent omics generation produced the following files:")
+                analysis_data_hint = "counts matrices"
+            else:
+                llm_lines.append("Your most recent run produced the following files:")
+            ds_name = str(recent.get("display_name") or "").strip()
+            if ds_name:
+                llm_lines.append(f"Dataset: {ds_name}")
+
+            recent_data = recent.get("data_files")
+            if not isinstance(recent_data, list):
+                recent_data = []
+            for f_ent in recent_data:
+                if not isinstance(f_ent, dict):
+                    continue
+                fn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
+                fid = str(f_ent.get("file_id") or "")
+                if fn and fid:
+                    llm_lines.append(f"- {fn} (file_id={fid})")
+
+            meta_map = recent.get("metadata_map")
+            if isinstance(meta_map, dict) and recent_data:
+                llm_lines.append("")
+                llm_lines.append("Metadata mapping (what to load alongside each data file):")
+                for f_ent in recent_data:
+                    if not isinstance(f_ent, dict):
+                        continue
+                    dfid = str(f_ent.get("file_id") or "")
+                    dfn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
+                    if not dfid or not dfn:
+                        continue
+                    mm = meta_map.get(dfid)
+                    if not isinstance(mm, dict):
+                        continue
+                    mfiles = mm.get("metadata_files")
+                    if not isinstance(mfiles, list) or not mfiles:
+                        continue
+                    mrefs: list[str] = []
+                    for mf in mfiles:
+                        if not isinstance(mf, dict):
+                            continue
+                        mfn = str(mf.get("llm_filename") or mf.get("name") or "")
+                        mfid = str(mf.get("file_id") or "")
+                        if mfn and mfid:
+                            mrefs.append(f"{mfn} (file_id={mfid})")
+                    if mrefs:
+                        llm_lines.append(f"- {dfn} -> " + ", ".join(mrefs))
+
+            if len(datasets_out) > 1:
+                llm_lines.append("")
+                llm_lines.append("In addition to the recently produced files you also have the following datasets available:")
+                for ds in datasets_out[1:]:
+                    if not isinstance(ds, dict):
+                        continue
+                    llm_lines.append("")
+                    llm_lines.append(f"Dataset: {str(ds.get('display_name') or '')}")
+                    data_files = ds.get("data_files")
+                    if not isinstance(data_files, list):
+                        data_files = []
+                    for f_ent in data_files[:12]:
+                        if not isinstance(f_ent, dict):
+                            continue
+                        fn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
+                        fid = str(f_ent.get("file_id") or "")
+                        if fn and fid:
+                            llm_lines.append(f"- {fn} (file_id={fid})")
+                    meta_file = None
+                    for f_ent in (ds.get("files") or []):
+                        if not isinstance(f_ent, dict):
+                            continue
+                        if str(f_ent.get("role") or "") == "run_metadata":
+                            meta_file = f_ent
+                            break
+                    if isinstance(meta_file, dict):
+                        fn = str(meta_file.get("llm_filename") or meta_file.get("name") or "")
+                        fid = str(meta_file.get("file_id") or "")
+                        if fn and fid:
+                            llm_lines.append("Whose run-level metadata is in file:")
+                            llm_lines.append(f"- {fn} (file_id={fid})")
+        else:
+            llm_lines.append("No files are available for this player_id yet.")
+
+        llm_lines.append("")
+        llm_lines.append("To perform an analysis:")
+        llm_lines.append(f"1) Choose the file_id(s) for the data you want to analyze (typically {analysis_data_hint}).")
+        llm_lines.append(f"2) Include the matching metadata file_id(s) shown in the mapping above.{analysis_step2_note}")
+        llm_lines.append("3) Think of the instructions for the analysis you want to run. If you are not sure what the data/metadata looks like ask and then you can ask again to analyze.")
+        llm_lines.append("4) If you need more samples to run the analysis run more samples before asking for the analysis. For example if you asked for an experiment with cell_culture_cancer, you might want to run the same experiment with cell_culture_healthy to get a control to compare to.")
+        llm_lines.append("5) Call POST /api/omics/analyze with JSON like:")
+        llm_lines.append('{"player_id":"<player_id>","file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}')
+
+        llm_message = "\n".join([str(x) for x in llm_lines if isinstance(x, str)])
+
+        return {
+            "player_id": str(pid),
+            "files": files_out,
+            "groups": groups_out,
+            "datasets": datasets_out,
+            "llm_message": llm_message,
+        }
+
+    def resolve_player_file_ids(self, player_id_in: Any, file_ids: list[str]) -> list[Dict[str, Any]]:
+        inv = self.inventory(player_id_in)
+        files = inv.get("files")
+        if not isinstance(files, list):
+            return []
+        wanted = set(str(x or "") for x in (file_ids or []) if str(x or "").strip())
+        out: list[Dict[str, Any]] = []
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            fid = str(f.get("file_id") or "")
+            if fid and fid in wanted:
+                out.append(f)
+        return out
+
+    def get_run(self, run_id: str) -> Dict[str, Any]:
+        rid = _omics_safe_run_id(run_id)
+        mp = self._run_manifest_path(rid)
+        dd = _safe_read_json(mp)
+        if not isinstance(dd, dict):
+            raise ValueError("run not found")
+        return dd
+
+    def list_files(self, run_id: str) -> list[Dict[str, Any]]:
+        rid = _omics_safe_run_id(run_id)
+        run_dir = self._run_dir(rid)
+        files: list[Dict[str, Any]] = []
+        try:
+            for p in run_dir.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(run_dir)
+                if rel.as_posix() == "manifest.json":
+                    continue
+                try:
+                    sz = int(p.stat().st_size)
+                except Exception:
+                    sz = 0
+                files.append({"name": str(rel.as_posix()), "bytes": int(sz)})
+        except Exception:
+            return []
+        files.sort(key=lambda d: str(d.get("name") or ""))
+        return files
+
+    def read_file_bytes(self, run_id: str, name: str) -> bytes:
+        rid = _omics_safe_run_id(run_id)
+        rel = _omics_safe_relpath(name)
+        run_dir = self._run_dir(rid)
+        p = (run_dir / rel).resolve()
+        if run_dir not in p.parents:
+            raise ValueError("bad name")
+        if not p.exists() or not p.is_file():
+            raise ValueError("file not found")
+        try:
+            return p.read_bytes()
+        except Exception as e:
+            raise ValueError(str(e))
+
+    def file_path(self, run_id: str, name: str) -> Path:
+        rid = _omics_safe_run_id(run_id)
+        rel = _omics_safe_relpath(name)
+        run_dir = self._run_dir(rid)
+        p = (run_dir / rel).resolve()
+        if run_dir not in p.parents:
+            raise ValueError("bad name")
+        if not p.exists() or not p.is_file():
+            raise ValueError("file not found")
+        return p
 
 
 class _DocWorkspace:
@@ -2514,6 +4260,7 @@ class _DocWorkspace:
 
 
 _DOC = _DocWorkspace()
+_OMICS = _OmicsWorkspace()
 
 
 def _evo_runs_ensure_dir() -> None:
@@ -5851,14 +7598,25 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_bytes(self, code: int, data: bytes, *, content_type: str = "application/octet-stream", filename: str = "") -> None:
+        raw = bytes(data or b"")
+        self.send_response(int(code))
+        self.send_header("Content-Type", str(content_type or "application/octet-stream"))
+        if isinstance(filename, str) and filename.strip():
+            safe_fn = str(Path(filename).name)
+            self.send_header("Content-Disposition", f"attachment; filename=\"{safe_fn}\"")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def _read_json_body(self) -> Dict[str, Any]:
         try:
-            n = int(self.headers.get("Content-Length") or "0")
+            length = int(self.headers.get("Content-Length") or "0")
         except Exception:
-            n = 0
-        if n <= 0:
+            length = 0
+        if length <= 0:
             return {}
-        raw = self.rfile.read(n)
+        raw = self.rfile.read(length)
         try:
             obj = json.loads(raw.decode("utf-8"))
         except Exception as e:
@@ -5867,14 +7625,72 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
             raise ValueError("json body must be an object")
         return obj
 
+    def do_HEAD(self):  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/testing_api_points":
+            self.path = "/testing_api_points.html"
+        return super().do_HEAD()
+
     def do_GET(self):  # noqa: N802
         t0 = time.time()
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
         try:
+            if path == "/testing_api_points":
+                self.path = "/testing_api_points.html"
+                super().do_GET()
+                return
             if path == "/api/health":
                 self._send_json(200, {"ok": True, "tick": int(_RT.tick)})
+                return
+            if path in ("/api/tests/cancer/models", "/api/tests/hereditary_disease/models", "/api/tests/aging/models"):
+                if path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                self._send_json(200, {"ok": True, "challenge": challenge, "models": _tests_model_list_for_challenge(challenge)})
+                return
+            if path in ("/api/tests/cancer/proteins", "/api/tests/hereditary_disease/proteins", "/api/tests/aging/proteins"):
+                if path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                mk = ""
+                try:
+                    qv = qs.get("model")
+                    if isinstance(qv, list) and qv:
+                        mk = str(qv[0] or "")
+                except Exception:
+                    mk = ""
+                real_to_mask, _ = _tests_get_protein_mask_maps(mk, challenge=challenge)
+                layers = [real_to_mask.get(k) for k in _protein_layer_names_from_payload(_tests_load_model_payload_for_challenge(challenge, mk))]
+                layers2 = [str(x) for x in layers if isinstance(x, str) and x]
+                self._send_json(200, {"ok": True, "challenge": challenge, "model": str(mk), "proteins": layers2})
+                return
+            if path in ("/api/tests/cancer/protein_layers", "/api/tests/hereditary_disease/protein_layers", "/api/tests/aging/protein_layers"):
+                if path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                mk = ""
+                try:
+                    qv = qs.get("model")
+                    if isinstance(qv, list) and qv:
+                        mk = str(qv[0] or "")
+                except Exception:
+                    mk = ""
+                real_to_mask, _ = _tests_get_protein_mask_maps(mk, challenge=challenge)
+                layers = [real_to_mask.get(k) for k in _protein_layer_names_from_payload(_tests_load_model_payload_for_challenge(challenge, mk))]
+                layers2 = [str(x) for x in layers if isinstance(x, str) and x]
+                self._send_json(200, {"ok": True, "challenge": challenge, "model": str(mk), "protein_layers": layers2})
                 return
             if path == "/api/spatial_tx/gene_sets":
                 self._send_json(200, {"ok": True, "gene_sets": _list_stx_gene_sets()})
@@ -5891,6 +7707,116 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 except Exception:
                     pid = ""
                 self._send_json(200, {"ok": True, "game": _game_get_player_state(pid)})
+                return
+            if path == "/api/omics/runs":
+                limit_i = 200
+                try:
+                    qv = qs.get("limit")
+                    if isinstance(qv, list) and qv:
+                        limit_i = int(qv[0])
+                except Exception:
+                    limit_i = 200
+                runs = _OMICS.list_runs(limit=int(limit_i))
+                out_runs: list[Dict[str, Any]] = []
+                for r in runs:
+                    if not isinstance(r, dict):
+                        continue
+                    out_runs.append(
+                        {
+                            "run_id": str(r.get("run_id") or ""),
+                            "created_at": float(r.get("created_at") or 0.0),
+                            "experiment": str(r.get("experiment") or ""),
+                            "kind": str(r.get("kind") or ""),
+                            "model": str(r.get("model") or ""),
+                            "ticks": int(r.get("ticks") or 0),
+                            "replicates": int(r.get("replicates") or 0),
+                            "omics_set": str(r.get("omics_set") or ""),
+                            "gene_set": str(r.get("gene_set") or ""),
+                        }
+                    )
+
+                self._send_json(200, {"ok": True, "runs": out_runs})
+                return
+            if path == "/api/omics/inventory":
+                pid = ""
+                try:
+                    qv = qs.get("player_id")
+                    if isinstance(qv, list) and qv:
+                        pid = str(qv[0] or "")
+                except Exception:
+                    pid = ""
+                if not pid:
+                    raise ValueError("missing player_id")
+                inv = _OMICS.inventory(pid)
+                self._send_json(200, {"ok": True, **inv})
+                return
+            if path == "/api/omics/run":
+                rid = ""
+                try:
+                    qv = qs.get("run_id")
+                    if isinstance(qv, list) and qv:
+                        rid = str(qv[0] or "")
+                except Exception:
+                    rid = ""
+                if not rid:
+                    raise ValueError("missing run_id")
+                manifest = _OMICS.get_run(rid)
+                files = _OMICS.list_files(rid)
+                self._send_json(200, {"ok": True, "run": manifest, "files": files})
+                return
+            if path == "/api/omics/file":
+                rid = ""
+                name = ""
+                pid = ""
+                fid = ""
+                try:
+                    qv = qs.get("run_id")
+                    if isinstance(qv, list) and qv:
+                        rid = str(qv[0] or "")
+                except Exception:
+                    rid = ""
+                try:
+                    qv = qs.get("player_id")
+                    if isinstance(qv, list) and qv:
+                        pid = str(qv[0] or "")
+                except Exception:
+                    pid = ""
+                try:
+                    qv = qs.get("file_id")
+                    if isinstance(qv, list) and qv:
+                        fid = str(qv[0] or "")
+                except Exception:
+                    fid = ""
+                try:
+                    qv = qs.get("name")
+                    if isinstance(qv, list) and qv:
+                        name = str(qv[0] or "")
+                except Exception:
+                    name = ""
+
+                if fid:
+                    if not pid:
+                        raise ValueError("missing player_id")
+                    matches = _OMICS.resolve_player_file_ids(pid, [fid])
+                    if not matches:
+                        raise ValueError("file not found")
+                    m0 = matches[0]
+                    rid = str(m0.get("run_id") or "")
+                    name = str(m0.get("name") or "")
+                if not rid:
+                    raise ValueError("missing run_id")
+                if not name:
+                    raise ValueError("missing name")
+
+                p = _OMICS.file_path(rid, name)
+                data = p.read_bytes()
+                ct = "application/octet-stream"
+                suf = p.suffix.lower()
+                if suf == ".csv":
+                    ct = "text/csv"
+                elif suf == ".json":
+                    ct = "application/json"
+                self._send_bytes(200, data, content_type=ct, filename=p.name)
                 return
             if path == "/api/doc/status":
                 self._send_json(200, _DOC.status())
@@ -5914,9 +7840,2126 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 self._send_json(200, _DOC.status())
                 return
 
+            if self.path == "/api/omics/analyze":
+                body = self._read_json_body()
+                run_id = body.get("run_id")
+                instructions = body.get("instructions")
+                files_req = body.get("files")
+                file_ids_req = body.get("file_ids")
+                player_id_req = body.get("player_id")
+                provider_req = body.get("provider")
+                model_req = body.get("model")
+                memory_limit_req = body.get("memory_limit")
+
+                if not isinstance(instructions, str) or not instructions.strip():
+                    raise ValueError("missing instructions")
+
+                def _mask_disease_term(text: str) -> str:
+                    t = str(text or "")
+                    if not t:
+                        return ""
+                    t = t.replace("/api/tests/cancer/", "/api/tests/disease/")
+                    t = t.replace("/api/tests/cancer", "/api/tests/disease")
+                    t = t.replace("/api/tests/hereditary_disease/", "/api/tests/disease/")
+                    t = t.replace("/api/tests/hereditary_disease", "/api/tests/disease")
+                    t = t.replace("/api/tests/aging/", "/api/tests/disease/")
+                    t = t.replace("/api/tests/aging", "/api/tests/disease")
+                    t = re.sub(r"cancerous", "diseased", t, flags=re.IGNORECASE)
+                    t = re.sub(r"cancer", "disease", t, flags=re.IGNORECASE)
+                    return t
+
+                instructions_prefix = (
+                    "You will be communicating with an LLM. Do not generate files, plots, or charts. "
+                    "Describe your findings in as much detail as possible using pure text. "
+                    "If helpful, you may include a small table in plain text."
+                )
+                instructions_eff = _mask_disease_term(instructions_prefix + "\n\n" + str(instructions))
+
+                prov = str(provider_req or "openai").strip().lower() or "openai"
+                if prov == "claude":
+                    prov = "anthropic"
+
+                selected: list[Dict[str, Any]] = []
+                if isinstance(file_ids_req, list) and file_ids_req:
+                    pid = _sanitize_player_id(player_id_req)
+                    if not pid:
+                        raise ValueError("missing player_id")
+                    fids = [str(x or "").strip() for x in file_ids_req]
+                    fids = [x for x in fids if x]
+                    if not fids:
+                        raise ValueError("no file_ids selected")
+                    selected = _OMICS.resolve_player_file_ids(pid, fids)
+                    if not selected:
+                        raise ValueError("no files selected")
+                else:
+                    if not isinstance(run_id, str) or not run_id.strip():
+                        raise ValueError("missing run_id")
+                    manifest = _OMICS.get_run(run_id)
+                    all_files = _OMICS.list_files(run_id)
+                    all_names = [str(f.get("name") or "") for f in all_files if isinstance(f, dict)]
+                    all_names = [n for n in all_names if n]
+
+                    if isinstance(files_req, list) and files_req:
+                        req_names = [str(x or "") for x in files_req]
+                        req_names = [n for n in req_names if n]
+                        names = [n for n in req_names if n in set(all_names)]
+                    else:
+                        names = list(all_names)
+                    if not names:
+                        raise ValueError("no files selected")
+                    for nm in names:
+                        selected.append({"run_id": str(run_id), "name": str(nm)})
+
+                manifest = None
+                try:
+                    if isinstance(run_id, str) and run_id.strip():
+                        manifest = _OMICS.get_run(run_id)
+                except Exception:
+                    manifest = None
+
+                model = "gpt-5.2"
+                memory_limit = str(memory_limit_req or "4g")
+                if memory_limit not in ("1g", "4g", "16g", "64g"):
+                    memory_limit = "4g"
+
+                if isinstance(model_req, str) and model_req.strip():
+                    model = str(model_req).strip()
+
+
+                if prov in ("openai", "openai_compat"):
+                    if OpenAI is None:
+                        raise ValueError("openai sdk not installed")
+                    api_key = os.environ.get("OPENAI_API_KEY")
+                    if not isinstance(api_key, str) or not api_key.strip():
+                        raise ValueError("missing OPENAI_API_KEY")
+
+                    client = OpenAI(api_key=api_key)
+                    file_ids: list[str] = []
+
+                    used_files: list[Dict[str, Any]] = []
+                    for ent in selected:
+                        rid0 = str(ent.get("run_id") or "")
+                        name0 = str(ent.get("name") or "")
+                        if not rid0 or not name0:
+                            continue
+                        p = _OMICS.file_path(rid0, name0)
+
+                        raw_bytes = b""
+                        try:
+                            raw_bytes = p.read_bytes()
+                        except Exception:
+                            raw_bytes = b""
+
+                        upload_name = str(p.name)
+                        suf = str(p.suffix or "").lower()
+                        if suf in (".csv", ".tsv", ".txt", ".json"):
+                            try:
+                                txt0 = raw_bytes.decode("utf-8", errors="replace")
+                                txt1 = _mask_disease_term(txt0)
+                                raw_bytes = txt1.encode("utf-8")
+                                upload_name = _mask_disease_term(upload_name)
+                            except Exception:
+                                pass
+
+                        bio = io.BytesIO(raw_bytes)
+                        try:
+                            bio.name = upload_name
+                        except Exception:
+                            pass
+                        fo = client.files.create(file=bio, purpose="user_data")
+                        fid = str(getattr(fo, "id", "") or "")
+                        if fid:
+                            file_ids.append(fid)
+                        used_files.append({
+                            "run_id": rid0,
+                            "name": name0,
+                            "file_id": str(ent.get("file_id") or ""),
+                            "display_name": str(ent.get("display_name") or name0),
+                        })
+
+                    tools = [
+                        {
+                            "type": "code_interpreter",
+                            "container": {"type": "auto", "file_ids": file_ids, "memory_limit": memory_limit},
+                        }
+                    ]
+                    resp = client.responses.create(
+                        model=model,
+                        input=str(instructions_eff),
+                        reasoning={"effort": "medium"},
+                        tools=tools,
+                        include=["code_interpreter_call.outputs"],
+                    )
+
+                    out_text = ""
+                    try:
+                        out_text = str(getattr(resp, "output_text", "") or "")
+                    except Exception:
+                        out_text = ""
+
+                    resp_dump: Any = None
+                    try:
+                        resp_dump = resp.model_dump()
+                    except Exception:
+                        resp_dump = None
+
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "run_id": str(run_id or ""),
+                            "manifest": manifest,
+                            "files": used_files,
+                            "provider": "openai",
+                            "openai": {
+                                "model": str(model),
+                                "memory_limit": str(memory_limit),
+                                "file_ids": file_ids,
+                            },
+                            "output_text": out_text,
+                            "response": resp_dump,
+                        },
+                    )
+                    return
+
+                if prov in ("anthropic",):
+                    api_key_a = os.environ.get("ANTHROPIC_API_KEY")
+                    if not isinstance(api_key_a, str) or not api_key_a.strip():
+                        raise ValueError("missing ANTHROPIC_API_KEY")
+
+                    used_files: list[Dict[str, Any]] = []
+                    file_ids: list[str] = []
+
+                    for ent in selected:
+                        rid0 = str(ent.get("run_id") or "")
+                        name0 = str(ent.get("name") or "")
+                        if not rid0 or not name0:
+                            continue
+                        p = _OMICS.file_path(rid0, name0)
+
+                        raw_bytes = b""
+                        try:
+                            raw_bytes = p.read_bytes()
+                        except Exception:
+                            raw_bytes = b""
+
+                        upload_name = str(p.name)
+                        suf = str(p.suffix or "").lower()
+                        if suf in (".csv", ".tsv", ".txt", ".json"):
+                            try:
+                                txt0 = raw_bytes.decode("utf-8", errors="replace")
+                                txt1 = _mask_disease_term(txt0)
+                                raw_bytes = txt1.encode("utf-8")
+                                upload_name = _mask_disease_term(upload_name)
+                            except Exception:
+                                pass
+
+                        up = _anthropic_upload_file(
+                            api_key=str(api_key_a),
+                            filename=str(upload_name),
+                            file_bytes=(raw_bytes or b""),
+                            timeout_s=60.0,
+                        )
+                        fid = str(up.get("id") or "")
+                        if fid:
+                            file_ids.append(fid)
+                        used_files.append({
+                            "run_id": rid0,
+                            "name": name0,
+                            "file_id": str(ent.get("file_id") or ""),
+                            "display_name": str(ent.get("display_name") or name0),
+                            "anthropic_file_id": fid,
+                        })
+
+                    if not file_ids:
+                        raise ValueError("no files uploaded")
+
+                    resp_json = _anthropic_messages_code_execution(
+                        api_key=str(api_key_a),
+                        model=str(model or "claude-sonnet-4-5"),
+                        instructions=str(instructions_eff),
+                        file_ids=list(file_ids),
+                        timeout_s=120.0,
+                    )
+                    out_text = _anthropic_message_text(resp_json if isinstance(resp_json, dict) else {})
+
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "run_id": str(run_id or ""),
+                            "manifest": manifest,
+                            "files": used_files,
+                            "provider": "anthropic",
+                            "anthropic": {
+                                "model": str(model),
+                                "file_ids": list(file_ids),
+                            },
+                            "output_text": str(out_text or ""),
+                            "response": resp_json,
+                        },
+                    )
+                    return
+
+                raise ValueError(f"unsupported provider: {prov}")
+
             if self.path == "/api/game/reset":
                 body = self._read_json_body()
                 self._send_json(200, {"ok": True, "game": _game_reset_player(body.get("player_id"))})
+                return
+
+            if self.path in ("/api/tests/cancer/estimate_cost", "/api/tests/hereditary_disease/estimate_cost", "/api/tests/aging/estimate_cost"):
+                if self.path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif self.path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                model_key = body.get("model")
+                exp = str(body.get("experiment") or "").strip().lower()
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+
+                if exp in ("bulk", "bulk_omics"):
+                    omics_set_req = body.get("omics_set")
+                    omics_set_name, _ = _load_bulk_omics_set(str(omics_set_req or ""))
+                    kind0 = _bulk_omics_kind_from_set_name(str(omics_set_name or ""))
+                    unit = _tests_compute_unit_cost_cents(
+                        challenge=challenge,
+                        kind=str(kind0),
+                        model_key=model_key,
+                        ticks=int(ticks_i),
+                        interventions_n=int(iv_n),
+                    )
+                    charge = _tests_make_charge(
+                        kind=f"tests_{challenge}_{str(kind0)}",
+                        samples=int(reps_i),
+                        unit_cost_cents=int(unit),
+                        meta={"experiment": f"tests_{challenge}_bulk_omics_v1", "player_id": _sanitize_player_id(player_id)},
+                    )
+                    self._send_json(200, {"ok": True, "charge": charge})
+                    return
+
+                if exp in ("spatial", "spatial_tx"):
+                    unit = _tests_compute_unit_cost_cents(
+                        challenge=challenge,
+                        kind="spatial_transcriptomics",
+                        model_key=model_key,
+                        ticks=int(ticks_i),
+                        interventions_n=int(iv_n),
+                    )
+                    charge = _tests_make_charge(
+                        kind=f"tests_{challenge}_spatial_transcriptomics",
+                        samples=int(reps_i),
+                        unit_cost_cents=int(unit),
+                        meta={"experiment": f"tests_{challenge}_spatial_tx_v1", "player_id": _sanitize_player_id(player_id)},
+                    )
+                    self._send_json(200, {"ok": True, "charge": charge})
+                    return
+
+                if exp in ("characterization", "char"):
+                    unit = _tests_compute_unit_cost_cents(
+                        challenge=challenge,
+                        kind="characterization",
+                        model_key=model_key,
+                        ticks=int(ticks_i),
+                        interventions_n=int(iv_n),
+                    )
+                    charge = _tests_make_charge(
+                        kind=f"tests_{challenge}_characterization",
+                        samples=int(reps_i),
+                        unit_cost_cents=int(unit),
+                        meta={"experiment": f"tests_{challenge}_characterization_v1", "player_id": _sanitize_player_id(player_id)},
+                    )
+                    self._send_json(200, {"ok": True, "charge": charge})
+                    return
+
+                if exp in ("protein_screen", "screen"):
+                    if not _tests_is_in_vitro_model(model_key):
+                        raise ValueError("protein_screen is only allowed for in vitro cell_culture_* models")
+                    payload0 = _tests_load_model_payload_for_challenge(challenge, model_key)
+                    prot_layers = _protein_layer_names_from_payload(payload0)
+                    samples_run = int(int(reps_i) * int(len(prot_layers) + 2))
+                    unit = _tests_compute_unit_cost_cents(
+                        challenge=challenge,
+                        kind="protein_screen",
+                        model_key=model_key,
+                        ticks=int(ticks_i),
+                        interventions_n=int(iv_n + 1),
+                    )
+                    charge = _tests_make_charge(
+                        kind=f"tests_{challenge}_protein_screen",
+                        samples=int(samples_run),
+                        unit_cost_cents=int(unit),
+                        meta={"experiment": f"tests_{challenge}_protein_screen_v1", "player_id": _sanitize_player_id(player_id)},
+                    )
+                    self._send_json(200, {"ok": True, "charge": charge})
+                    return
+
+                if exp in ("claim_cure", "cure"):
+                    ticks_i = 400
+                    disease_key = _tests_claim_cure_disease_model_key_for_challenge(challenge)
+                    unit = _tests_compute_unit_cost_cents(
+                        challenge=challenge,
+                        kind="claim_cure",
+                        model_key=str(disease_key),
+                        ticks=int(ticks_i),
+                        interventions_n=int(iv_n),
+                    )
+                    charge = _tests_make_charge(
+                        kind=f"tests_{challenge}_claim_cure",
+                        samples=int(2 * reps_i),
+                        unit_cost_cents=int(unit),
+                        meta={"experiment": f"tests_{challenge}_claim_cure_v1", "player_id": _sanitize_player_id(player_id)},
+                    )
+                    self._send_json(200, {"ok": True, "charge": charge})
+                    return
+
+                raise ValueError("unknown experiment")
+
+            if self.path in ("/api/tests/cancer/bulk_omics", "/api/tests/hereditary_disease/bulk_omics", "/api/tests/aging/bulk_omics"):
+                if self.path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif self.path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+                model_key = body.get("model")
+
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                seed = body.get("seed", 1)
+                omics_set_req = body.get("omics_set")
+                omics_set_name, features = _load_bulk_omics_set(str(omics_set_req or ""))
+
+                if not features:
+                    raise ValueError("no features selected")
+
+                kind0 = _bulk_omics_kind_from_set_name(str(omics_set_name or ""))
+                masked_features = _bulk_omics_mask_feature_headers(features, kind=str(kind0))
+
+                z_target_arr = None
+                z_target_in = body.get("z_target")
+                if isinstance(z_target_in, list):
+                    if len(z_target_in) != int(len(features)):
+                        raise ValueError("z_target must have length == #features")
+                    tmp: list[float] = []
+                    for v in z_target_in:
+                        try:
+                            f = float(v)
+                        except Exception:
+                            f = float("nan")
+                        tmp.append(f)
+                    z_target_arr = np.asarray(tmp, dtype=np.float64)
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                payload0 = _tests_load_model_payload_for_challenge(challenge, model_key)
+                payload = _deepcopy_payload(payload0)
+                interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=model_key, challenge=challenge)
+                if interventions_real:
+                    payload["_tick_interventions"] = list(interventions_real)
+
+                syn_rng = np.random.default_rng(3)
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+                model_label0 = str(model_key or "")
+                if model_label0.startswith("cell_culture_"):
+                    model_label0 = model_label0[len("cell_culture_"):]
+                if model_label0.startswith("tissue_"):
+                    model_label0 = model_label0[len("tissue_"):]
+                model_label = _omics_safe_label(model_label0, default="sample")
+
+                replicate_deaths: list[Dict[str, Any]] = []
+
+                assay = str(kind0 or "")
+                if assay == "bulk_rnaseq":
+                    assay = "Bulk transcriptomics"
+                elif assay == "bulk_proteomics":
+                    assay = "Bulk proteomics"
+                elif assay == "bulk_metabolomics":
+                    assay = "Bulk metabolomics"
+
+                meta_header = [
+                    "sample_id",
+                    "assay",
+                    "model",
+                    "replicate",
+                    "sample_age",
+                ]
+                meta_rows: list[list[Any]] = []
+                mat_header = ["sample_id", *masked_features]
+
+                run_ids: list[str] = []
+                run_T: list[list[float]] = []
+                out_runs: list[Dict[str, Any]] = []
+
+                for ri in range(reps_i):
+                    seed0 = int(seed_i) + (int(ri) * 97)
+                    pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                    if isinstance(pf, dict):
+                        replicate_deaths.append(
+                            {
+                                "model": str(model_key or ""),
+                                "replicate": int(ri),
+                                "seed": int(seed0),
+                                "requested_ticks": int(ticks_i),
+                                "death_tick": int(pf.get("death_tick") or 0),
+                                "death_measurement": str(pf.get("death_measurement") or ""),
+                                "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
+                            }
+                        )
+                        continue
+                    p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
+                    H = int(p.get("H") or 0)
+                    W = int(p.get("W") or 0)
+                    if H <= 0 or W <= 0:
+                        raise ValueError("payload invalid H/W")
+                    expected_len = int(H * W)
+                    layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+                    if not layers:
+                        raise ValueError("payload has no float32 layers")
+
+                    sample_id = f"{model_label}_r{int(ri)}_{run_tag}"
+                    vv: list[float] = []
+                    for ln in features:
+                        arr = layers.get(ln)
+                        if arr is None:
+                            vv.append(0.0)
+                            continue
+                        try:
+                            s = float(np.asarray(arr, dtype=np.float64).reshape(-1).sum())
+                        except Exception:
+                            s = 0.0
+                        if not np.isfinite(s) or s < 0.0:
+                            s = 0.0
+                        vv.append(float(s))
+
+                    meta_rows.append([
+                        sample_id,
+                        str(assay),
+                        str(model_key or ""),
+                        int(ri),
+                        int(ticks_i),
+                    ])
+                    run_ids.append(sample_id)
+                    run_T.append(vv)
+
+                    out_runs.append(
+                        {
+                            "model": str(model_key or ""),
+                            "replicate": int(ri),
+                            "seed": int(seed0),
+                            "ticks": int(ticks_i),
+                            "age_days": int(ticks_i),
+                            "H": int(H),
+                            "W": int(W),
+                        }
+                    )
+
+                if not run_ids:
+                    self._send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": f"all replicates died before requested ticks={int(ticks_i)}",
+                            "error_kind": "all_replicates_died",
+                            "experiment": "tests_cancer_bulk_omics_v1",
+                            "details": {
+                                "model": str(model_key or ""),
+                                "requested_ticks": int(ticks_i),
+                                "replicates_requested": int(reps_i),
+                                "replicate_deaths": list(replicate_deaths),
+                            },
+                        },
+                    )
+                    return
+
+                noisy_mat_rows: list[list[Any]] = []
+                if run_ids and run_T:
+                    T_arr = np.asarray(run_T, dtype=np.float64)
+                    Y = _bulk_synthetic_v1_noisy_counts(T_arr, rng=syn_rng, z_target=z_target_arr)
+                    for ii, sid in enumerate(run_ids):
+                        noisy_mat_rows.append([sid, *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]])
+
+                matrix_noisy_csv = _csv_from_rows(mat_header, noisy_mat_rows)
+                metadata_csv = _csv_from_rows(meta_header, meta_rows)
+
+                # Persist files to disk (wide format: one CSV per replicate sample).
+                files_text: Dict[str, Any] = {}
+                files_text[f"metadata_{run_tag}.csv"] = str(metadata_csv)
+                for row in noisy_mat_rows:
+                    if not isinstance(row, list) or not row:
+                        continue
+                    sid = str(row[0] or "")
+                    safe_sid = _omics_safe_label(sid, default="sample")
+                    files_text[f"samples/{safe_sid}.csv"] = _csv_from_rows(mat_header, [row])
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_bulk_omics_v1",
+                    "kind": str(kind0),
+                    "player_id": _sanitize_player_id(player_id),
+                    "model": str(model_key or ""),
+                    "ticks": int(ticks_i),
+                    "age_days": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "replicates_completed": int(len(out_runs)),
+                    "replicate_deaths": list(replicate_deaths),
+                    "omics_set": str(omics_set_name or ""),
+                    "features": list(masked_features),
+                    "runs": out_runs,
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                unit = _tests_compute_unit_cost_cents(
+                    challenge=challenge,
+                    kind=str(kind0),
+                    model_key=model_key,
+                    ticks=int(ticks_i),
+                    interventions_n=int(iv_n),
+                )
+                charge = _tests_make_charge(
+                    kind=f"tests_{challenge}_{str(kind0)}",
+                    samples=int(len(out_runs)),
+                    unit_cost_cents=int(unit),
+                    meta={
+                        "experiment": f"tests_{challenge}_bulk_omics_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "omics_set": str(omics_set_name or ""),
+                        "model": str(model_key or ""),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": f"tests_{challenge}_bulk_omics_v1",
+                        "model": str(model_key or ""),
+                        "ticks": int(ticks_i),
+                        "age_days": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "replicates_completed": int(len(out_runs)),
+                        "replicate_deaths": list(replicate_deaths),
+                        "omics_set": str(omics_set_name or ""),
+                        "genes": masked_features,
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
+                        "noise": {
+                            "model": "bulk_synthetic_v1",
+                            "sigma_sample": 0.35,
+                            "theta": 50.0,
+                            "ambient_frac": 0.001,
+                            "ambient_sigma_sample": 0.25,
+                            "rng_seed": 3,
+                        },
+                        "matrix_noisy_csv": matrix_noisy_csv,
+                        "metadata_csv": metadata_csv,
+                        "runs": out_runs,
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path in ("/api/tests/cancer/spatial_tx", "/api/tests/hereditary_disease/spatial_tx", "/api/tests/aging/spatial_tx"):
+                if self.path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif self.path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+                model_key = body.get("model")
+
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                seed = body.get("seed", 1)
+                gene_set_req = body.get("gene_set")
+                gene_set_name, genes = _load_stx_gene_set(str(gene_set_req or ""))
+
+                payload0 = _tests_load_model_payload_for_challenge(challenge, model_key)
+                if not genes:
+                    genes = _default_stx_gene_list(payload0, max_genes=8)
+                if not genes:
+                    raise ValueError("no genes selected")
+
+                z_target_arr = None
+                z_target_in = body.get("z_target")
+                if isinstance(z_target_in, list):
+                    if len(z_target_in) != int(len(genes)):
+                        raise ValueError("z_target must have length == #genes")
+                    tmp: list[float] = []
+                    for v in z_target_in:
+                        try:
+                            f = float(v)
+                        except Exception:
+                            f = float("nan")
+                        tmp.append(f)
+                    z_target_arr = np.asarray(tmp, dtype=np.float64)
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                payload = _deepcopy_payload(payload0)
+                interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=model_key, challenge=challenge)
+                if interventions_real:
+                    payload["_tick_interventions"] = list(interventions_real)
+
+                replicate_deaths: list[Dict[str, Any]] = []
+
+                syn_rng = np.random.default_rng(3)
+
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+                model_label0 = str(model_key or "")
+                if model_label0.startswith("cell_culture_"):
+                    model_label0 = model_label0[len("cell_culture_"):]
+                if model_label0.startswith("tissue_"):
+                    model_label0 = model_label0[len("tissue_"):]
+                model_label = _omics_safe_label(model_label0, default="sample")
+
+                meta_header = [
+                    "cell_id",
+                    "assay",
+                    "model",
+                    "replicate",
+                    "seed",
+                    "sample_taken_at_day",
+                    "x",
+                    "y",
+                    "grid_index",
+                ]
+                meta_rows: list[list[Any]] = []
+                stx_kind = _stx_kind_from_gene_set_and_genes(gene_set_name, genes)
+                assay = "Spatial transcriptomics"
+                if str(stx_kind) == "bulk_proteomics":
+                    assay = "Spatial proteomics"
+                genes_masked = _bulk_omics_mask_feature_headers(genes, kind=str(stx_kind))
+                mat_header = ["cell_id", *genes_masked]
+                noisy_mat_rows: list[list[Any]] = []
+
+                out_runs: list[Dict[str, Any]] = []
+                files_text: Dict[str, Any] = {}
+                for ri in range(reps_i):
+                    seed0 = int(seed_i) + (int(ri) * 97)
+                    pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                    if isinstance(pf, dict):
+                        replicate_deaths.append(
+                            {
+                                "model": str(model_key or ""),
+                                "replicate": int(ri),
+                                "seed": int(seed0),
+                                "requested_ticks": int(ticks_i),
+                                "death_tick": int(pf.get("death_tick") or 0),
+                                "death_measurement": str(pf.get("death_measurement") or ""),
+                                "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
+                            }
+                        )
+                        continue
+                    p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
+                    tx = _spatial_tx_rows(
+                        p,
+                        genes,
+                        cell_layer="",
+                        min_cell_value=0.0,
+                        stride=1,
+                        max_spots=None,
+                        seed=seed0,
+                    )
+
+                    H = int(tx.get("H") or 0)
+                    W = int(tx.get("W") or 0)
+                    rows = tx.get("rows")
+                    if not isinstance(rows, list):
+                        rows = []
+
+                    run_cell_ids: list[str] = []
+                    run_x: list[int] = []
+                    run_y: list[int] = []
+                    run_T: list[list[float]] = []
+                    rep_meta_rows: list[list[Any]] = []
+
+                    for si, row in enumerate(rows):
+                        if not isinstance(row, dict):
+                            continue
+                        x = row.get("x")
+                        y = row.get("y")
+                        try:
+                            xi = int(x)
+                        except Exception:
+                            continue
+                        try:
+                            yi = int(y)
+                        except Exception:
+                            continue
+                        grid_index = (yi * int(W) + xi) if (W > 0) else int(yi)
+                        cell_id = f"{model_label}_r{int(ri)}_{run_tag}_s{int(seed0)}_{int(si)}"
+
+                        meta_rows.append(
+                            [
+                                cell_id,
+                                str(assay),
+                                str(model_key or ""),
+                                int(ri),
+                                int(seed0),
+                                int(ticks_i),
+                                int(xi),
+                                int(yi),
+                                int(grid_index),
+                            ]
+                        )
+                        rep_meta_rows.append([
+                            cell_id,
+                            str(assay),
+                            str(model_key or ""),
+                            int(ri),
+                            int(seed0),
+                            int(ticks_i),
+                            int(xi),
+                            int(yi),
+                            int(grid_index),
+                        ])
+
+                        vv: list[float] = []
+                        for g in genes:
+                            try:
+                                f0 = float(row.get(g) or 0.0)
+                            except Exception:
+                                f0 = 0.0
+                            if not np.isfinite(f0) or f0 < 0.0:
+                                f0 = 0.0
+                            vv.append(float(f0))
+
+                        run_cell_ids.append(cell_id)
+                        run_x.append(int(xi))
+                        run_y.append(int(yi))
+                        run_T.append(vv)
+
+                    if run_cell_ids and run_T:
+                        T_arr = np.asarray(run_T, dtype=np.float64)
+                        x_arr = np.asarray(run_x, dtype=np.int64)
+                        y_arr = np.asarray(run_y, dtype=np.int64)
+                        Y = _stx_synthetic_v3_noisy_counts(
+                            T_arr,
+                            x_arr,
+                            y_arr,
+                            H=int(H),
+                            W=int(W),
+                            rng=syn_rng,
+                            z_target=z_target_arr,
+                        )
+                        for ii, cid in enumerate(run_cell_ids):
+                            noisy_mat_rows.append([cid, *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]])
+
+                        # Persist per-replicate wide matrix + per-cell metadata.
+                        rep_prefix = f"replicates/{model_label}_r{int(ri)}_{run_tag}"
+                        rep_rows = [[run_cell_ids[ii], *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]] for ii in range(len(run_cell_ids))]
+                        files_text[f"{rep_prefix}_matrix.csv"] = _csv_from_rows(mat_header, rep_rows)
+                        files_text[f"{rep_prefix}_cell_metadata.csv"] = _csv_from_rows(meta_header, rep_meta_rows)
+
+                    out_runs.append(
+                        {
+                            "model": str(model_key or ""),
+                            "replicate": int(ri),
+                            "seed": int(seed0),
+                            "ticks": int(ticks_i),
+                            "cells": int(len(rows)),
+                            "H": int(H),
+                            "W": int(W),
+                        }
+                    )
+
+                if not out_runs:
+                    self._send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": f"all replicates died before requested ticks={int(ticks_i)}",
+                            "error_kind": "all_replicates_died",
+                            "experiment": f"tests_{challenge}_spatial_tx_v1",
+                            "details": {
+                                "model": str(model_key or ""),
+                                "requested_ticks": int(ticks_i),
+                                "replicates_requested": int(reps_i),
+                                "replicate_deaths": list(replicate_deaths),
+                            },
+                        },
+                    )
+                    return
+
+                matrix_noisy_csv = _csv_from_rows(mat_header, noisy_mat_rows)
+                metadata_csv = _csv_from_rows(meta_header, meta_rows)
+
+                files_text[f"metadata_{run_tag}.csv"] = str(metadata_csv)
+                manifest = {
+                    "experiment": f"tests_{challenge}_spatial_tx_v1",
+                    "kind": str(stx_kind),
+                    "player_id": _sanitize_player_id(player_id),
+                    "model": str(model_key or ""),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "replicates_completed": int(len(out_runs)),
+                    "replicate_deaths": list(replicate_deaths),
+                    "gene_set": str(gene_set_name or ""),
+                    "genes": list(genes_masked),
+                    "runs": out_runs,
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                unit = _tests_compute_unit_cost_cents(
+                    challenge=challenge,
+                    kind="spatial_transcriptomics",
+                    model_key=model_key,
+                    ticks=int(ticks_i),
+                    interventions_n=int(iv_n),
+                )
+                charge = _tests_make_charge(
+                    kind=f"tests_{challenge}_spatial_transcriptomics",
+                    samples=int(len(out_runs)),
+                    unit_cost_cents=int(unit),
+                    meta={
+                        "experiment": f"tests_{challenge}_spatial_tx_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "gene_set": str(gene_set_name or ""),
+                        "model": str(model_key or ""),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": f"tests_{challenge}_spatial_tx_v1",
+                        "model": str(model_key or ""),
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "replicates_completed": int(len(out_runs)),
+                        "replicate_deaths": list(replicate_deaths),
+                        "gene_set": str(gene_set_name or ""),
+                        "genes": genes_masked,
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
+                        "noise": {
+                            "model": "synthetic_v3",
+                            "sigma_cell": 0.35,
+                            "theta": 50.0,
+                            "eps": 0.08,
+                            "target_median_umi": 2000.0,
+                            "ambient_total_umi": 0.05,
+                            "ambient_sigma_cell": 0.25,
+                            "rng_seed": 3,
+                        },
+                        "matrix_noisy_csv": matrix_noisy_csv,
+                        "metadata_csv": metadata_csv,
+                        "runs": out_runs,
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path in ("/api/tests/cancer/characterization", "/api/tests/hereditary_disease/characterization", "/api/tests/aging/characterization"):
+                if self.path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif self.path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+                model_key = body.get("model")
+
+                ticks = body.get("ticks", 100)
+                replicates = body.get("replicates", 1)
+                seed = body.get("seed", 1)
+                include_replicates_raw = body.get("include_replicates", True)
+                include_replicates = bool(include_replicates_raw)
+
+                try:
+                    ticks_i = max(0, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                payload0 = _tests_load_model_payload_for_challenge(challenge, model_key)
+                payload = _deepcopy_payload(payload0)
+                interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=model_key, challenge=challenge)
+                if interventions_real:
+                    payload["_tick_interventions"] = list(interventions_real)
+
+                names = _measurement_names_from_payload(payload)
+                if not names:
+                    raise ValueError("no measurements configured (missing measurements_config)")
+
+                if _tests_is_in_vitro_model(model_key):
+                    # In vitro characterization always returns per-replicate files.
+                    include_replicates = True
+
+                    rep_series: list[Dict[str, list[float]]] = []
+                    rep_seeds: list[int] = []
+                    for ri in range(int(reps_i)):
+                        seed0 = int(seed_i) + (int(ri) * 97)
+                        s0, m0 = _run_cell_culture_measurement_series_and_metrics(
+                            payload,
+                            ticks=int(ticks_i),
+                            seed0=int(seed0),
+                            names=names,
+                        )
+                        rep_series.append(s0)
+                        rep_seeds.append(int(seed0))
+
+                    # Persist files to disk.
+                    files_text: Dict[str, Any] = {}
+
+                    run_id0 = uuid.uuid4().hex
+                    run_tag = str(run_id0)[:12]
+                    model_label0 = str(model_key or "")
+                    if model_label0.startswith("cell_culture_"):
+                        model_label0 = model_label0[len("cell_culture_"):]
+                    if model_label0.startswith("tissue_"):
+                        model_label0 = model_label0[len("tissue_"):]
+                    model_label = _omics_safe_label(model_label0, default="sample")
+
+                    meta_header = [
+                        "run_id",
+                        "sample_id",
+                        "assay",
+                        "model",
+                        "replicate",
+                        "seed",
+                        "study_ran_for_days",
+                        "timecourse_filename",
+                        "timecourse_relpath",
+                        "timecourse_file_id",
+                        "timecourse_url",
+                    ]
+                    meta_rows: list[list[Any]] = []
+                    tc_names: list[str] = []
+                    for ri, sd in enumerate(rep_seeds):
+                        sample_id = f"{model_label}_r{int(ri)}_{run_tag}"
+                        tc_name = f"replicates/{sample_id}_timecourse.csv"
+                        tc_names.append(tc_name)
+                        tc_fid = _OMICS._file_id(run_id0, tc_name)
+                        tc_url = f"/api/omics/file?run_id={run_id0}&name={tc_name}"
+                        meta_rows.append(
+                            [
+                                str(run_id0),
+                                str(sample_id),
+                                "Characterization experiment",
+                                str(model_key or ""),
+                                int(ri),
+                                int(sd),
+                                int(ticks_i),
+                                str(Path(tc_name).name),
+                                str(tc_name),
+                                str(tc_fid),
+                                str(tc_url),
+                            ]
+                        )
+
+                    metadata_name = f"metadata_{run_tag}.csv"
+                    files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
+
+                    tc_header = ["day", *[str(x) for x in names]]
+                    for ri, s0 in enumerate(rep_series):
+                        tr: list[list[Any]] = []
+                        for ti in range(int(ticks_i)):
+                            row: list[Any] = [int(ti)]
+                            for nm in names:
+                                vals = s0.get(nm) if isinstance(s0.get(nm), list) else []
+                                row.append(vals[int(ti)] if int(ti) < int(len(vals)) else "")
+                            tr.append(row)
+                        tc_name = tc_names[int(ri)] if int(ri) < int(len(tc_names)) else f"replicates/{model_label}_r{int(ri)}_{run_tag}_timecourse.csv"
+                        files_text[str(tc_name)] = _csv_from_rows(tc_header, tr)
+
+                    manifest = {
+                        "experiment": "tests_cancer_characterization_v1",
+                        "kind": "characterization",
+                        "player_id": _sanitize_player_id(player_id),
+                        "model": str(model_key or ""),
+                        "ticks": int(ticks_i),
+                        "age_days": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "seed": int(seed_i),
+                        "interventions": interventions_real,
+                        "measurements": list(names),
+                    }
+                    omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                    iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                    unit = _tests_compute_unit_cost_cents(
+                        challenge="cancer",
+                        kind="characterization",
+                        model_key=model_key,
+                        ticks=int(ticks_i),
+                        interventions_n=int(iv_n),
+                    )
+                    charge = _tests_make_charge(
+                        kind="tests_cancer_characterization",
+                        samples=int(reps_i),
+                        unit_cost_cents=int(unit),
+                        meta={
+                            "experiment": "tests_cancer_characterization_v1",
+                            "ticks": int(ticks_i),
+                            "replicates": int(reps_i),
+                            "model": str(model_key or ""),
+                        },
+                    )
+                    game = _game_apply_charge(player_id, charge)
+
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "experiment": "tests_cancer_characterization_v1",
+                            "model": str(model_key or ""),
+                            "ticks": int(ticks_i),
+                            "replicates": int(reps_i),
+                            "measurements": names,
+                            "run_id": str(omics_saved.get("run_id") or ""),
+                            "files": omics_saved.get("files"),
+                            "omics_inventory": {
+                                "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                                "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                            },
+                            "game": game,
+                        },
+                    )
+                    return
+
+                death_names = _death_measurement_names_from_payload(payload)
+
+                # In vivo characterization also persists per-replicate timecourses and replicate metadata only.
+                include_replicates = True
+
+                rep_series: list[Dict[str, list[float]]] = []
+                rep_seeds: list[int] = []
+                death_days: list[int] = []
+                death_meas: list[str] = []
+
+                for ri in range(int(reps_i)):
+                    seed0 = int(seed_i) + (int(ri) * 97)
+                    s0, dt0, dm0 = _run_in_vivo_measurement_series_until_death(
+                        payload, ticks=int(ticks_i), seed0=int(seed0), death_names=death_names
+                    )
+                    rep_series.append(s0)
+                    rep_seeds.append(int(seed0))
+                    death_days.append(int(dt0))
+                    death_meas.append(str(dm0))
+
+                # Persist files to disk.
+                files_text: Dict[str, Any] = {}
+
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+                model_label0 = str(model_key or "")
+                if model_label0.startswith("cell_culture_"):
+                    model_label0 = model_label0[len("cell_culture_"):]
+                if model_label0.startswith("tissue_"):
+                    model_label0 = model_label0[len("tissue_"):]
+                model_label = _omics_safe_label(model_label0, default="sample")
+
+                meta_header = [
+                    "run_id",
+                    "sample_id",
+                    "assay",
+                    "model",
+                    "replicate",
+                    "seed",
+                    "study_ran_for_days",
+                    "death_occurred_on_day",
+                    "death_measurement",
+                    "timecourse_filename",
+                    "timecourse_relpath",
+                    "timecourse_file_id",
+                    "timecourse_url",
+                ]
+                meta_rows: list[list[Any]] = []
+                tc_names: list[str] = []
+                for ri, sd in enumerate(rep_seeds):
+                    sample_id = f"{model_label}_r{int(ri)}_{run_tag}"
+                    tc_name = f"replicates/{sample_id}_timecourse.csv"
+                    tc_names.append(tc_name)
+                    dd = int(death_days[int(ri)]) if int(ri) < int(len(death_days)) else int(ticks_i)
+                    dm = str(death_meas[int(ri)]) if int(ri) < int(len(death_meas)) else ""
+                    tc_fid = _OMICS._file_id(run_id0, tc_name)
+                    tc_url = f"/api/omics/file?run_id={run_id0}&name={tc_name}"
+                    meta_rows.append(
+                        [
+                            str(run_id0),
+                            str(sample_id),
+                            "Characterization experiment",
+                            str(model_key or ""),
+                            int(ri),
+                            int(sd),
+                            int(ticks_i),
+                            int(dd),
+                            str(dm),
+                            str(Path(tc_name).name),
+                            str(tc_name),
+                            str(tc_fid),
+                            str(tc_url),
+                        ]
+                    )
+
+                metadata_name = f"metadata_{run_tag}.csv"
+                files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
+
+                tc_header = ["day", *[str(x) for x in names]]
+                for ri, s0 in enumerate(rep_series):
+                    tr: list[list[Any]] = []
+                    for ti in range(int(ticks_i)):
+                        row: list[Any] = [int(ti)]
+                        for nm in names:
+                            vals = s0.get(nm) if isinstance(s0.get(nm), list) else []
+                            row.append(vals[int(ti)] if int(ti) < int(len(vals)) else "")
+                        tr.append(row)
+                    tc_name = tc_names[int(ri)] if int(ri) < int(len(tc_names)) else f"replicates/{model_label}_r{int(ri)}_{run_tag}_timecourse.csv"
+                    files_text[str(tc_name)] = _csv_from_rows(tc_header, tr)
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_characterization_v1",
+                    "kind": "characterization",
+                    "player_id": _sanitize_player_id(player_id),
+                    "model": str(model_key or ""),
+                    "ticks": int(ticks_i),
+                    "age_days": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "seed": int(seed_i),
+                    "interventions": interventions_real,
+                    "measurements": list(names),
+                    "death_names": list(death_names),
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                unit = _tests_compute_unit_cost_cents(
+                    challenge=challenge,
+                    kind="characterization",
+                    model_key=model_key,
+                    ticks=int(ticks_i),
+                    interventions_n=int(iv_n),
+                )
+                charge = _tests_make_charge(
+                    kind=f"tests_{challenge}_characterization",
+                    samples=int(reps_i),
+                    unit_cost_cents=int(unit),
+                    meta={
+                        "experiment": f"tests_{challenge}_characterization_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "model": str(model_key or ""),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": f"tests_{challenge}_characterization_v1",
+                        "model": str(model_key or ""),
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "measurements": names,
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path in ("/api/tests/cancer/protein_screen", "/api/tests/hereditary_disease/protein_screen", "/api/tests/aging/protein_screen"):
+                if self.path.startswith("/api/tests/cancer/"):
+                    challenge = "cancer"
+                elif self.path.startswith("/api/tests/hereditary_disease/"):
+                    challenge = "hereditary_disease"
+                else:
+                    challenge = "aging"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+                model_key = body.get("model")
+
+                if not _tests_is_in_vitro_model(model_key):
+                    raise ValueError("protein_screen is only allowed for in vitro cell_culture_* models")
+
+                ticks = body.get("ticks", 200)
+                replicates = body.get("replicates", 10)
+                direction = body.get("direction", "up")
+                dose = body.get("dose", 1)
+
+                payload0 = _tests_load_model_payload_for_challenge(challenge, model_key)
+                baseline_payload = _deepcopy_payload(payload0)
+                payload = _deepcopy_payload(payload0)
+                interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=model_key, challenge=challenge)
+                if interventions_real:
+                    payload["_tick_interventions"] = list(interventions_real)
+
+                try:
+                    ticks_i = max(1, int(ticks))
+                except Exception as e:
+                    raise ValueError(f"ticks must be an int: {e}") from e
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+
+                seed_i = 1
+
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+                model_label0 = str(model_key or "")
+                if model_label0.startswith("cell_culture_"):
+                    model_label0 = model_label0[len("cell_culture_"):]
+                if model_label0.startswith("tissue_"):
+                    model_label0 = model_label0[len("tissue_"):]
+                model_label = _omics_safe_label(model_label0, default="sample")
+
+                try:
+                    dose_f = float(dose)
+                except Exception:
+                    dose_f = 0.0
+                if not np.isfinite(dose_f) or dose_f < 0.0:
+                    dose_f = 0.0
+
+                direction_s = str(direction or "").strip().lower()
+                if direction_s in ("+", "inc", "increase", "up", "pos", "positive"):
+                    direction_s = "up"
+                elif direction_s in ("-", "dec", "decrease", "down", "neg", "negative"):
+                    direction_s = "down"
+                else:
+                    raise ValueError("invalid direction")
+
+                worker_mode = "process"
+                workers_i = 35
+
+                prot_layers = _protein_layer_names_from_payload(payload0)
+                real_to_mask, _ = _tests_get_protein_mask_maps(model_key, challenge=challenge)
+                if not prot_layers:
+                    raise ValueError("no protein_* float32 layers found")
+
+                meas_names = _measurement_names_from_payload(payload0)
+                if not meas_names:
+                    raise ValueError("model has no measurements_config measurements")
+
+                def _eval_layer(li: int, nm: str) -> Dict[str, Any]:
+                    p0 = _deepcopy_payload(payload)
+                    tiv0 = p0.get("_tick_interventions")
+                    tiv = list(tiv0) if isinstance(tiv0, list) else []
+                    tiv.append({"layer": str(nm), "direction": str(direction_s), "dose": float(dose_f)})
+                    p0["_tick_interventions"] = tiv
+                    return {
+                        "layer": str(nm),
+                        "layer_index": int(li),
+                        "measurements_end_sample": _cell_culture_measurements_end_sample_from_payload(
+                            p0,
+                            ticks=int(ticks_i),
+                            seed=int(seed_i),
+                            replicates=int(reps_i),
+                            selected_names=meas_names,
+                            condition_index=int(li + 2),
+                        ).get("measurements_end_sample"),
+                    }
+
+                results_out: list[Optional[Dict[str, Any]]] = [None for _ in range(int(len(prot_layers)))]
+                if int(len(prot_layers)) <= 1:
+                    for li, nm in enumerate(prot_layers):
+                        results_out[int(li)] = _eval_layer(int(li), str(nm))
+                else:
+                    ctx = mp.get_context("spawn")
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=int(workers_i),
+                        mp_context=ctx,
+                        initializer=_vitro_screen_worker_init,
+                        initargs=(payload, int(ticks_i), int(seed_i), int(reps_i), str(direction_s), float(dose_f), list(meas_names)),
+                    ) as ex:
+                        pending: set[concurrent.futures.Future] = set()
+                        it = iter(list(enumerate(prot_layers)))
+
+                        def _submit_one() -> None:
+                            try:
+                                li0, nm0 = next(it)
+                            except StopIteration:
+                                return
+                            pending.add(ex.submit(_vitro_screen_worker_eval, int(li0), str(nm0)))
+
+                        for _ in range(min(int(workers_i), int(len(prot_layers)))):
+                            _submit_one()
+
+                        while pending:
+                            done, pending = concurrent.futures.wait(
+                                pending, return_when=concurrent.futures.FIRST_COMPLETED
+                            )
+                            for fut in done:
+                                r = fut.result()
+                                li = int(r.get("layer_index") or 0)
+                                if 0 <= li < int(len(results_out)):
+                                    results_out[li] = r
+                                _submit_one()
+
+                results: list[Dict[str, Any]] = [r for r in results_out if isinstance(r, dict)]
+
+                for r in results:
+                    try:
+                        ln = str(r.get("layer") or "")
+                    except Exception:
+                        ln = ""
+                    if ln:
+                        m = real_to_mask.get(ln)
+                        if m:
+                            r["layer"] = str(m)
+
+                results_out2: list[Dict[str, Any]] = []
+                for r in results:
+                    if not isinstance(r, dict):
+                        continue
+                    results_out2.append(
+                        {
+                            "layer": r.get("layer"),
+                            "layer_index": r.get("layer_index"),
+                            "measurements_end_sample": r.get("measurements_end_sample"),
+                        }
+                    )
+
+                baseline_out = _cell_culture_measurements_end_sample_from_payload(
+                    baseline_payload,
+                    ticks=int(ticks_i),
+                    seed=int(seed_i),
+                    replicates=int(reps_i),
+                    selected_names=meas_names,
+                    condition_index=0,
+                )
+                control_out = _cell_culture_measurements_end_sample_from_payload(
+                    payload,
+                    ticks=int(ticks_i),
+                    seed=int(seed_i),
+                    replicates=int(reps_i),
+                    selected_names=meas_names,
+                    condition_index=1,
+                )
+
+                # Persist files to disk.
+                files_text: Dict[str, Any] = {}
+
+                meta_header = [
+                    "run_id",
+                    "sample_id",
+                    "assay",
+                    "model",
+                    "direction",
+                    "dose",
+                    "study_ran_for_days",
+                    "replicates",
+                    "replicate",
+                    "seed",
+                    "protein_layers",
+                    "measurements_filename",
+                    "measurements_relpath",
+                    "measurements_file_id",
+                    "measurements_url",
+                ]
+                meta_rows: list[list[Any]] = []
+
+                rows_by_rep: Dict[int, list[list[Any]]] = {}
+                seed_by_rep: Dict[int, int] = {}
+
+                def _add_row(*, rep: int, seed: Any, condition: str, protein: str, meas: Any) -> None:
+                    try:
+                        rep_i = int(rep)
+                    except Exception:
+                        return
+                    if rep_i < 0:
+                        return
+                    if rep_i not in rows_by_rep:
+                        rows_by_rep[rep_i] = []
+                    if rep_i not in seed_by_rep:
+                        try:
+                            seed_by_rep[rep_i] = int(seed)
+                        except Exception:
+                            seed_by_rep[rep_i] = int(seed_i)
+                    m = meas if isinstance(meas, dict) else {}
+                    row: list[Any] = [str(condition or ""), str(protein or "")]
+                    for nm in meas_names:
+                        v = m.get(nm)
+                        if v is None:
+                            row.append("")
+                            continue
+                        try:
+                            vf = float(v)
+                        except Exception:
+                            row.append("")
+                            continue
+                        if not np.isfinite(vf):
+                            row.append("")
+                            continue
+                        row.append(float(vf))
+                    rows_by_rep[rep_i].append(row)
+
+                b0 = baseline_out.get("measurements_end_sample")
+                if not isinstance(b0, list):
+                    b0 = []
+                for ent in b0:
+                    if not isinstance(ent, dict):
+                        continue
+                    rep = ent.get("replicate")
+                    sd = ent.get("seed")
+                    m = ent.get("measurements_end")
+                    _add_row(rep=int(rep) if rep is not None else 0, seed=sd, condition="baseline", protein="", meas=m)
+
+                c0 = control_out.get("measurements_end_sample")
+                if not isinstance(c0, list):
+                    c0 = []
+                for ent in c0:
+                    if not isinstance(ent, dict):
+                        continue
+                    rep = ent.get("replicate")
+                    sd = ent.get("seed")
+                    m = ent.get("measurements_end")
+                    _add_row(rep=int(rep) if rep is not None else 0, seed=sd, condition="control", protein="", meas=m)
+
+                for r in results_out2:
+                    if not isinstance(r, dict):
+                        continue
+                    ln = str(r.get("layer") or "")
+                    rows0 = r.get("measurements_end_sample")
+                    if not isinstance(rows0, list):
+                        rows0 = []
+                    for ent in rows0:
+                        if not isinstance(ent, dict):
+                            continue
+                        rep = ent.get("replicate")
+                        sd = ent.get("seed")
+                        m = ent.get("measurements_end")
+                        _add_row(rep=int(rep) if rep is not None else 0, seed=sd, condition="perturb", protein=str(ln), meas=m)
+
+                base_sid = f"{model_label}_{run_tag}"
+                data_header = ["condition", "protein", *[str(x) for x in meas_names]]
+                for rep_i in range(int(reps_i)):
+                    sid = f"{base_sid}_r{int(rep_i)}"
+                    safe_sid = _omics_safe_label(sid, default="sample")
+                    fn = f"results/{safe_sid}_protein_screen_measurements.csv"
+                    fid = _OMICS._file_id(run_id0, fn)
+                    url = f"/api/omics/file?player_id={_sanitize_player_id(player_id)}&file_id={fid}"
+                    out_rows = rows_by_rep.get(int(rep_i))
+                    if not isinstance(out_rows, list):
+                        out_rows = []
+                    files_text[fn] = _csv_from_rows(data_header, out_rows)
+                    sd_i = seed_by_rep.get(int(rep_i))
+                    if sd_i is None:
+                        sd_i = int(seed_i)
+                    meta_rows.append(
+                        [
+                            str(run_id0),
+                            str(sid),
+                            "Drug screen",
+                            str(model_key or ""),
+                            str(direction_s),
+                            float(dose_f),
+                            int(ticks_i),
+                            int(reps_i),
+                            int(rep_i),
+                            int(sd_i),
+                            int(len(prot_layers)),
+                            str(Path(fn).name),
+                            str(fn),
+                            str(fid),
+                            str(url),
+                        ]
+                    )
+
+                metadata_name = f"metadata_{run_tag}.csv"
+                files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_protein_screen_v1",
+                    "kind": "protein_screen",
+                    "player_id": _sanitize_player_id(player_id),
+                    "model": str(model_key or ""),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "seed": int(seed_i),
+                    "direction": str(direction_s),
+                    "dose": float(dose_f),
+                    "protein_layers": int(len(prot_layers)),
+                    "measurements": list(meas_names),
+                    "interventions": interventions_real,
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                samples_run = int(int(reps_i) * int(len(prot_layers) + 2))
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                unit = _tests_compute_unit_cost_cents(
+                    challenge=challenge,
+                    kind="protein_screen",
+                    model_key=model_key,
+                    ticks=int(ticks_i),
+                    interventions_n=int(iv_n + 1),
+                )
+                charge = _tests_make_charge(
+                    kind=f"tests_{challenge}_protein_screen",
+                    samples=int(samples_run),
+                    unit_cost_cents=int(unit),
+                    meta={
+                        "experiment": f"tests_{challenge}_protein_screen_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "protein_layers": int(len(prot_layers)),
+                        "direction": str(direction_s),
+                        "dose": float(dose_f),
+                        "model": str(model_key or ""),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": f"tests_{challenge}_protein_screen_v1",
+                        "model": str(model_key or ""),
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "workers": int(workers_i),
+                        "worker_mode": str(worker_mode),
+                        "direction": str(direction_s),
+                        "dose": float(dose_f),
+                        "protein_layers": int(len(prot_layers)),
+                        "measurements": list(meas_names),
+                        "interventions": interventions,
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
+                        "baseline": dict(baseline_out),
+                        "control": dict(control_out),
+                        "results": results_out2,
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path == "/api/tests/aging/claim_cure":
+                challenge = "aging"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+
+                ticks = body.get("ticks", 200)
+                replicates = body.get("replicates", 10)
+                seed = body.get("seed", 1)
+
+                ticks_i = 400
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+
+                healthy0 = _tests_load_model_payload_for_challenge(challenge, "healthy")
+                healthy_base = _deepcopy_payload(healthy0)
+                healthy = _deepcopy_payload(healthy0)
+                interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key="healthy", challenge=challenge)
+                if interventions_real:
+                    healthy["_tick_interventions"] = list(interventions_real)
+
+                death_names = _death_measurement_names_from_payload(healthy)
+                if not death_names:
+                    raise ValueError("no death measurements found (measurement name must contain 'death')")
+
+                death_ticks_base: list[int] = []
+                death_ticks_treated: list[int] = []
+                death_meas_base: list[str] = []
+                death_meas_treated: list[str] = []
+                for ri in range(int(reps_i)):
+                    seed0_b = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                    seed0_t = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+                    rb = _run_lifespan_death_tick(healthy_base, ticks=int(ticks_i), seed0=int(seed0_b), death_names=death_names)
+                    rt = _run_lifespan_death_tick(healthy, ticks=int(ticks_i), seed0=int(seed0_t), death_names=death_names)
+                    try:
+                        death_ticks_base.append(int(rb.get("death_tick")))
+                    except Exception:
+                        death_ticks_base.append(int(ticks_i))
+                    try:
+                        death_ticks_treated.append(int(rt.get("death_tick")))
+                    except Exception:
+                        death_ticks_treated.append(int(ticks_i))
+                    death_meas_base.append(str(rb.get("death_measurement") or ""))
+                    death_meas_treated.append(str(rt.get("death_measurement") or ""))
+
+                stats_base = _tests_lifespan_stats(death_ticks_base, ticks=int(ticks_i))
+                stats_treated = _tests_lifespan_stats(death_ticks_treated, ticks=int(ticks_i))
+                curve_base = _lifespan_survival_curve(death_ticks_base, ticks=int(ticks_i))
+                curve_treated = _lifespan_survival_curve(death_ticks_treated, ticks=int(ticks_i))
+                try:
+                    med_b = float(stats_base.get("median_lifespan_tick") or 0.0)
+                except Exception:
+                    med_b = float(0.0)
+                try:
+                    med_t = float(stats_treated.get("median_lifespan_tick") or 0.0)
+                except Exception:
+                    med_t = float(0.0)
+                delta_med = float(med_t) - float(med_b)
+                extra_days = float(delta_med)
+                win = False
+
+                files_text: Dict[str, Any] = {}
+
+                meta_header = [
+                    "run_id",
+                    "sample_id",
+                    "assay",
+                    "study_observed_until_days",
+                    "replicates_per_group",
+                    "interventions_in_healthy_model",
+                    "interventions",
+                    "win",
+                ]
+                meta_rows: list[list[Any]] = []
+
+                sid_sum = f"summarized_results_{run_tag}"
+                fn_sum = f"results/summarized_results_{run_tag}.csv"
+
+                sum_header = [
+                    "sample_type",
+                    "study_observed_until_days",
+                    "age_at_death_days",
+                    "cause_of_death",
+                ]
+                sum_rows: list[list[Any]] = []
+
+                for ri in range(int(reps_i)):
+                    dt = int(death_ticks_base[int(ri)]) if int(ri) < int(len(death_ticks_base)) else int(ticks_i)
+                    dm = str(death_meas_base[int(ri)]) if int(ri) < int(len(death_meas_base)) else ""
+                    cause = str(dm or "")
+                    if int(dt) >= int(ticks_i):
+                        cause = "survived_to_end"
+                    sum_rows.append(["baseline_healthy", int(ticks_i), int(dt), str(cause)])
+
+                for ri in range(int(reps_i)):
+                    dt = int(death_ticks_treated[int(ri)]) if int(ri) < int(len(death_ticks_treated)) else int(ticks_i)
+                    dm = str(death_meas_treated[int(ri)]) if int(ri) < int(len(death_meas_treated)) else ""
+                    cause = str(dm or "")
+                    if int(dt) >= int(ticks_i):
+                        cause = "survived_to_end"
+                    sum_rows.append(["treated_healthy", int(ticks_i), int(dt), str(cause)])
+
+                files_text[fn_sum] = _csv_from_rows(sum_header, sum_rows)
+
+                meta_rows.append(
+                    [
+                        str(run_id0),
+                        str(sid_sum),
+                        "in vivo lifespan study (aging claim)",
+                        int(ticks_i),
+                        int(reps_i),
+                        bool(bool(interventions_real)),
+                        json.dumps(interventions_real, ensure_ascii=False),
+                        bool(win),
+                    ]
+                )
+
+                metadata_name = f"metadata_{run_tag}.csv"
+                files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_claim_cure_v1",
+                    "kind": "claim_cure",
+                    "player_id": _sanitize_player_id(player_id),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "seed": int(seed_i),
+                    "interventions": interventions_real,
+                    "baseline_healthy_median_tick": float(med_b),
+                    "treated_healthy_median_tick": float(med_t),
+                    "extra_days": float(extra_days),
+                    "delta_median_ticks": float(delta_med),
+                    "win": bool(win),
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                unit = _tests_compute_unit_cost_cents(
+                    challenge=challenge,
+                    kind="claim_cure",
+                    model_key="healthy",
+                    ticks=int(ticks_i),
+                    interventions_n=int(iv_n),
+                )
+                charge = _tests_make_charge(
+                    kind=f"tests_{challenge}_claim_cure",
+                    samples=int(2 * reps_i),
+                    unit_cost_cents=int(unit),
+                    meta={
+                        "experiment": f"tests_{challenge}_claim_cure_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                score_lifedays_per_usd = None
+                try:
+                    msu = float(game.get("money_spent_usd") or 0.0) if isinstance(game, dict) else 0.0
+                except Exception:
+                    msu = 0.0
+                if msu > 0.0:
+                    try:
+                        score_lifedays_per_usd = float(max(0.0, float(extra_days))) / float(msu)
+                    except Exception:
+                        score_lifedays_per_usd = None
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": f"tests_{challenge}_claim_cure_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "death_measurements": list(death_names),
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
+                        "baseline_healthy": {
+                            **stats_base,
+                            "death_ticks": [int(x) for x in death_ticks_base],
+                            "death_measurements": [str(x) for x in death_meas_base],
+                            "curve": curve_base,
+                        },
+                        "healthy": {
+                            **stats_treated,
+                            "death_ticks": [int(x) for x in death_ticks_treated],
+                            "death_measurements": [str(x) for x in death_meas_treated],
+                            "curve": curve_treated,
+                        },
+                        "baseline_healthy_median_tick": float(med_b),
+                        "treated_healthy_median_tick": float(med_t),
+                        "extra_days": float(extra_days),
+                        "score_lifedays_per_usd": score_lifedays_per_usd,
+                        "delta_median_ticks": float(delta_med),
+                        "win": bool(win),
+                        "game": game,
+                    },
+                )
+                return
+
+            if self.path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure"):
+                challenge = "cancer" if self.path.startswith("/api/tests/cancer/") else "hereditary_disease"
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                interventions = _tests_validate_protein_interventions(body.get("interventions"))
+
+                ticks = body.get("ticks", 200)
+                replicates = body.get("replicates", 10)
+                seed = body.get("seed", 1)
+
+                ticks_i = 400
+                try:
+                    reps_i = max(1, int(replicates))
+                except Exception as e:
+                    raise ValueError(f"replicates must be an int: {e}") from e
+                try:
+                    seed_i = int(seed)
+                except Exception as e:
+                    raise ValueError(f"seed must be an int: {e}") from e
+
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+
+                disease_key = _tests_claim_cure_disease_model_key_for_challenge(challenge)
+                healthy = _tests_load_model_payload_for_challenge(challenge, "healthy")
+                sick0 = _tests_load_model_payload_for_challenge(challenge, str(disease_key))
+                sick = _deepcopy_payload(sick0)
+                interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=str(disease_key), challenge=challenge)
+                if interventions_real:
+                    sick["_tick_interventions"] = list(interventions_real)
+
+                death_names = _death_measurement_names_from_payload(healthy)
+                dn2 = _death_measurement_names_from_payload(sick)
+                seen_dn = set(death_names)
+                for nm in dn2:
+                    if nm in seen_dn:
+                        continue
+                    death_names.append(nm)
+                    seen_dn.add(nm)
+
+                if not death_names:
+                    raise ValueError("no death measurements found (measurement name must contain 'death')")
+
+                death_ticks_healthy: list[int] = []
+                death_ticks_sick_base: list[int] = []
+                death_ticks_sick: list[int] = []
+                death_meas_healthy: list[str] = []
+                death_meas_sick_base: list[str] = []
+                death_meas_sick: list[str] = []
+                for ri in range(int(reps_i)):
+                    seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                    seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+                    rh = _run_lifespan_death_tick(healthy, ticks=int(ticks_i), seed0=int(seed0_h), death_names=death_names)
+                    rs0 = _run_lifespan_death_tick(sick0, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names)
+                    rs = _run_lifespan_death_tick(sick, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names)
+                    try:
+                        death_ticks_healthy.append(int(rh.get("death_tick")))
+                    except Exception:
+                        death_ticks_healthy.append(int(ticks_i))
+                    try:
+                        death_ticks_sick_base.append(int(rs0.get("death_tick")))
+                    except Exception:
+                        death_ticks_sick_base.append(int(ticks_i))
+                    try:
+                        death_ticks_sick.append(int(rs.get("death_tick")))
+                    except Exception:
+                        death_ticks_sick.append(int(ticks_i))
+                    death_meas_healthy.append(str(rh.get("death_measurement") or ""))
+                    death_meas_sick_base.append(str(rs0.get("death_measurement") or ""))
+                    death_meas_sick.append(str(rs.get("death_measurement") or ""))
+
+                stats_healthy = _tests_lifespan_stats(death_ticks_healthy, ticks=int(ticks_i))
+                stats_sick_base = _tests_lifespan_stats(death_ticks_sick_base, ticks=int(ticks_i))
+                stats_sick = _tests_lifespan_stats(death_ticks_sick, ticks=int(ticks_i))
+                curve_healthy = _lifespan_survival_curve(death_ticks_healthy, ticks=int(ticks_i))
+                curve_sick_base = _lifespan_survival_curve(death_ticks_sick_base, ticks=int(ticks_i))
+                curve_sick = _lifespan_survival_curve(death_ticks_sick, ticks=int(ticks_i))
+                try:
+                    med_h = float(stats_healthy.get("median_lifespan_tick" ) or 0.0)
+                except Exception:
+                    med_h = float(0.0)
+                try:
+                    med_s0 = float(stats_sick_base.get("median_lifespan_tick") or 0.0)
+                except Exception:
+                    med_s0 = float(0.0)
+                try:
+                    med_s = float(stats_sick.get("median_lifespan_tick") or 0.0)
+                except Exception:
+                    med_s = float(0.0)
+                delta_med = float(med_s) - float(med_h)
+                extra_days = float(med_s) - float(med_s0)
+                win = bool(abs(float(delta_med)) <= 0.5)
+
+                files_text: Dict[str, Any] = {}
+
+                meta_header = [
+                    "run_id",
+                    "sample_id",
+                    "assay",
+                    "study_observed_until_days",
+                    "replicates_per_group",
+                    "interventions_in_cancer_model",
+                    "interventions",
+                    "win",
+                ]
+                meta_rows: list[list[Any]] = []
+
+                sid_sum = f"summarized_results_{run_tag}"
+                fn_sum = f"results/summarized_results_{run_tag}.csv"
+
+                sum_header = [
+                    "sample_type",
+                    "study_observed_until_days",
+                    "age_at_death_days",
+                    "cause_of_death",
+                ]
+                sum_rows: list[list[Any]] = []
+
+                # One row per individual. The simulation produces `reps_i` healthy and `reps_i` sick.
+                for ri in range(int(reps_i)):
+                    dt = int(death_ticks_healthy[int(ri)]) if int(ri) < int(len(death_ticks_healthy)) else int(ticks_i)
+                    dm = str(death_meas_healthy[int(ri)]) if int(ri) < int(len(death_meas_healthy)) else ""
+                    cause = str(dm or "")
+                    if int(dt) >= int(ticks_i):
+                        cause = "survived_to_end"
+                    sum_rows.append(["healthy", int(ticks_i), int(dt), str(cause)])
+
+                for ri in range(int(reps_i)):
+                    dt = int(death_ticks_sick[int(ri)]) if int(ri) < int(len(death_ticks_sick)) else int(ticks_i)
+                    dm = str(death_meas_sick[int(ri)]) if int(ri) < int(len(death_meas_sick)) else ""
+                    cause = str(dm or "")
+                    if int(dt) >= int(ticks_i):
+                        cause = "survived_to_end"
+                    sum_rows.append([str(disease_key), int(ticks_i), int(dt), str(cause)])
+
+                files_text[fn_sum] = _csv_from_rows(sum_header, sum_rows)
+
+                meta_rows.append(
+                    [
+                        str(run_id0),
+                        str(sid_sum),
+                        "in vivo lifespan study (win claim)",
+                        int(ticks_i),
+                        int(reps_i),
+                        bool(bool(interventions_real)),
+                        json.dumps(interventions_real, ensure_ascii=False),
+                        bool(win),
+                    ]
+                )
+
+                metadata_name = f"metadata_{run_tag}.csv"
+                files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_claim_cure_v1",
+                    "kind": "claim_cure",
+                    "player_id": _sanitize_player_id(player_id),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "seed": int(seed_i),
+                    "interventions": interventions_real,
+                    "baseline_disease_median_tick": float(med_s0),
+                    "treated_disease_median_tick": float(med_s),
+                    "extra_days": float(extra_days),
+                    "delta_median_ticks": float(delta_med),
+                    "win": bool(win),
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
+                unit = _tests_compute_unit_cost_cents(
+                    challenge=challenge,
+                    kind="claim_cure",
+                    model_key=str(disease_key),
+                    ticks=int(ticks_i),
+                    interventions_n=int(iv_n),
+                )
+                charge = _tests_make_charge(
+                    kind=f"tests_{challenge}_claim_cure",
+                    samples=int(2 * reps_i),
+                    unit_cost_cents=int(unit),
+                    meta={
+                        "experiment": f"tests_{challenge}_claim_cure_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                    },
+                )
+                game = _game_apply_charge(player_id, charge)
+
+                score_lifedays_per_usd = None
+                try:
+                    msu = float(game.get("money_spent_usd") or 0.0) if isinstance(game, dict) else 0.0
+                except Exception:
+                    msu = 0.0
+                if msu > 0.0:
+                    try:
+                        score_lifedays_per_usd = float(max(0.0, float(extra_days))) / float(msu)
+                    except Exception:
+                        score_lifedays_per_usd = None
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "experiment": f"tests_{challenge}_claim_cure_v1",
+                        "ticks": int(ticks_i),
+                        "replicates": int(reps_i),
+                        "death_measurements": list(death_names),
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
+                        "healthy": {
+                            **stats_healthy,
+                            "death_ticks": [int(x) for x in death_ticks_healthy],
+                            "death_measurements": [str(x) for x in death_meas_healthy],
+                            "curve": curve_healthy,
+                        },
+                        "baseline_sick": {
+                            **stats_sick_base,
+                            "death_ticks": [int(x) for x in death_ticks_sick_base],
+                            "death_measurements": [str(x) for x in death_meas_sick_base],
+                            "curve": curve_sick_base,
+                        },
+                        "sick": {
+                            **stats_sick,
+                            "death_ticks": [int(x) for x in death_ticks_sick],
+                            "death_measurements": [str(x) for x in death_meas_sick],
+                            "curve": curve_sick,
+                        },
+                        "baseline_disease_median_tick": float(med_s0),
+                        "treated_disease_median_tick": float(med_s),
+                        "extra_days": float(extra_days),
+                        "score_lifedays_per_usd": score_lifedays_per_usd,
+                        "delta_median_ticks": float(delta_med),
+                        "win": bool(win),
+                        "game": game,
+                    },
+                )
                 return
 
             if self.path == "/api/experiments/spatial_tx":
@@ -5954,7 +9997,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         if not isinstance(p0, dict):
                             continue
                         p1 = _deepcopy_payload(p0)
-                        _apply_interventions_to_payload_inplace(p1, interventions)
+                        if isinstance(interventions, list) and interventions:
+                            p1["_tick_interventions"] = list(interventions)
                         ent["payload"] = p1
 
                 if not cond_list:
@@ -5964,7 +10008,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         cond_list.append({"name": "healthy", "payload": healthy})
                     if isinstance(sick, dict):
                         sick2 = _deepcopy_payload(sick)
-                        _apply_interventions_to_payload_inplace(sick2, interventions)
+                        if isinstance(interventions, list) and interventions:
+                            sick2["_tick_interventions"] = list(interventions)
                         cond_list.append({"name": "sick", "payload": sick2})
 
                 if not cond_list:
@@ -6005,63 +10050,61 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError(f"seed must be an int: {e}") from e
                 syn_rng = np.random.default_rng(3)
 
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+
                 # Death-aware preflight: spatial/bulk assays are snapshots at `ticks`, so
                 # cancel if any replicate dies before the requested tick.
-                for ci, c in enumerate(cond_list):
-                    nm0 = str(c.get("name") or "").strip()
-                    payload0 = c.get("payload")
-                    if not nm0 or not isinstance(payload0, dict):
-                        continue
-                    for ri in range(reps_i):
-                        seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
-                        pf = _preflight_death_before_ticks(payload0, ticks=int(ticks_i), seed0=int(seed0))
-                        if isinstance(pf, dict):
-                            dt0 = int(pf.get("death_tick") or 0)
-                            self._send_json(
-                                400,
-                                {
-                                    "ok": False,
-                                    "error": f"ticks too high: '{nm0}' died at tick {dt0} (< requested ticks={int(ticks_i)})",
-                                    "error_kind": "ticks_exceed_death",
-                                    "experiment": "spatial_tx_v1",
-                                    "details": {
-                                        "condition": str(nm0),
-                                        "replicate": int(ri),
-                                        "seed": int(seed0),
-                                        "requested_ticks": int(ticks_i),
-                                        "death_tick": int(dt0),
-                                        "death_measurement": str(pf.get("death_measurement") or ""),
-                                        "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
-                                    },
-                                },
-                            )
-                            return
+                replicate_deaths: list[Dict[str, Any]] = []
 
                 meta_header = [
                     "cell_id",
                     "sample",
                     "condition",
+                    "assay",
                     "replicate",
                     "seed",
-                    "ticks",
+                    "sample_taken_at_day",
                     "x",
                     "y",
                     "grid_index",
                 ]
                 meta_rows: list[list[Any]] = []
-                mat_header = ["cell_id", *genes]
+                stx_kind = _stx_kind_from_gene_set_and_genes(gene_set_name, genes)
+                assay = "Spatial transcriptomics"
+                if str(stx_kind) == "bulk_proteomics":
+                    assay = "Spatial proteomics"
+                genes_masked = _bulk_omics_mask_feature_headers(genes, kind=str(stx_kind))
+                mat_header = ["cell_id", *genes_masked]
                 truth_mat_rows: list[list[Any]] = []
                 noisy_mat_rows: list[list[Any]] = []
 
                 out_runs: list[Dict[str, Any]] = []
+                files_text: Dict[str, Any] = {}
                 for ci, c in enumerate(cond_list):
                     nm = str(c.get("name") or "").strip()
                     payload = c.get("payload")
                     if not nm or not isinstance(payload, dict):
                         continue
 
+                    safe_cond = _omics_safe_label(nm, default="condition")
+
                     for ri in range(reps_i):
                         seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
+                        pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                        if isinstance(pf, dict):
+                            replicate_deaths.append(
+                                {
+                                    "condition": str(nm),
+                                    "replicate": int(ri),
+                                    "seed": int(seed0),
+                                    "requested_ticks": int(ticks_i),
+                                    "death_tick": int(pf.get("death_tick") or 0),
+                                    "death_measurement": str(pf.get("death_measurement") or ""),
+                                    "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
+                                }
+                            )
+                            continue
                         p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
                         tx = _spatial_tx_rows(
                             p,
@@ -6083,6 +10126,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         run_x: list[int] = []
                         run_y: list[int] = []
                         run_T: list[list[float]] = []
+                        rep_meta_rows: list[list[Any]] = []
 
                         for si, row in enumerate(rows):
                             if not isinstance(row, dict):
@@ -6098,13 +10142,29 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             except Exception:
                                 continue
                             grid_index = (yi * int(W) + xi) if (W > 0) else int(yi)
-                            cell_id = f"{nm}_r{int(ri)}_s{int(seed0)}_{int(si)}"
+
+                            cell_id = f"{safe_cond}_r{int(ri)}_{run_tag}_s{int(seed0)}_{int(si)}"
 
                             meta_rows.append(
                                 [
                                     cell_id,
                                     nm,
                                     nm,
+                                    str(assay),
+                                    int(ri),
+                                    int(seed0),
+                                    int(ticks_i),
+                                    int(xi),
+                                    int(yi),
+                                    int(grid_index),
+                                ]
+                            )
+                            rep_meta_rows.append(
+                                [
+                                    cell_id,
+                                    nm,
+                                    nm,
+                                    str(assay),
                                     int(ri),
                                     int(seed0),
                                     int(ticks_i),
@@ -6140,6 +10200,11 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             for ii, cid in enumerate(run_cell_ids):
                                 noisy_mat_rows.append([cid, *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]])
 
+                            rep_prefix = f"replicates/{safe_cond}_r{int(ri)}_{run_tag}"
+                            rep_rows = [[run_cell_ids[ii], *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]] for ii in range(len(run_cell_ids))]
+                            files_text[f"{rep_prefix}_matrix.csv"] = _csv_from_rows(mat_header, rep_rows)
+                            files_text[f"{rep_prefix}_cell_metadata.csv"] = _csv_from_rows(meta_header, rep_meta_rows)
+
                         out_runs.append(
                             {
                                 "condition": nm,
@@ -6152,9 +10217,41 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             }
                         )
 
+                if not out_runs:
+                    self._send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": f"all replicates died before requested ticks={int(ticks_i)}",
+                            "error_kind": "all_replicates_died",
+                            "experiment": "spatial_tx_v1",
+                            "details": {
+                                "requested_ticks": int(ticks_i),
+                                "replicates_requested": int(reps_i),
+                                "replicate_deaths": list(replicate_deaths),
+                            },
+                        },
+                    )
+                    return
+
                 matrix_truth_csv = _csv_from_rows(mat_header, truth_mat_rows)
                 matrix_noisy_csv = _csv_from_rows(mat_header, noisy_mat_rows)
                 metadata_csv = _csv_from_rows(meta_header, meta_rows)
+
+                files_text[f"metadata_{run_tag}.csv"] = str(metadata_csv)
+                manifest = {
+                    "experiment": "spatial_tx_v1",
+                    "kind": str(stx_kind),
+                    "player_id": _sanitize_player_id(player_id),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "replicates_completed": int(len(out_runs)),
+                    "replicate_deaths": list(replicate_deaths),
+                    "gene_set": str(gene_set_name or ""),
+                    "genes": list(genes_masked),
+                    "runs": out_runs,
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
 
                 samples_run = int(len(out_runs))
                 charge = _game_compute_charge(
@@ -6176,8 +10273,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         "experiment": "spatial_tx_v1",
                         "ticks": int(ticks_i),
                         "replicates": int(reps_i),
+                        "replicates_completed": int(len(out_runs)),
+                        "replicate_deaths": list(replicate_deaths),
                         "gene_set": str(gene_set_name or ""),
-                        "genes": genes,
+                        "genes": genes_masked,
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
                         "noise": {
                             "model": "synthetic_v3",
                             "sigma_cell": 0.35,
@@ -6217,7 +10318,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError("missing healthy/sick payloads")
 
                 sick2 = _deepcopy_payload(sick)
-                _apply_interventions_to_payload_inplace(sick2, interventions)
+                if isinstance(interventions, list) and interventions:
+                    sick2["_tick_interventions"] = list(interventions)
 
                 try:
                     ticks_i = max(0, int(ticks))
@@ -6632,7 +10734,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError("missing sick payload")
 
                 sick2 = _deepcopy_payload(sick)
-                _apply_interventions_to_payload_inplace(sick2, interventions)
+                if isinstance(interventions, list) and interventions:
+                    sick2["_tick_interventions"] = list(interventions)
 
                 try:
                     ticks_i = max(1, int(ticks))
@@ -6723,7 +10826,10 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                 def _eval_layer(li: int, nm: str) -> Dict[str, Any]:
                     p0 = _deepcopy_payload(sick2)
-                    _apply_interventions_to_payload_inplace(p0, [{"layer": str(nm), "direction": direction, "dose": float(dose_f)}])
+                    tiv0 = p0.get("_tick_interventions")
+                    tiv = list(tiv0) if isinstance(tiv0, list) else []
+                    tiv.append({"layer": str(nm), "direction": direction, "dose": float(dose_f)})
+                    p0["_tick_interventions"] = tiv
                     dts: list[int] = []
                     for ri in range(int(reps_i)):
                         seed0 = int(seed_i) + (int(li + 1) * 1000003) + (int(ri) * 97)
@@ -6872,7 +10978,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         if not isinstance(p0, dict):
                             continue
                         p1 = _deepcopy_payload(p0)
-                        _apply_interventions_to_payload_inplace(p1, interventions)
+                        if isinstance(interventions, list) and interventions:
+                            p1["_tick_interventions"] = list(interventions)
                         ent["payload"] = p1
 
                 if not cond_list:
@@ -6882,7 +10989,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         cond_list.append({"name": "healthy", "payload": healthy})
                     if isinstance(sick, dict):
                         sick2 = _deepcopy_payload(sick)
-                        _apply_interventions_to_payload_inplace(sick2, interventions)
+                        if isinstance(interventions, list) and interventions:
+                            sick2["_tick_interventions"] = list(interventions)
                         cond_list.append({"name": "sick", "payload": sick2})
 
                 if not cond_list:
@@ -6890,6 +10998,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                 if not features:
                     raise ValueError("no features selected")
+
+                kind = _bulk_omics_kind_from_set_name(str(omics_set_name or ""))
+                masked_features = _bulk_omics_mask_feature_headers(features, kind=str(kind))
 
                 z_target_arr = None
                 z_target_in = body.get("z_target")
@@ -6920,46 +11031,29 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                 syn_rng = np.random.default_rng(3)
 
+                run_id0 = uuid.uuid4().hex
+                run_tag = str(run_id0)[:12]
+
                 # Death-aware preflight: bulk assays are snapshots at `ticks`.
-                for ci, c in enumerate(cond_list):
-                    nm0 = str(c.get("name") or "").strip()
-                    payload0 = c.get("payload")
-                    if not nm0 or not isinstance(payload0, dict):
-                        continue
-                    for ri in range(reps_i):
-                        seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
-                        pf = _preflight_death_before_ticks(payload0, ticks=int(ticks_i), seed0=int(seed0))
-                        if isinstance(pf, dict):
-                            dt0 = int(pf.get("death_tick") or 0)
-                            self._send_json(
-                                400,
-                                {
-                                    "ok": False,
-                                    "error": f"ticks too high: '{nm0}' died at tick {dt0} (< requested ticks={int(ticks_i)})",
-                                    "error_kind": "ticks_exceed_death",
-                                    "experiment": "bulk_omics_v1",
-                                    "details": {
-                                        "condition": str(nm0),
-                                        "replicate": int(ri),
-                                        "seed": int(seed0),
-                                        "requested_ticks": int(ticks_i),
-                                        "death_tick": int(dt0),
-                                        "death_measurement": str(pf.get("death_measurement") or ""),
-                                        "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
-                                    },
-                                },
-                            )
-                            return
+                replicate_deaths: list[Dict[str, Any]] = []
+
+                assay = str(kind or "")
+                if assay == "bulk_rnaseq":
+                    assay = "Bulk transcriptomics"
+                elif assay == "bulk_proteomics":
+                    assay = "Bulk proteomics"
+                elif assay == "bulk_metabolomics":
+                    assay = "Bulk metabolomics"
 
                 meta_header = [
                     "sample_id",
+                    "assay",
                     "condition",
                     "replicate",
-                    "seed",
-                    "ticks",
+                    "study_ran_for_days",
                 ]
                 meta_rows: list[list[Any]] = []
-                mat_header = ["sample_id", *features]
+                mat_header = ["sample_id", *masked_features]
                 truth_mat_rows: list[list[Any]] = []
 
                 run_ids: list[str] = []
@@ -6974,6 +11068,20 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                     for ri in range(reps_i):
                         seed0 = int(seed_i) + (int(ci) * 1000003) + (int(ri) * 97)
+                        pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                        if isinstance(pf, dict):
+                            replicate_deaths.append(
+                                {
+                                    "condition": str(nm),
+                                    "replicate": int(ri),
+                                    "seed": int(seed0),
+                                    "requested_ticks": int(ticks_i),
+                                    "death_tick": int(pf.get("death_tick") or 0),
+                                    "death_measurement": str(pf.get("death_measurement") or ""),
+                                    "death_names": pf.get("death_names") if isinstance(pf.get("death_names"), list) else [],
+                                }
+                            )
+                            continue
                         p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
                         H = int(p.get("H") or 0)
                         W = int(p.get("W") or 0)
@@ -6984,7 +11092,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         if not layers:
                             raise ValueError("payload has no float32 layers")
 
-                        sample_id = f"{nm}_r{int(ri)}_s{int(seed0)}"
+                        sample_id = f"{nm}_c{int(ci)}_r{int(ri)}"
                         vv: list[float] = []
                         for ln in features:
                             arr = layers.get(ln)
@@ -7001,9 +11109,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                         meta_rows.append([
                             sample_id,
+                            str(assay),
                             nm,
                             int(ri),
-                            int(seed0),
                             int(ticks_i),
                         ])
                         truth_mat_rows.append([sample_id, *vv])
@@ -7016,10 +11124,28 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 "replicate": int(ri),
                                 "seed": int(seed0),
                                 "ticks": int(ticks_i),
+                                "age_days": int(ticks_i),
                                 "H": int(H),
                                 "W": int(W),
                             }
                         )
+
+                if not run_ids:
+                    self._send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": f"all replicates died before requested ticks={int(ticks_i)}",
+                            "error_kind": "all_replicates_died",
+                            "experiment": "bulk_omics_v1",
+                            "details": {
+                                "requested_ticks": int(ticks_i),
+                                "replicates_requested": int(reps_i),
+                                "replicate_deaths": list(replicate_deaths),
+                            },
+                        },
+                    )
+                    return
 
                 noisy_mat_rows: list[list[Any]] = []
                 if run_ids and run_T:
@@ -7032,8 +11158,31 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 matrix_noisy_csv = _csv_from_rows(mat_header, noisy_mat_rows)
                 metadata_csv = _csv_from_rows(meta_header, meta_rows)
 
+                files_text: Dict[str, Any] = {}
+                files_text[f"metadata_{run_tag}.csv"] = str(metadata_csv)
+                for row in noisy_mat_rows:
+                    if not isinstance(row, list) or not row:
+                        continue
+                    sid = str(row[0] or "")
+                    safe_sid = _omics_safe_label(sid, default="sample")
+                    files_text[f"samples/{safe_sid}.csv"] = _csv_from_rows(mat_header, [row])
+
+                manifest = {
+                    "experiment": "bulk_omics_v1",
+                    "kind": str(kind),
+                    "player_id": _sanitize_player_id(player_id),
+                    "ticks": int(ticks_i),
+                    "age_days": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "replicates_completed": int(len(out_runs)),
+                    "replicate_deaths": list(replicate_deaths),
+                    "omics_set": str(omics_set_name or ""),
+                    "features": list(masked_features),
+                    "runs": out_runs,
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
                 samples_run = int(len(out_runs))
-                kind = _bulk_omics_kind_from_set_name(str(omics_set_name or ""))
                 charge = _game_compute_charge(
                     kind,
                     samples_run,
@@ -7052,9 +11201,18 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         "ok": True,
                         "experiment": "bulk_omics_v1",
                         "ticks": int(ticks_i),
+                        "age_days": int(ticks_i),
                         "replicates": int(reps_i),
+                        "replicates_completed": int(len(out_runs)),
+                        "replicate_deaths": list(replicate_deaths),
                         "omics_set": str(omics_set_name or ""),
-                        "genes": features,
+                        "genes": masked_features,
+                        "run_id": str(omics_saved.get("run_id") or ""),
+                        "files": omics_saved.get("files"),
+                        "omics_inventory": {
+                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
+                        },
                         "noise": {
                             "model": "bulk_synthetic_v1",
                             "sigma_sample": 0.35,

@@ -1,0 +1,7 @@
+sample_type,study_observed_until_days,age_at_death_days,cause_of_death
+baseline_healthy,400,144,glucose_death
+baseline_healthy,400,247,nutrients_death
+baseline_healthy,400,259,nutrients_death
+treated_healthy,400,258,nutrients_death
+treated_healthy,400,248,nutrients_death
+treated_healthy,400,227,nutrients_death

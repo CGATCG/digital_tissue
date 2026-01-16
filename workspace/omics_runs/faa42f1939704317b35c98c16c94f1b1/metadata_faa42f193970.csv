@@ -1,0 +1,2 @@
+run_id,sample_id,assay,study_observed_until_days,replicates_per_group,interventions_in_healthy_model,interventions,win
+faa42f1939704317b35c98c16c94f1b1,summarized_results_faa42f193970,in vivo lifespan study (aging claim),400,3,True,"[{""layer"": ""protein_south_exporter_glucose"", ""direction"": ""down"", ""dose"": 5}]",False
