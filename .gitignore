@@ -9,3 +9,6 @@ venv/
 *.log
 runs/
 vars.sh
+
+workspace/game_state.json
+workspace/omics_runs/
