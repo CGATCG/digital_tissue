@@ -1,2 +1,0 @@
-run_id,sample_id,assay,model,direction,dose,study_ran_for_days,replicates,replicate,seed,protein_layers,measurements_filename,measurements_relpath,measurements_file_id,measurements_url
-a08de99abd8848a6bb2d71e6389b67f6,cell_culture_a08de99abd88_r0,Drug screen,cell_culture,down,5.0,30,1,0,1,104,cell_culture_a08de99abd88_r0_protein_screen_measurements.csv,results/cell_culture_a08de99abd88_r0_protein_screen_measurements.csv,d096cc0ec374,/api/omics/file?player_id=bench_1768508647_1ad9cef0&file_id=d096cc0ec374

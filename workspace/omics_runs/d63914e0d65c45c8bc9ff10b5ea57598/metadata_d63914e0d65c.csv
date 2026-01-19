@@ -1,2 +1,0 @@
-run_id,sample_id,assay,study_observed_until_days,replicates_per_group,interventions_in_healthy_model,interventions,win
-d63914e0d65c45c8bc9ff10b5ea57598,summarized_results_d63914e0d65c,in vivo lifespan study (aging claim),400,3,True,"[{""layer"": ""protein_north_importer_glucose"", ""direction"": ""down"", ""dose"": 10}]",False

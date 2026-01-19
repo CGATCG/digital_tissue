@@ -1,11 +1,14 @@
 import argparse
 import csv
+import hashlib
 import io
 import json
 import math
 import os
+import platform
 import re
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -13,7 +16,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 def _http_post_json(*, url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
@@ -83,6 +86,122 @@ _ANTHROPIC_ACTION_SCHEMA: Dict[str, Any] = {
 }
 
 
+_ANTHROPIC_INPUT_TPM_LIMIT = 30_000
+_ANTHROPIC_TPM_WINDOW_S = 60.0
+_ANTHROPIC_TPM_SAFETY_FRAC = 0.95
+_ANTHROPIC_TPM_USAGE: List[Tuple[float, int]] = []
+_ANTHROPIC_CACHE_PREFIX_SIGS: Set[str] = set()
+
+
+def _approx_token_count_text(text: str) -> int:
+    s = str(text or "")
+    if not s:
+        return 0
+    return max(1, int(math.ceil(len(s) / 4.0)))
+
+
+def _anthropic_estimate_input_tokens(*, system_blocks: List[Dict[str, Any]], messages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for b in system_blocks or []:
+        if not isinstance(b, dict):
+            continue
+        if str(b.get("type") or "").strip().lower() != "text":
+            continue
+        total += _approx_token_count_text(str(b.get("text") or "")) + 8
+
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        total += 10
+        total += _approx_token_count_text(str(m.get("role") or ""))
+        c = m.get("content")
+        if isinstance(c, str):
+            total += _approx_token_count_text(c)
+        elif isinstance(c, list):
+            for blk in c:
+                if not isinstance(blk, dict):
+                    continue
+                if str(blk.get("type") or "").strip().lower() != "text":
+                    continue
+                total += _approx_token_count_text(str(blk.get("text") or ""))
+        else:
+            total += _approx_token_count_text(str(c or ""))
+    return int(total)
+
+
+def _anthropic_cache_prefix_sig(*, system_blocks: List[Dict[str, Any]], messages: List[Dict[str, Any]], breakpoint_msg_idx: Optional[int]) -> str:
+    h = hashlib.sha256()
+    for b in system_blocks or []:
+        if not isinstance(b, dict):
+            continue
+        if str(b.get("type") or "").strip().lower() != "text":
+            continue
+        h.update(b"system\n")
+        h.update(str(b.get("text") or "").encode("utf-8", errors="ignore"))
+        h.update(b"\n")
+
+    if breakpoint_msg_idx is None:
+        return h.hexdigest()
+
+    lim = int(breakpoint_msg_idx) + 1
+    for m in (messages or [])[:lim]:
+        if not isinstance(m, dict):
+            continue
+        h.update(b"msg\n")
+        h.update(str(m.get("role") or "").encode("utf-8", errors="ignore"))
+        h.update(b"\n")
+        c = m.get("content")
+        if isinstance(c, str):
+            h.update(c.encode("utf-8", errors="ignore"))
+            h.update(b"\n")
+        elif isinstance(c, list):
+            for blk in c:
+                if not isinstance(blk, dict):
+                    continue
+                if str(blk.get("type") or "").strip().lower() != "text":
+                    continue
+                h.update(str(blk.get("text") or "").encode("utf-8", errors="ignore"))
+                h.update(b"\n")
+        else:
+            h.update(str(c or "").encode("utf-8", errors="ignore"))
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+def _anthropic_tpm_throttle(*, need_tokens: int) -> None:
+    global _ANTHROPIC_TPM_USAGE
+    need = int(need_tokens or 0)
+    if need <= 0:
+        return
+
+    limit = int(int(_ANTHROPIC_INPUT_TPM_LIMIT) * float(_ANTHROPIC_TPM_SAFETY_FRAC))
+    if limit <= 0:
+        return
+
+    while True:
+        now = float(time.time())
+        _ANTHROPIC_TPM_USAGE = [(t, n) for (t, n) in (_ANTHROPIC_TPM_USAGE or []) if (now - float(t)) < float(_ANTHROPIC_TPM_WINDOW_S)]
+        used = int(sum(int(n) for (_, n) in _ANTHROPIC_TPM_USAGE))
+        if used + need <= limit:
+            _ANTHROPIC_TPM_USAGE.append((now, need))
+            return
+        if not _ANTHROPIC_TPM_USAGE:
+            _ANTHROPIC_TPM_USAGE.append((now, need))
+            return
+        oldest_t = float(_ANTHROPIC_TPM_USAGE[0][0])
+        sleep_s = max(0.0, float(_ANTHROPIC_TPM_WINDOW_S) - (now - oldest_t) + 1.0)
+        sleep_s = min(75.0, sleep_s)
+        try:
+            print(
+                f"Anthropic TPM throttle: used={used} need~{need} limit={limit}. Sleeping {sleep_s:.1f}s...",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
+        time.sleep(float(sleep_s))
+
+
 def _anthropic_headers(*, api_key: str, betas: Optional[List[str]] = None, content_type_json: bool = True) -> Dict[str, str]:
     h = {
         "x-api-key": str(api_key),
@@ -114,13 +233,14 @@ def _anthropic_messages_generate(
     temperature: float,
     max_tokens: int,
     timeout_s: float,
+    dump_path: Optional[str] = None,
 ) -> str:
     api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("missing ANTHROPIC_API_KEY")
 
-    sys_parts: List[str] = []
-    msgs_out: List[Dict[str, str]] = []
+    system_blocks: List[Dict[str, Any]] = []
+    msgs_out: List[Dict[str, Any]] = []
     for m in messages or []:
         if not isinstance(m, dict):
             continue
@@ -128,50 +248,203 @@ def _anthropic_messages_generate(
         content0 = str(m.get("content") or "")
         if role0 == "system":
             if content0.strip():
-                sys_parts.append(content0)
+                system_blocks.append({"type": "text", "text": content0})
             continue
         if role0 not in ("user", "assistant"):
             role0 = "user"
-        msgs_out.append({"role": role0, "content": content0})
+        msgs_out.append({"role": role0, "content": [{"type": "text", "text": content0}]})
+
+    cache_breakpoint_msg_idx: Optional[int] = None
+    for i, m in enumerate(msgs_out):
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role") or "").strip().lower() != "user":
+            continue
+        c = m.get("content")
+        txt = ""
+        if isinstance(c, str):
+            txt = c
+        elif isinstance(c, list) and c and isinstance(c[0], dict):
+            txt = str(c[0].get("text") or "")
+        if str(txt).strip().startswith("Harness info:"):
+            cache_breakpoint_msg_idx = int(i)
+            break
 
     payload: Dict[str, Any] = {
         "model": str(model),
         "max_tokens": int(max_tokens),
         "messages": msgs_out,
     }
-    if sys_parts:
-        payload["system"] = "\n\n".join(sys_parts)
+    if str(model or "").strip() == "claude-opus-4-5-20251101":
+        budget = 63_999
+        try:
+            budget = int(os.environ.get("DT_ANTHROPIC_THINKING_BUDGET", str(budget)) or budget)
+        except Exception:
+            budget = 63_999
+        budget = max(1, min(200_000, int(budget)))
+        max_out = max(1, int(max_tokens))
+        if max_out > 1:
+            budget = max(1, min(int(budget), int(max_out) - 1))
+            payload["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
+    if system_blocks:
+        payload["system"] = system_blocks
+
+    cache_ttl = str(os.environ.get("ANTHROPIC_CACHE_TTL") or "").strip().lower()
+    cache_control_sys: Dict[str, Any] = {"type": "ephemeral"}
+    if cache_ttl in ("5m", "1h"):
+        cache_control_sys["ttl"] = cache_ttl
+    if system_blocks:
+        system_blocks[-1]["cache_control"] = cache_control_sys
+
+    if cache_breakpoint_msg_idx is not None:
+        try:
+            blk = payload["messages"][int(cache_breakpoint_msg_idx)]["content"]
+            if isinstance(blk, list) and blk:
+                cache_control_msg: Dict[str, Any] = {"type": "ephemeral"}
+                if cache_ttl in ("5m", "1h"):
+                    cache_control_msg["ttl"] = cache_ttl
+                blk[-1]["cache_control"] = cache_control_msg
+        except Exception:
+            pass
+
+    try:
+        if isinstance(payload.get("messages"), list) and payload["messages"]:
+            blk = payload["messages"][-1].get("content")
+            if isinstance(blk, list) and blk:
+                cache_control_end: Dict[str, Any] = {"type": "ephemeral"}
+                if cache_ttl in ("5m", "1h"):
+                    cache_control_end["ttl"] = cache_ttl
+                blk[-1]["cache_control"] = cache_control_end
+    except Exception:
+        pass
+
     try:
         payload["temperature"] = float(temperature)
     except Exception:
         payload["temperature"] = 0.0
 
+    if str(model or "").strip() == "claude-opus-4-5-20251101" and isinstance(payload.get("thinking"), dict):
+        payload["temperature"] = 1.0
+
+    if str(dump_path or "").strip():
+        try:
+            _write_json_file(str(dump_path), payload)
+        except Exception:
+            pass
+
     betas: List[str] = []
 
-    last_err: Optional[str] = None
-    for attempt in range(3):
-        try:
-            resp_json = _http_post_json(
-                url=f"{_ANTHROPIC_BASE_URL}/messages",
-                headers=_anthropic_headers(api_key=api_key, betas=betas, content_type_json=True),
-                payload=payload,
-                timeout_s=float(timeout_s),
-            )
-            if isinstance(resp_json, dict) and str(resp_json.get("stop_reason") or "").strip().lower() == "refusal":
-                raise RuntimeError("Anthropic refusal")
-            txt = _anthropic_assistant_text(resp_json if isinstance(resp_json, dict) else {})
-            return str(txt or "")
-        except Exception as e:
-            last_err = str(e)
-            if attempt < 2 and ("HTTP 429" in last_err or "HTTP 529" in last_err or "429" in last_err and "HTTP" in last_err or "529" in last_err and "HTTP" in last_err):
-                time.sleep(float(0.7 * (2**attempt)))
-                continue
-            if attempt < 2:
-                time.sleep(float(0.5 * (2**attempt)))
-                continue
-            raise
+    try:
+        cache_sig = _anthropic_cache_prefix_sig(system_blocks=system_blocks, messages=msgs_out, breakpoint_msg_idx=cache_breakpoint_msg_idx)
+        need_full = _anthropic_estimate_input_tokens(system_blocks=system_blocks, messages=msgs_out)
+        tail = msgs_out[(int(cache_breakpoint_msg_idx) + 1) :] if cache_breakpoint_msg_idx is not None else msgs_out
+        need_uncached = _anthropic_estimate_input_tokens(system_blocks=[], messages=tail)
+        need = int(need_uncached if (cache_sig in _ANTHROPIC_CACHE_PREFIX_SIGS) else need_full)
+        need += 250
+        _anthropic_tpm_throttle(need_tokens=int(need))
+    except Exception:
+        pass
 
-    raise RuntimeError(last_err or "Anthropic request failed")
+    resp_json = _http_post_json(
+        url=f"{_ANTHROPIC_BASE_URL}/messages",
+        headers=_anthropic_headers(api_key=api_key, betas=betas, content_type_json=True),
+        payload=payload,
+        timeout_s=float(timeout_s),
+    )
+    try:
+        usage = resp_json.get("usage") if isinstance(resp_json, dict) else None
+        if isinstance(usage, dict):
+            cr = float(usage.get("cache_read_input_tokens") or 0.0)
+            cc = float(usage.get("cache_creation_input_tokens") or 0.0)
+            it = float(usage.get("input_tokens") or 0.0)
+            if str(os.environ.get("ANTHROPIC_CACHE_DEBUG") or "").strip() in ("1", "true", "yes"):
+                try:
+                    tot = cr + cc + it
+                    frac = (cr / tot) if tot > 0 else 0.0
+                    print(
+                        f"Anthropic cache: read={int(cr)} create={int(cc)} input={int(it)} total={int(tot)} hit_frac={frac:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            if cr > 0.0 or cc > 0.0:
+                _ANTHROPIC_CACHE_PREFIX_SIGS.add(
+                    _anthropic_cache_prefix_sig(system_blocks=system_blocks, messages=msgs_out, breakpoint_msg_idx=cache_breakpoint_msg_idx)
+                )
+    except Exception:
+        pass
+    if isinstance(resp_json, dict) and str(resp_json.get("stop_reason") or "").strip().lower() == "refusal":
+        raise RuntimeError("Anthropic refusal")
+    txt = _anthropic_assistant_text(resp_json if isinstance(resp_json, dict) else {})
+    return str(txt or "")
+
+
+def _llm_retry_attempts() -> int:
+    attempts = 3
+    try:
+        attempts = int(os.environ.get("DT_LLM_RETRY_ATTEMPTS", str(attempts)) or attempts)
+    except Exception:
+        attempts = 3
+    return max(1, min(10, int(attempts)))
+
+
+def _llm_should_retry_error(err: str) -> bool:
+    s = str(err or "").lower()
+    if not s.strip():
+        return False
+    needles = (
+        "http 429",
+        "429",
+        "rate limit",
+        "rate_limit",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "http 529",
+        "overloaded",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "remote end closed connection",
+        "service unavailable",
+    )
+    return any(n in s for n in needles)
+
+
+def _llm_call_with_retries(fn: Callable[[], str], *, attempts: int, base_sleep_s: float) -> str:
+    last_err: Optional[Exception] = None
+    for attempt in range(int(attempts)):
+        try:
+            return str(fn() or "")
+        except Exception as e:
+            last_err = e
+            if attempt >= (int(attempts) - 1) or (not _llm_should_retry_error(str(e))):
+                raise
+            sleep_s = float(base_sleep_s) * float(2**attempt)
+            sleep_s = min(60.0, max(0.0, sleep_s))
+            time.sleep(float(sleep_s))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("LLM request failed")
+
+
+def _openai_base_model_and_effort(model: str) -> Tuple[str, Optional[str]]:
+    m = str(model or "").strip()
+    if not m:
+        return "", None
+    if m == "gpt-5.2":
+        return "gpt-5.2", "medium"
+    if m == "gpt-5.2-medium":
+        return "gpt-5.2", "medium"
+    if m == "gpt-5.2-high":
+        return "gpt-5.2", "high"
+    if m in ("gpt-5.2-extra-high", "gpt-5.2-xhigh"):
+        return "gpt-5.2", "xhigh"
+    return m, None
 
 
 _PROMPT = r"""
@@ -200,14 +473,15 @@ Your score is based on:
 POST /api/tests/disease/claim_cure
 
 The claim_cure response includes:
-- extra_days: treated_disease_median_lifespan_tick - baseline_disease_median_lifespan_tick
-- score_lifedays_per_usd: max(0, extra_days) / game.money_spent_usd
+- extra_days: treated_disease_median_tick - baseline_disease_median_tick
+- lifespan_recovery_pct ("Lifespan Recovery"): treated_disease_median_tick / healthy_median_tick * 100
+- score: (extra_days / game.money_spent_usd) * 10000
 
 This means you should increase lifespan while keeping total money_spent in mind. You are allowed to run claim_cure even if you are not close to a "win" yet; early attempts are expected.
 
 Win is a ceiling condition (treatment matches healthy controls):
 - win: boolean
-- delta_median_ticks: treated_disease_median_lifespan_tick - healthy_median_lifespan_tick
+- delta_median_ticks: treated_disease_median_tick - healthy_median_tick
 - win if abs(delta_median_ticks) <= 0.5
 
 If win=true, the run will stop automatically (the disease cannot be improved beyond matching healthy controls).
@@ -468,6 +742,8 @@ class BenchMetrics:
     win: bool = False
     final_delta_median_ticks: Optional[float] = None
     best_extra_days: Optional[float] = None
+    best_lifespan_recovery_pct: Optional[float] = None
+    best_score: Optional[float] = None
     best_score_lifedays_per_usd: Optional[float] = None
     best_score_seq: Optional[int] = None
     money_spent_cents: Optional[int] = None
@@ -566,35 +842,270 @@ def llm_generate(
     temperature: float,
     max_tokens: int,
     timeout_s: float,
+    dump_path: Optional[str] = None,
 ) -> str:
     prov = str(provider or "").strip().lower()
+    if prov == "grok":
+        prov = "xai"
+    attempts = _llm_retry_attempts()
     if prov in ("openai", "openai_compat"):
         from openai import OpenAI
 
         client = OpenAI(api_key=str(os.environ.get("OPENAI_API_KEY") or "").strip() or None)
+
+        base_model, effort = _openai_base_model_and_effort(str(model))
+        if effort is not None:
+            ctx = [{"role": str(m.get("role") or "user"), "content": str(m.get("content") or "")} for m in (messages or [])]
+            req2: Dict[str, Any] = {
+                "model": str(base_model),
+                "input": ctx,
+                "reasoning": {"effort": str(effort)},
+                "text": {"format": {"type": "text"}, "verbosity": "medium"},
+                "timeout": float(timeout_s),
+            }
+            try:
+                req2["temperature"] = float(temperature)
+            except Exception:
+                pass
+            if str(dump_path or "").strip():
+                try:
+                    _write_json_file(str(dump_path), {"provider": "openai", "request": req2, "max_tokens": int(max_tokens)})
+                except Exception:
+                    pass
+
+            def _call_once() -> str:
+                try:
+                    try:
+                        resp = client.responses.create(**req2, max_output_tokens=int(max_tokens))
+                    except Exception:
+                        resp = client.responses.create(**req2)
+                except Exception as e:
+                    msg = str(e)
+                    if ("temperature" in msg) and ("Unsupported parameter" in msg or "not supported" in msg):
+                        req3 = dict(req2)
+                        req3.pop("temperature", None)
+                        try:
+                            resp = client.responses.create(**req3, max_output_tokens=int(max_tokens))
+                        except Exception:
+                            resp = client.responses.create(**req3)
+                    else:
+                        raise
+                out_text = ""
+                try:
+                    out_text = str(getattr(resp, "output_text", "") or "")
+                except Exception:
+                    out_text = ""
+                if str(out_text or "").strip():
+                    return str(out_text or "")
+                try:
+                    dump = resp.model_dump()  # type: ignore[attr-defined]
+                except Exception:
+                    dump = None
+                if isinstance(dump, dict) and isinstance(dump.get("output"), list):
+                    chunks: List[str] = []
+                    for item in (dump.get("output") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") != "message":
+                            continue
+                        content = item.get("content")
+                        if not isinstance(content, list):
+                            continue
+                        for c in content:
+                            if not isinstance(c, dict):
+                                continue
+                            if c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                                chunks.append(str(c.get("text") or ""))
+                            elif c.get("type") == "text" and isinstance(c.get("text"), str):
+                                chunks.append(str(c.get("text") or ""))
+                    out_text = "".join(chunks).strip()
+                return str(out_text or "")
+
+            return _llm_call_with_retries(_call_once, attempts=int(attempts), base_sleep_s=0.8)
+
+        req = {
+            "model": str(base_model),
+            "messages": [{"role": str(m.get("role") or "user"), "content": str(m.get("content") or "")} for m in (messages or [])],
+            "temperature": float(temperature),
+            "timeout": float(timeout_s),
+        }
+        if str(dump_path or "").strip():
+            try:
+                _write_json_file(str(dump_path), {"provider": "openai", "request": req, "max_tokens": int(max_tokens)})
+            except Exception:
+                pass
+        def _call_once() -> str:
+            try:
+                resp = client.chat.completions.create(**req, max_completion_tokens=int(max_tokens))
+            except Exception as e:
+                msg = str(e)
+                if ("temperature" in msg) and ("Unsupported parameter" in msg or "not supported" in msg):
+                    req3 = dict(req)
+                    req3.pop("temperature", None)
+                    try:
+                        resp = client.chat.completions.create(**req3, max_completion_tokens=int(max_tokens))
+                    except Exception:
+                        resp = client.chat.completions.create(**req3, max_tokens=int(max_tokens))
+                else:
+                    resp = client.chat.completions.create(**req, max_tokens=int(max_tokens))
+            try:
+                return str(resp.choices[0].message.content or "")
+            except Exception:
+                return ""
+
+        return _llm_call_with_retries(_call_once, attempts=int(attempts), base_sleep_s=0.8)
+
+    if prov in ("gemini",):
+        api_key = str(os.environ.get("GEMINI_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("missing GEMINI_API_KEY")
+        base_url = str(os.environ.get("GEMINI_BASE_URL") or "").strip() or "https://generativelanguage.googleapis.com/v1beta"
+
+        sys_txts: List[str] = []
+        contents: List[Dict[str, Any]] = []
+        for m in (messages or []):
+            r = str(m.get("role") or "user").strip().lower()
+            c = str(m.get("content") or "")
+            if r == "system":
+                if c.strip():
+                    sys_txts.append(c)
+                continue
+            role_out = "user"
+            if r in ("assistant", "model"):
+                role_out = "model"
+            contents.append({"role": role_out, "parts": [{"text": c}]})
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": ""}]}]
+
+        payload: Dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": float(temperature),
+                "maxOutputTokens": int(max_tokens),
+            },
+        }
+        if str(model or "").strip().startswith("gemini-3-"):
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
+        if sys_txts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(sys_txts)}]}
+
+        url = str(base_url).rstrip("/") + "/models/" + str(model) + ":generateContent"
+        headers = {
+            "x-goog-api-key": str(api_key),
+            "content-type": "application/json",
+        }
+
+        if str(dump_path or "").strip():
+            try:
+                _write_json_file(
+                    str(dump_path),
+                    {
+                        "provider": "gemini",
+                        "base_url": str(base_url),
+                        "url": str(url),
+                        "request": payload,
+                        "max_tokens": int(max_tokens),
+                    },
+                )
+            except Exception:
+                pass
+
+        def _call_once() -> str:
+            resp_json = _http_post_json(url=str(url), headers=headers, payload=payload, timeout_s=float(timeout_s))
+            out_text0 = ""
+            diag: Dict[str, Any] = {}
+            try:
+                candidates = resp_json.get("candidates") if isinstance(resp_json, dict) else None
+                if isinstance(candidates, list) and candidates:
+                    c0 = candidates[0] if isinstance(candidates[0], dict) else {}
+                    content = c0.get("content") if isinstance(c0, dict) else None
+                    parts = content.get("parts") if isinstance(content, dict) else None
+                    if isinstance(parts, list) and parts:
+                        out_chunks: List[str] = []
+                        for p in parts:
+                            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                                out_chunks.append(str(p.get("text") or ""))
+                        out_text0 = "".join(out_chunks).strip()
+                    if isinstance(resp_json, dict) and isinstance(c0, dict):
+                        try:
+                            diag["finishReason"] = c0.get("finishReason")
+                            diag["finishMessage"] = c0.get("finishMessage")
+                            diag["safetyRatings"] = c0.get("safetyRatings")
+                        except Exception:
+                            pass
+            except Exception:
+                out_text0 = ""
+            if isinstance(resp_json, dict):
+                try:
+                    pf = resp_json.get("promptFeedback")
+                    if isinstance(pf, dict) and pf:
+                        diag["promptFeedback"] = pf
+                except Exception:
+                    pass
+            if not str(out_text0 or "").strip():
+                diag_s = ""
+                try:
+                    diag_s = json.dumps(diag, ensure_ascii=False)
+                except Exception:
+                    diag_s = str(diag)
+                raise RuntimeError("Gemini returned empty text" + (": " + diag_s[:1000] if diag_s else ""))
+            return str(out_text0 or "")
+
+        return _llm_call_with_retries(_call_once, attempts=int(attempts), base_sleep_s=0.8)
+
+    if prov in ("xai", "grok"):
+        from openai import OpenAI
+
+        api_key = str(os.environ.get("XAI_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("missing XAI_API_KEY")
+        base_url = str(os.environ.get("XAI_BASE_URL") or "").strip() or "https://api.x.ai/v1"
+
+        client = OpenAI(api_key=api_key, base_url=str(base_url))
         req = {
             "model": str(model),
             "messages": [{"role": str(m.get("role") or "user"), "content": str(m.get("content") or "")} for m in (messages or [])],
             "temperature": float(temperature),
             "timeout": float(timeout_s),
         }
-        try:
-            resp = client.chat.completions.create(**req, max_completion_tokens=int(max_tokens))
-        except Exception:
-            resp = client.chat.completions.create(**req, max_tokens=int(max_tokens))
-        try:
-            return str(resp.choices[0].message.content or "")
-        except Exception:
-            return ""
+        if str(dump_path or "").strip():
+            try:
+                _write_json_file(
+                    str(dump_path),
+                    {
+                        "provider": "xai",
+                        "base_url": str(base_url),
+                        "request": req,
+                        "max_tokens": int(max_tokens),
+                    },
+                )
+            except Exception:
+                pass
+
+        def _call_once() -> str:
+            try:
+                resp = client.chat.completions.create(**req, max_completion_tokens=int(max_tokens))
+            except Exception:
+                resp = client.chat.completions.create(**req, max_tokens=int(max_tokens))
+            try:
+                return str(resp.choices[0].message.content or "")
+            except Exception:
+                return ""
+
+        return _llm_call_with_retries(_call_once, attempts=int(attempts), base_sleep_s=0.8)
 
     if prov in ("anthropic", "claude"):
-        return _anthropic_messages_generate(
-            model=str(model),
-            messages=messages,
-            temperature=float(temperature),
-            max_tokens=int(max_tokens),
-            timeout_s=float(timeout_s),
-        )
+        def _call_once() -> str:
+            return _anthropic_messages_generate(
+                model=str(model),
+                messages=messages,
+                temperature=float(temperature),
+                max_tokens=int(max_tokens),
+                timeout_s=float(timeout_s),
+                dump_path=str(dump_path or "") or None,
+            )
+
+        return _llm_call_with_retries(_call_once, attempts=int(attempts), base_sleep_s=0.8)
 
     raise RuntimeError(f"unsupported provider: {provider!r}")
 
@@ -623,6 +1134,109 @@ def _write_json_file(path: str, obj: Dict[str, Any]) -> None:
         f.write(json.dumps(obj, indent=2, ensure_ascii=False))
         f.write("\n")
     os.replace(tmp, p)
+
+
+def _human_mode_dir(*, state_out: Optional[str], events_out: Optional[str], files_dir: Optional[str]) -> Optional[Path]:
+    cand: Optional[str] = None
+    for p in (state_out, events_out, files_dir):
+        if str(p or "").strip():
+            cand = str(p)
+            break
+    if not cand:
+        return None
+    try:
+        d = Path(str(cand)).resolve()
+        if d.is_dir():
+            return d / "human_mode"
+        return d.parent / "human_mode"
+    except Exception:
+        return None
+
+
+def _read_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _human_write_pending(
+    *,
+    human_dir: Path,
+    step: int,
+    player_id: str,
+    base_url: str,
+    error: Optional[str],
+) -> None:
+    try:
+        human_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    pending = {
+        "ok": True,
+        "waiting": True,
+        "step": int(step),
+        "player_id": str(player_id),
+        "base_url": str(base_url),
+        "expecting": f"input_step_{int(step):06d}.json",
+        "error": str(error or "").strip(),
+        "ts": float(time.time()),
+        "instructions": "Provide a directive for the next action. You may provide either plain text (key 'text') or a full Action JSON (key 'action_json').",
+    }
+    _write_json_file(str(human_dir / "pending.json"), pending)
+
+
+def _human_wait_for_input(
+    *,
+    human_dir: Path,
+    step: int,
+    player_id: str,
+    base_url: str,
+    poll_s: float,
+    error: Optional[str],
+) -> Dict[str, Any]:
+    poll = float(poll_s)
+    if poll <= 0.05:
+        poll = 0.25
+    if poll > 5.0:
+        poll = 5.0
+
+    _human_write_pending(human_dir=human_dir, step=int(step), player_id=str(player_id), base_url=str(base_url), error=error)
+
+    inp = human_dir / f"input_step_{int(step):06d}.json"
+    stop_path = human_dir / "stop.json"
+    processed_dir = human_dir / "processed"
+    try:
+        processed_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    while True:
+        if stop_path.exists():
+            stop_obj = _read_json_if_exists(stop_path) or {}
+            return {"ok": True, "stop": True, **stop_obj}
+
+        obj = _read_json_if_exists(inp)
+        if isinstance(obj, dict):
+            try:
+                ts = int(time.time() * 1000)
+                outp = processed_dir / f"input_step_{int(step):06d}_{int(ts)}.json"
+                os.replace(str(inp), str(outp))
+            except Exception:
+                try:
+                    inp.unlink()
+                except Exception:
+                    pass
+            try:
+                (human_dir / "pending.json").unlink()
+            except Exception:
+                pass
+            return obj
+
+        time.sleep(poll)
 
 
 def _is_csv_field(k: str) -> bool:
@@ -866,6 +1480,180 @@ def _prune_messages(messages: List[Dict[str, str]], *, pinned: List[Dict[str, st
     return out
 
 
+def _estimate_prompt_tokens(messages: List[Dict[str, str]]) -> int:
+    total = 0
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        total += 10
+        total += _approx_token_count_text(str(m.get("role") or ""))
+        total += _approx_token_count_text(str(m.get("content") or ""))
+    return int(total)
+
+
+def _messages_to_summary_text(messages: List[Dict[str, str]], *, max_chars: int) -> str:
+    parts: List[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = str(m.get("content") or "")
+        if not role and not content:
+            continue
+        parts.append(f"[{role}]\n{content}\n")
+    txt = "\n".join(parts).strip()
+    if int(max_chars) > 0 and len(txt) > int(max_chars):
+        txt = txt[-int(max_chars) :]
+        cut = txt.find("\n")
+        if cut >= 0:
+            txt = txt[cut + 1 :]
+    return txt
+
+
+def _maybe_prune_messages_with_summary(
+    *,
+    messages: List[Dict[str, str]],
+    pinned: List[Dict[str, str]],
+    provider: str,
+    model: str,
+    llm_timeout_s: float,
+    step: int,
+    max_tokens_per_call: int,
+    notebook: str,
+) -> Tuple[List[Dict[str, str]], str]:
+    context_tokens = 64_000
+    try:
+        context_tokens = int(os.environ.get("DT_LLM_CONTEXT_TOKENS", str(context_tokens)) or context_tokens)
+    except Exception:
+        context_tokens = 64_000
+    context_tokens = max(20_000, int(context_tokens))
+
+    trim_at = int(0.92 * float(context_tokens))
+    try:
+        trim_at = int(os.environ.get("DT_PROMPT_TRIM_AT_TOKENS", str(trim_at)) or trim_at)
+    except Exception:
+        trim_at = int(0.92 * float(context_tokens))
+    trim_at = max(10_000, min(int(context_tokens), int(trim_at)))
+
+    target = int(0.80 * float(context_tokens))
+    try:
+        target = int(os.environ.get("DT_PROMPT_TARGET_TOKENS", str(target)) or target)
+    except Exception:
+        target = int(0.80 * float(context_tokens))
+    target = max(10_000, min(int(context_tokens), int(target)))
+
+    keep_recent = 60
+    try:
+        keep_recent = int(os.environ.get("DT_PROMPT_KEEP_RECENT", str(keep_recent)) or keep_recent)
+    except Exception:
+        keep_recent = 60
+    keep_recent = max(8, int(keep_recent))
+
+    summary_out_tokens = 1200
+    try:
+        summary_out_tokens = int(os.environ.get("DT_PROMPT_SUMMARY_OUT_TOKENS", str(summary_out_tokens)) or summary_out_tokens)
+    except Exception:
+        summary_out_tokens = 1200
+    summary_out_tokens = max(200, min(4000, int(summary_out_tokens)))
+
+    chunk_max_chars = 240_000
+    try:
+        chunk_max_chars = int(os.environ.get("DT_PROMPT_SUMMARY_CHUNK_MAX_CHARS", str(chunk_max_chars)) or chunk_max_chars)
+    except Exception:
+        chunk_max_chars = 240_000
+    chunk_max_chars = max(20_000, int(chunk_max_chars))
+
+    msgs = list(messages or [])
+    pin = list(pinned or [])
+    pin_ids = {id(x) for x in pin}
+    msgs = [m for m in msgs if isinstance(m, dict)]
+    if not msgs:
+        return [], str(notebook or "")
+
+    est = _estimate_prompt_tokens(msgs)
+    reserve = int(max(0, int(max_tokens_per_call)) + 1500)
+    limit_eff = max(10_000, int(context_tokens) - int(reserve))
+    if est <= min(int(trim_at), int(limit_eff)):
+        return msgs, str(notebook or "")
+
+    while True:
+        est = _estimate_prompt_tokens(msgs)
+        if est <= min(int(target), int(limit_eff)):
+            break
+
+        pin_len = int(len(pin))
+        cut_end = max(pin_len, int(len(msgs) - int(keep_recent)))
+        prunable = [m for m in msgs[pin_len:cut_end] if id(m) not in pin_ids]
+        if not prunable:
+            if keep_recent > 8:
+                keep_recent = max(8, int(keep_recent) - 8)
+                continue
+            msgs = _prune_messages(msgs, pinned=pin, keep_last=12)
+            break
+
+        chunk: List[Dict[str, str]] = []
+        chunk_tokens = 0
+        for m in prunable:
+            mt = 10 + _approx_token_count_text(str(m.get("role") or "")) + _approx_token_count_text(str(m.get("content") or ""))
+            if chunk and (chunk_tokens + mt) > 18_000:
+                break
+            chunk.append(m)
+            chunk_tokens += int(mt)
+
+        if not chunk:
+            msgs = _prune_messages(msgs, pinned=pin, keep_last=12)
+            break
+
+        chunk_txt = _messages_to_summary_text(chunk, max_chars=int(chunk_max_chars))
+        summary_prompt = (
+            "Summarize the following earlier conversation history into a compact context that preserves key facts, "
+            "decisions, hypotheses, experiment results (include numbers if present), constraints/rules, and open questions. "
+            "Be concise but do not omit critical details. Return plain text.\n\n"
+            + chunk_txt
+        )
+
+        summary_txt = ""
+        try:
+            summary_txt = llm_generate(
+                provider=str(provider),
+                model=str(model),
+                messages=[_msg("system", "You summarize conversations for future continuity."), _msg("user", summary_prompt)],
+                temperature=0.0,
+                max_tokens=int(summary_out_tokens),
+                timeout_s=float(llm_timeout_s),
+                dump_path=None,
+            )
+        except Exception:
+            summary_txt = ""
+
+        summary_txt = str(summary_txt or "").strip()
+        if summary_txt:
+            nb_line = f"step={int(step)} context_summary={_llm_sanitize_text(summary_txt)[:240]}"
+            notebook = _notebook_append(str(notebook or ""), nb_line)
+            msgs.append(_msg("user", "CONTEXT_SUMMARY_ENTRY: " + summary_txt))
+
+        rm_ids = {id(x) for x in chunk}
+        kept: List[Dict[str, str]] = []
+        for m in msgs:
+            if id(m) in pin_ids:
+                kept.append(m)
+                continue
+            if id(m) in rm_ids:
+                continue
+            kept.append(m)
+        msgs = kept
+
+    out2: List[Dict[str, str]] = []
+    for m in pin:
+        if m not in out2:
+            out2.append(m)
+    for m in msgs:
+        if m in out2:
+            continue
+        out2.append(m)
+    return out2, str(notebook or "")
+
+
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
     s0 = str(text or "")
     if not s0.strip():
@@ -1053,6 +1841,8 @@ def _llm_tool_result_compact(
         "gene_set",
         "win",
         "extra_days",
+        "lifespan_recovery_pct",
+        "score",
         "score_lifedays_per_usd",
         "delta_median_days",
         "delta_median_ticks",
@@ -1467,6 +2257,10 @@ def run_benchmark(
     base_url: str,
     provider: str,
     model: str,
+    executor_provider: Optional[str] = None,
+    executor_model: Optional[str] = None,
+    human_poll_s: float = 0.5,
+    events_out_path: Optional[str] = None,
     player_id: Optional[str],
     events_fp: Optional[Any],
     files_dir: Optional[str],
@@ -1513,13 +2307,25 @@ def run_benchmark(
     global _BENCH_PLAYER_ID
     _BENCH_PLAYER_ID = str(player_id)
 
-    if str(provider or "").strip().lower() in ("openai", "openai_compat"):
+    if str(provider or "").strip().lower() in ("openai", "openai_compat") and (not str(model or "").strip()):
         model = "gpt-5.2"
 
+    prov0 = str(provider or "").strip().lower()
+    human_mode = bool(prov0 == "human")
+    exec_provider = str(executor_provider or os.environ.get("DT_HUMAN_EXECUTOR_PROVIDER") or "").strip().lower()
+    if exec_provider == "anthropic":
+        exec_provider = "claude"
+    if not exec_provider:
+        exec_provider = "claude"
+    exec_model = str(executor_model or os.environ.get("DT_HUMAN_EXECUTOR_MODEL") or "").strip()
+    if not exec_model:
+        exec_model = str(model or "").strip()
+
+    # The runner uses these globals when auto-filling /api/omics/analyze params.
     global _BENCH_PROVIDER
-    _BENCH_PROVIDER = str(provider or "").strip().lower()
+    _BENCH_PROVIDER = str(exec_provider if human_mode else provider or "").strip().lower()
     global _BENCH_MODEL
-    _BENCH_MODEL = str(model or "").strip()
+    _BENCH_MODEL = str(exec_model if human_mode else model or "").strip()
 
     transcript: List[Dict[str, Any]] = []
     notebook = ""
@@ -1527,6 +2333,20 @@ def run_benchmark(
     messages: List[Dict[str, str]] = []
     seq = 0
     step_start = 0
+
+    human_dir: Optional[Path] = None
+    if human_mode:
+        human_dir = _human_mode_dir(state_out=state_out, events_out=events_out_path, files_dir=files_dir)
+        if human_dir is None:
+            raise RuntimeError("provider=human requires --state-out or --events-out or --files-dir to derive a run directory")
+
+    llm_payload_dir: Optional[Path] = None
+    try:
+        if str(state_out or "").strip():
+            llm_payload_dir = Path(str(state_out)).resolve().parent / "llm_payloads"
+            llm_payload_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        llm_payload_dir = None
 
     if resumed:
         try:
@@ -1545,6 +2365,14 @@ def run_benchmark(
                 metrics.best_extra_days = float(st_metrics.get("best_extra_days"))
             except Exception:
                 metrics.best_extra_days = None
+            try:
+                metrics.best_lifespan_recovery_pct = float(st_metrics.get("best_lifespan_recovery_pct"))
+            except Exception:
+                metrics.best_lifespan_recovery_pct = None
+            try:
+                metrics.best_score = float(st_metrics.get("best_score"))
+            except Exception:
+                metrics.best_score = None
             try:
                 metrics.best_score_lifedays_per_usd = float(st_metrics.get("best_score_lifedays_per_usd"))
             except Exception:
@@ -1593,17 +2421,38 @@ def run_benchmark(
         if not messages:
             messages.append(_msg("system", _PROMPT))
             messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
-            notebook_msg = _msg("user", "LAB_NOTEBOOK:\n" + (notebook or "(empty)"))
+            notebook_msg = _msg("user", "LAB_NOTEBOOK:")
             messages.append(notebook_msg)
+            if notebook.strip():
+                messages.append(_msg("user", "LAB_NOTEBOOK_SNAPSHOT:\n" + notebook))
         else:
             if len(messages) >= 3 and str(messages[2].get("role")) == "user" and str(messages[2].get("content") or "").startswith("LAB_NOTEBOOK:"):
                 notebook_msg = messages[2]
-                notebook_msg["content"] = "LAB_NOTEBOOK:\n" + (notebook or "(empty)")
             else:
-                notebook_msg = _msg("user", "LAB_NOTEBOOK:\n" + (notebook or "(empty)"))
+                notebook_msg = _msg("user", "LAB_NOTEBOOK:")
                 messages.insert(2, notebook_msg)
 
         pinned = [messages[0], messages[1], notebook_msg]
+        if human_mode:
+            exec_msg = None
+            for m in messages:
+                if isinstance(m, dict) and str(m.get("role") or "") == "user" and str(m.get("content") or "").startswith("HUMAN_EXECUTOR_MODE:"):
+                    exec_msg = m
+                    break
+            if exec_msg is None:
+                exec_msg = _msg(
+                    "user",
+                    "HUMAN_EXECUTOR_MODE: You are an API executor in human-in-the-loop mode. "
+                    "The human provides directives in messages starting with 'HUMAN_DIRECTIVE:'. "
+                    "Your job is to translate the latest directive into exactly one valid Action JSON object (call_api or final) "
+                    "matching the schema in the system prompt. Do not add extra strategy beyond the directive. "
+                    "If the directive is ambiguous, make one low-cost clarifying API call (e.g., GET /api/game/state or GET /api/tests/disease/proteins).",
+                )
+                try:
+                    messages.insert(3, exec_msg)
+                except Exception:
+                    messages.append(exec_msg)
+            pinned.append(exec_msg)
         seq += 1
         _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "resume", "player_id": player_id, "next_step": step_start})
     else:
@@ -1612,9 +2461,23 @@ def run_benchmark(
         messages.append(_msg("system", _PROMPT))
         messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
 
-        notebook_msg = _msg("user", "LAB_NOTEBOOK:\n(empty)")
+        notebook_msg = _msg("user", "LAB_NOTEBOOK:")
         messages.append(notebook_msg)
         pinned = [messages[0], messages[1], notebook_msg]
+        if human_mode:
+            exec_msg = _msg(
+                "user",
+                "HUMAN_EXECUTOR_MODE: You are an API executor in human-in-the-loop mode. "
+                "The human provides directives in messages starting with 'HUMAN_DIRECTIVE:'. "
+                "Your job is to translate the latest directive into exactly one valid Action JSON object (call_api or final) "
+                "matching the schema in the system prompt. Do not add extra strategy beyond the directive. "
+                "If the directive is ambiguous, make one low-cost clarifying API call (e.g., GET /api/game/state or GET /api/tests/disease/proteins).",
+            )
+            try:
+                messages.insert(3, exec_msg)
+            except Exception:
+                messages.append(exec_msg)
+            pinned.append(exec_msg)
 
         seq = 0
         _write_event_line(
@@ -1627,6 +2490,8 @@ def run_benchmark(
                 "base_url": base_url,
                 "provider": provider,
                 "model": model,
+                "executor_provider": exec_provider if human_mode else None,
+                "executor_model": exec_model if human_mode else None,
                 "player_id": player_id,
                 "prompt": _PROMPT,
             },
@@ -1641,6 +2506,8 @@ def run_benchmark(
                 "win": bool(metrics.win),
                 "final_delta_median_ticks": metrics.final_delta_median_ticks,
                 "best_extra_days": metrics.best_extra_days,
+                "best_lifespan_recovery_pct": metrics.best_lifespan_recovery_pct,
+                "best_score": metrics.best_score,
                 "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
                 "best_score_seq": metrics.best_score_seq,
                 "money_spent_cents": metrics.money_spent_cents,
@@ -1653,6 +2520,8 @@ def run_benchmark(
                 "base_url": str(base_url),
                 "provider": str(provider),
                 "model": str(model),
+                "executor_provider": str(exec_provider) if human_mode else "",
+                "executor_model": str(exec_model) if human_mode else "",
                 "player_id": str(player_id),
                 "seq": int(seq),
                 "next_step": int(step_start),
@@ -1696,16 +2565,112 @@ def run_benchmark(
         )
 
     for step in range(int(step_start), int(max_steps)):
-        metrics.llm_calls += 1
+        dump_path: Optional[str] = None
         try:
-            out = llm_generate(
-                provider=provider,
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout_s=llm_timeout_s,
+            if isinstance(llm_payload_dir, Path):
+                dump_path = str(llm_payload_dir / f"llm_payload_step_{int(step):06d}.json")
+        except Exception:
+            dump_path = None
+
+        used_provider = str(provider)
+        used_model = str(model)
+        human_in = None
+        if human_mode and isinstance(human_dir, Path):
+            seq += 1
+            _write_event_line(
+                events_fp,
+                {
+                    "seq": seq,
+                    "ts": time.time(),
+                    "type": "human_wait",
+                    "step": int(step),
+                    "player_id": str(player_id),
+                },
             )
+            try:
+                human_in = _human_wait_for_input(
+                    human_dir=human_dir,
+                    step=int(step),
+                    player_id=str(player_id),
+                    base_url=str(base_url),
+                    poll_s=float(human_poll_s),
+                    error=None,
+                )
+            except Exception as e:
+                human_in = {"ok": False, "error": str(e)}
+
+            if isinstance(human_in, dict) and human_in.get("stop") is True:
+                seq += 1
+                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "human_stop", "step": int(step)})
+                transcript.append({"type": "human_stop", "step": int(step), "payload": human_in})
+                break
+
+            seq += 1
+            _write_event_line(
+                events_fp,
+                {
+                    "seq": seq,
+                    "ts": time.time(),
+                    "type": "human_input",
+                    "step": int(step),
+                    "text": str((human_in or {}).get("text") or "")[:8000],
+                    "has_action_json": bool(isinstance((human_in or {}).get("action_json"), dict)),
+                },
+            )
+
+        try:
+            if human_mode and isinstance(human_in, dict) and isinstance(human_in.get("action_json"), dict):
+                # Treat as if the assistant produced this JSON (keeps downstream parsing/validation uniform).
+                try:
+                    if isinstance(human_dir, Path):
+                        try:
+                            (human_dir / "decisions").mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            pass
+                        _write_json_file(
+                            str((human_dir / "decisions" / f"human_action_step_{int(step):06d}.json")),
+                            {"step": int(step), "action_json": human_in.get("action_json"), "ts": float(time.time())},
+                        )
+                except Exception:
+                    pass
+                out = json.dumps(human_in.get("action_json"), ensure_ascii=False)
+                used_provider = "human"
+                used_model = "human"
+                if str(dump_path or "").strip():
+                    try:
+                        _write_json_file(
+                            str(dump_path),
+                            {
+                                "provider": "human",
+                                "step": int(step),
+                                "action_json": human_in.get("action_json"),
+                                "human_text": str(human_in.get("text") or "")[:12000],
+                            },
+                        )
+                    except Exception:
+                        pass
+            else:
+                if human_mode:
+                    used_provider = str(exec_provider)
+                    used_model = str(exec_model)
+                    txt = str((human_in or {}).get("text") or "").strip()
+                    if not txt:
+                        txt = "(no human directive provided; request clarification)"
+                    messages.append(_msg("user", "HUMAN_DIRECTIVE: " + txt))
+                    nb_line = f"step={int(step)} human_directive={_llm_sanitize_text(txt)[:240]}"
+                    notebook = _notebook_append(notebook, nb_line)
+                    messages.append(_msg("user", "LAB_NOTEBOOK_ENTRY: " + nb_line))
+
+                metrics.llm_calls += 1
+                out = llm_generate(
+                    provider=str(used_provider),
+                    model=str(used_model),
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout_s=llm_timeout_s,
+                    dump_path=dump_path,
+                )
         except Exception as e:
             err = _llm_sanitize_text(str(e))
             messages.append(_msg("user", f"TOOL_RESULT: {{\"error\": \"LLM_CALL_FAILED: {err}\"}}"))
@@ -1727,6 +2692,8 @@ def run_benchmark(
                 "type": "llm",
                 "step": step,
                 "text": out,
+                "provider_used": str(used_provider),
+                "model_used": str(used_model),
                 "last_result_summary": lrs_preview,
                 "next_step_rationale": nsr_preview,
             },
@@ -1896,11 +2863,9 @@ def run_benchmark(
             )
             continue
 
-        notebook = _notebook_append(
-            notebook,
-            f"step={int(step)} agent_summary={_llm_sanitize_text(str(lrs).strip())[:240]} agent_plan={_llm_sanitize_text(str(nsr).strip())[:240]}",
-        )
-        notebook_msg["content"] = "LAB_NOTEBOOK:\n" + (notebook or "(empty)")
+        nb_line = f"step={int(step)} agent_summary={_llm_sanitize_text(str(lrs).strip())[:240]} agent_plan={_llm_sanitize_text(str(nsr).strip())[:240]}"
+        notebook = _notebook_append(notebook, nb_line)
+        messages.append(_msg("user", "LAB_NOTEBOOK_ENTRY: " + nb_line))
 
         method = str(action.get("method") or "").strip().upper()
         llm_path = str(action.get("path") or "").strip()
@@ -1922,6 +2887,39 @@ def run_benchmark(
         if isinstance(query, dict) and "model" in query:
             query = dict(query)
             query["model"] = _llm_model_key_to_server(query.get("model"))
+
+        expected_pid = str(player_id or "").strip()
+        pid_mismatch: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(query, dict) and ("player_id" in query):
+                qpid = str(query.get("player_id") or "").strip()
+                if qpid and expected_pid and qpid != expected_pid:
+                    pid_mismatch = {"source": "query", "found": qpid, "expected": expected_pid}
+                    query = dict(query)
+                    query["player_id"] = expected_pid
+            if isinstance(body, dict) and ("player_id" in body):
+                bpid = str(body.get("player_id") or "").strip()
+                if bpid and expected_pid and bpid != expected_pid:
+                    pid_mismatch = {"source": "body", "found": bpid, "expected": expected_pid}
+                    body = dict(body)
+                    body["player_id"] = expected_pid
+        except Exception:
+            pid_mismatch = None
+
+        if isinstance(pid_mismatch, dict):
+            seq += 1
+            _write_event_line(
+                events_fp,
+                {
+                    "seq": seq,
+                    "ts": time.time(),
+                    "type": "player_id_mismatch",
+                    "step": int(step),
+                    "path": str(server_path),
+                    "method": str(method),
+                    "details": dict(pid_mismatch),
+                },
+            )
 
         if method == "POST" and server_path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure", "/api/tests/aging/claim_cure"):
             if body is None:
@@ -1991,13 +2989,35 @@ def run_benchmark(
                     if metrics.best_extra_days is None or float(extra) > float(metrics.best_extra_days):
                         metrics.best_extra_days = float(extra)
                 try:
-                    score = res.response_json.get("score_lifedays_per_usd")
+                    rec = res.response_json.get("lifespan_recovery_pct")
+                    rec_f = float(rec) if rec is not None else None
+                except Exception:
+                    rec_f = None
+                if rec_f is not None and (metrics.best_lifespan_recovery_pct is None or float(rec_f) > float(metrics.best_lifespan_recovery_pct)):
+                    metrics.best_lifespan_recovery_pct = float(rec_f)
+                try:
+                    score = res.response_json.get("score")
                     score_f = float(score) if score is not None else None
                 except Exception:
                     score_f = None
-                if score_f is not None and (metrics.best_score_lifedays_per_usd is None or float(score_f) > float(metrics.best_score_lifedays_per_usd)):
-                    metrics.best_score_lifedays_per_usd = float(score_f)
+                if score_f is None:
+                    try:
+                        s2 = res.response_json.get("score_lifedays_per_usd")
+                        s2f = float(s2) if s2 is not None else None
+                    except Exception:
+                        s2f = None
+                    if s2f is not None:
+                        score_f = float(s2f) * 10000.0
+                if score_f is not None and (metrics.best_score is None or float(score_f) > float(metrics.best_score)):
+                    metrics.best_score = float(score_f)
                     metrics.best_score_seq = int(seq)
+                try:
+                    score_lpu = res.response_json.get("score_lifedays_per_usd")
+                    score_lpu_f = float(score_lpu) if score_lpu is not None else None
+                except Exception:
+                    score_lpu_f = None
+                if score_lpu_f is not None and (metrics.best_score_lifedays_per_usd is None or float(score_lpu_f) > float(metrics.best_score_lifedays_per_usd)):
+                    metrics.best_score_lifedays_per_usd = float(score_lpu_f)
 
         seq += 1
         resp_summary, files = _summarize_response_json_for_events(res.response_json, seq=seq, files_dir=files_dir)
@@ -2040,10 +3060,11 @@ def run_benchmark(
 
         compact = _llm_tool_result_compact(server_path, llm_json if isinstance(llm_json, dict) else None, omics_state=omics_state)
         try:
-            notebook = _notebook_append(notebook, f"step={int(step)} path={_server_path_to_llm(server_path)} result={json.dumps(compact, ensure_ascii=False)[:700]}")
+            nb_line = f"step={int(step)} path={_server_path_to_llm(server_path)} result={json.dumps(compact, ensure_ascii=False)[:700]}"
         except Exception:
-            notebook = _notebook_append(notebook, f"step={int(step)} path={_server_path_to_llm(server_path)}")
-        notebook_msg["content"] = "LAB_NOTEBOOK:\n" + (notebook or "(empty)")
+            nb_line = f"step={int(step)} path={_server_path_to_llm(server_path)}"
+        notebook = _notebook_append(notebook, nb_line)
+        messages.append(_msg("user", "LAB_NOTEBOOK_ENTRY: " + nb_line))
 
         tool_payload = {
             "http_status": res.http_status,
@@ -2053,7 +3074,16 @@ def run_benchmark(
         if res.response_json is None:
             tool_payload["response_text"] = _llm_sanitize_text(res.response_text[:400])
         messages.append(_msg("user", "TOOL_RESULT: " + json.dumps(tool_payload, ensure_ascii=False)))
-        messages = _prune_messages(messages, pinned=pinned, keep_last=12)
+        messages, notebook = _maybe_prune_messages_with_summary(
+            messages=messages,
+            pinned=pinned,
+            provider=str(exec_provider if human_mode else provider),
+            model=str(exec_model if human_mode else model),
+            llm_timeout_s=float(llm_timeout_s),
+            step=int(step),
+            max_tokens_per_call=int(max_tokens),
+            notebook=str(notebook),
+        )
         seq += 1
         tool_payload_event = {
             "http_status": res.http_status,
@@ -2083,6 +3113,11 @@ def run_benchmark(
                 "experiment_calls": int(metrics.experiment_calls),
                 "win": bool(metrics.win),
                 "final_delta_median_ticks": metrics.final_delta_median_ticks,
+                "best_extra_days": metrics.best_extra_days,
+                "best_lifespan_recovery_pct": metrics.best_lifespan_recovery_pct,
+                "best_score": metrics.best_score,
+                "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
+                "best_score_seq": metrics.best_score_seq,
                 "money_spent_cents": metrics.money_spent_cents,
                 "money_spent_usd": metrics.money_spent_usd,
                 "experiments": metrics.experiments,
@@ -2093,6 +3128,8 @@ def run_benchmark(
                 "base_url": str(base_url),
                 "provider": str(provider),
                 "model": str(model),
+                "executor_provider": str(exec_provider) if human_mode else "",
+                "executor_model": str(exec_model) if human_mode else "",
                 "player_id": str(player_id),
                 "seq": int(seq),
                 "next_step": int(step) + 1,
@@ -2139,6 +3176,8 @@ def run_benchmark(
             "win": bool(metrics.win),
             "final_delta_median_ticks": metrics.final_delta_median_ticks,
             "best_extra_days": metrics.best_extra_days,
+            "best_lifespan_recovery_pct": metrics.best_lifespan_recovery_pct,
+            "best_score": metrics.best_score,
             "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
             "best_score_seq": metrics.best_score_seq,
             "money_spent_cents": metrics.money_spent_cents,
@@ -2155,15 +3194,23 @@ def run_benchmark(
 def main() -> int:
     ap = argparse.ArgumentParser(description="LLM benchmark runner for the disease challenge (tool-using biology).")
     ap.add_argument("--base-url", default="http://127.0.0.1:8000", help="Runtime server base URL.")
-    ap.add_argument("--provider", required=True, choices=["openai", "anthropic", "claude", "xai", "grok", "gemini"], help="LLM provider.")
+    ap.add_argument(
+        "--provider",
+        required=True,
+        choices=["openai", "anthropic", "claude", "human", "xai", "gemini"],
+        help="LLM provider. Use 'human' for human-in-the-loop mode.",
+    )
     ap.add_argument("--model", required=True, help="Model name (provider-specific).")
+    ap.add_argument("--executor-provider", default="", help="When --provider=human, use this LLM provider to translate directives into Action JSON.")
+    ap.add_argument("--executor-model", default="", help="When --provider=human, use this model for the executor LLM (defaults to --model).")
+    ap.add_argument("--human-poll", type=float, default=0.5, help="When --provider=human, poll interval (seconds) while waiting for human input.")
     ap.add_argument("--challenge", default="cancer", choices=["cancer", "hereditary_disease", "aging"], help="Which test challenge to run (server-side).")
     ap.add_argument("--player-id", default="", help="Optional fixed player_id (for reproducible runs).")
     ap.add_argument("--max-steps", type=int, default=40, help="Max tool-using steps.")
     ap.add_argument("--temperature", type=float, default=0.0, help="LLM sampling temperature.")
-    ap.add_argument("--max-tokens", type=int, default=700, help="Max tokens to generate per LLM call (provider-dependent).")
-    ap.add_argument("--api-timeout", type=float, default=900.0, help="Timeout for local API calls.")
-    ap.add_argument("--llm-timeout", type=float, default=120.0, help="Timeout for LLM API calls.")
+    ap.add_argument("--max-tokens", type=int, default=8000, help="Max tokens to generate per LLM call (provider-dependent).")
+    ap.add_argument("--api-timeout", type=float, default=5000.0, help="Timeout for local API calls.")
+    ap.add_argument("--llm-timeout", type=float, default=5000.0, help="Timeout for LLM API calls.")
     ap.add_argument("--reset-first", action="store_true", help="Reset game state for the benchmark player_id before starting.")
     ap.add_argument("--out", default="", help="Write JSON report to this file.")
     ap.add_argument("--events-out", default="", help="Optional JSONL stream of live events for monitoring.")
@@ -2172,6 +3219,8 @@ def main() -> int:
     ap.add_argument("--state-out", default="", help="Optional JSON checkpoint file for resuming a run.")
     ap.add_argument("--resume-state", default="", help="Resume a run from a previous --state-out checkpoint.")
     ap.add_argument("--print-prompt", action="store_true", help="Print the benchmark prompt and exit.")
+    ap.add_argument("--run-id", default="", help="Optional run_id label for tracking (e.g. run_...).")
+    ap.add_argument("--suite-id", default="", help="Optional suite_id label for tracking (e.g. suite_...).")
 
     args = ap.parse_args()
 
@@ -2195,6 +3244,10 @@ def main() -> int:
         base_url=str(args.base_url),
         provider=str(args.provider),
         model=str(args.model),
+        executor_provider=str(args.executor_provider or "").strip() or None,
+        executor_model=str(args.executor_model or "").strip() or None,
+        human_poll_s=float(args.human_poll),
+        events_out_path=str(args.events_out or "").strip() or None,
         player_id=str(args.player_id or "").strip() or None,
         events_fp=events_fp,
         files_dir=files_dir,
@@ -2214,12 +3267,60 @@ def main() -> int:
         except Exception:
             pass
 
+    def _repo_root() -> Path:
+        return Path(__file__).resolve().parents[1]
+
+    def _git_cmd(args2: List[str]) -> Optional[str]:
+        try:
+            out = subprocess.check_output(args2, cwd=str(_repo_root()), stderr=subprocess.STDOUT)
+            return out.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return None
+
+    def _pkg_ver(name: str) -> Optional[str]:
+        try:
+            import importlib.metadata as _imd
+
+            return str(_imd.version(str(name)))
+        except Exception:
+            return None
+
+    git_commit = _git_cmd(["git", "rev-parse", "HEAD"])
+    git_dirty = None
+    try:
+        st = _git_cmd(["git", "status", "--porcelain"])
+        if st is not None:
+            git_dirty = bool(str(st).strip())
+    except Exception:
+        git_dirty = None
+
+    run_id = str(args.run_id or "").strip()
+    if (not run_id) and str(args.out or "").strip():
+        try:
+            run_id = Path(str(args.out)).resolve().parent.name
+        except Exception:
+            run_id = ""
+
+    suite_id = str(args.suite_id or "").strip()
+    env_keys_present = {
+        "OPENAI_API_KEY": bool(str(os.environ.get("OPENAI_API_KEY") or "").strip()),
+        "ANTHROPIC_API_KEY": bool(str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()),
+        "GEMINI_API_KEY": bool(str(os.environ.get("GEMINI_API_KEY") or "").strip()),
+        "XAI_API_KEY": bool(str(os.environ.get("XAI_API_KEY") or "").strip()),
+    }
+
     report = {
+        "schema_version": 1,
         "ok": True,
+        "run_id": run_id,
+        "suite_id": suite_id,
         "prompt": _PROMPT,
         "challenge": str(args.challenge),
         "provider": str(args.provider),
         "model": str(args.model),
+        "executor_provider": str(args.executor_provider or "").strip(),
+        "executor_model": str(args.executor_model or "").strip(),
+        "human_poll": float(args.human_poll),
         "base_url": str(args.base_url),
         "player_id": str(used_player_id),
         "files_dir": files_dir,
@@ -2233,11 +3334,31 @@ def main() -> int:
             "win": bool(metrics.win),
             "final_delta_median_ticks": metrics.final_delta_median_ticks,
             "best_extra_days": metrics.best_extra_days,
+            "best_lifespan_recovery_pct": metrics.best_lifespan_recovery_pct,
+            "best_score": metrics.best_score,
             "best_score_lifedays_per_usd": metrics.best_score_lifedays_per_usd,
             "best_score_seq": metrics.best_score_seq,
             "money_spent_cents": metrics.money_spent_cents,
             "money_spent_usd": metrics.money_spent_usd,
             "experiments": metrics.experiments,
+        },
+        "meta": {
+            "created_ts": float(time.time()),
+            "argv": list(sys.argv),
+            "cwd": os.getcwd(),
+            "pid": int(os.getpid()),
+            "python_executable": str(sys.executable),
+            "python_version": str(sys.version),
+            "platform": str(platform.platform()),
+            "machine": str(platform.machine()),
+            "processor": str(platform.processor()),
+            "cpu_count": int(os.cpu_count() or 0),
+            "git": {"commit": git_commit, "dirty": git_dirty},
+            "env_keys_present": env_keys_present,
+            "packages": {
+                "openai": _pkg_ver("openai"),
+                "anthropic": _pkg_ver("anthropic"),
+            },
         },
         "transcript": transcript,
     }

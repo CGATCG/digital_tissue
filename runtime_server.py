@@ -1,4 +1,5 @@
 import concurrent.futures
+import base64
 import copy
 import faulthandler
 import gzip
@@ -39,6 +40,60 @@ except Exception:
 _ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 
 
+_ANTHROPIC_INPUT_TPM_LIMIT = 30_000
+_ANTHROPIC_TPM_WINDOW_S = 60.0
+_ANTHROPIC_TPM_SAFETY_FRAC = 0.60
+_ANTHROPIC_TPM_USAGE: deque[tuple[float, int]] = deque()
+_ANTHROPIC_TPM_LOCK = threading.Lock()
+
+
+def _approx_token_count_text(text: str) -> int:
+    s = str(text or "")
+    if not s:
+        return 0
+    return max(1, int((len(s) + 3) // 4))
+
+
+def _anthropic_tpm_used(now: float) -> int:
+    with _ANTHROPIC_TPM_LOCK:
+        while _ANTHROPIC_TPM_USAGE and (now - float(_ANTHROPIC_TPM_USAGE[0][0])) >= float(_ANTHROPIC_TPM_WINDOW_S):
+            _ANTHROPIC_TPM_USAGE.popleft()
+        return int(sum(int(n) for (_, n) in _ANTHROPIC_TPM_USAGE))
+
+
+def _anthropic_tpm_throttle(*, need_tokens: int) -> None:
+    need = int(need_tokens or 0)
+    if need <= 0:
+        return
+
+    limit = int(int(_ANTHROPIC_INPUT_TPM_LIMIT) * float(_ANTHROPIC_TPM_SAFETY_FRAC))
+    if limit <= 0:
+        return
+
+    while True:
+        now = float(time.time())
+        used = _anthropic_tpm_used(now)
+        if used + need <= limit:
+            with _ANTHROPIC_TPM_LOCK:
+                _ANTHROPIC_TPM_USAGE.append((now, need))
+            return
+        with _ANTHROPIC_TPM_LOCK:
+            oldest_t = float(_ANTHROPIC_TPM_USAGE[0][0]) if _ANTHROPIC_TPM_USAGE else now
+        sleep_s = max(0.0, float(_ANTHROPIC_TPM_WINDOW_S) - (now - oldest_t) + 1.0)
+        sleep_s = min(75.0, sleep_s)
+        try:
+            logging.getLogger(__name__).warning(
+                "Anthropic TPM throttle: used=%s need~%s limit=%s. Sleeping %.1fs...",
+                used,
+                need,
+                limit,
+                float(sleep_s),
+            )
+        except Exception:
+            pass
+        time.sleep(float(sleep_s))
+
+
 def _anthropic_headers(*, api_key: str, betas: Optional[list[str]] = None, content_type: Optional[str] = "application/json") -> Dict[str, str]:
     h = {
         "x-api-key": str(api_key),
@@ -65,6 +120,8 @@ def _http_post_json(*, url: str, headers: Dict[str, str], payload: Dict[str, Any
         except Exception:
             txt = str(e)
         raise ValueError(f"HTTP {int(getattr(e, 'code', 0) or 0)}: {txt[:2000]}") from e
+    except Exception as e:
+        raise ValueError(str(e)) from e
     obj = {}
     try:
         parsed = json.loads(txt) if isinstance(txt, str) and txt.strip() else None
@@ -74,17 +131,83 @@ def _http_post_json(*, url: str, headers: Dict[str, str], payload: Dict[str, Any
     return obj
 
 
+def _should_retry_remote_http_error(msg: str) -> bool:
+    s = str(msg or "").upper()
+    if not s:
+        return False
+    if "HTTP 503" in s or "\"CODE\"" in s and "503" in s:
+        return True
+    if "UNAVAILABLE" in s or "SERVICE UNAVAILABLE" in s:
+        return True
+    if "REQUEST TIMED OUT" in s or "TIMED OUT" in s or "TIMEOUT" in s:
+        return True
+    if "HTTP 429" in s or "RATE LIMIT" in s or "RESOURCE_EXHAUSTED" in s:
+        return True
+    return False
+
+
+def _retry_delay_seconds_from_error(msg: str) -> Optional[float]:
+    s = str(msg or "")
+    if not s.strip():
+        return None
+    try:
+        m = re.search(r"retryDelay\"\s*:\s*\"\s*([0-9]+(?:\.[0-9]+)?)\s*s\s*\"", s, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"please\s+retry\s+in\s*([0-9]+(?:\.[0-9]+)?)\s*s", s, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"retry[-\s]?after\s*([0-9]+(?:\.[0-9]+)?)\s*s", s, flags=re.IGNORECASE)
+        if not m:
+            return None
+        v = float(m.group(1))
+        if not (v >= 0.0):
+            return None
+        return min(300.0, v)
+    except Exception:
+        return None
+
+
+def _openai_base_model_and_effort(model: str) -> tuple[str, Optional[str]]:
+    m = str(model or "").strip()
+    if not m:
+        return "", None
+    if m == "gpt-5.2":
+        return "gpt-5.2", "medium"
+    if m == "gpt-5.2-medium":
+        return "gpt-5.2", "medium"
+    if m == "gpt-5.2-high":
+        return "gpt-5.2", "high"
+    if m in ("gpt-5.2-extra-high", "gpt-5.2-xhigh"):
+        return "gpt-5.2", "xhigh"
+    return m, None
+
+
 def _anthropic_upload_file(*, api_key: str, filename: str, file_bytes: bytes, timeout_s: float) -> Dict[str, Any]:
     betas = ["files-api-2025-04-14"]
-    return _http_post_multipart_file(
-        url=f"{_ANTHROPIC_BASE_URL}/files",
-        headers=_anthropic_headers(api_key=api_key, betas=betas, content_type=None),
-        field_name="file",
-        filename=str(filename),
-        file_bytes=(file_bytes or b""),
-        mime_type="application/octet-stream",
-        timeout_s=float(timeout_s),
-    )
+    last_err: Optional[str] = None
+    for attempt in range(3):
+        try:
+            return _http_post_multipart_file(
+                url=f"{_ANTHROPIC_BASE_URL}/files",
+                headers=_anthropic_headers(api_key=api_key, betas=betas, content_type=None),
+                field_name="file",
+                filename=str(filename),
+                file_bytes=(file_bytes or b""),
+                mime_type="application/octet-stream",
+                timeout_s=float(timeout_s),
+            )
+        except Exception as e:
+            last_err = str(e)
+            if attempt < 2 and ("HTTP 429" in last_err or "rate_limit_error" in last_err):
+                time.sleep(65.0)
+                continue
+            if attempt < 2 and ("timed out" in last_err.lower() or "timeout" in last_err.lower()):
+                time.sleep(2.0)
+                continue
+            if attempt < 2:
+                time.sleep(float(0.6 * (2**attempt)))
+                continue
+            raise
+    raise ValueError(last_err or "Anthropic upload failed")
 
 
 def _anthropic_messages_code_execution(
@@ -94,6 +217,8 @@ def _anthropic_messages_code_execution(
     instructions: str,
     file_ids: list[str],
     timeout_s: float,
+    max_tokens: int,
+    messages: Optional[list[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     betas = ["code-execution-2025-08-25", "files-api-2025-04-14"]
 
@@ -102,15 +227,28 @@ def _anthropic_messages_code_execution(
         if str(fid or "").strip():
             content_blocks.append({"type": "container_upload", "file_id": str(fid)})
 
-    payload: Dict[str, Any] = {
-        "model": str(model),
-        "max_tokens": 4096,
-        "messages": [
+    msgs: list[Dict[str, Any]] = []
+    if isinstance(messages, list) and messages:
+        msgs = [m for m in messages if isinstance(m, dict)]
+    if not msgs:
+        msgs = [
             {
                 "role": "user",
                 "content": content_blocks,
             }
-        ],
+        ]
+
+    max_tokens_i = 4096
+    try:
+        max_tokens_i = int(max_tokens)
+    except Exception:
+        max_tokens_i = 4096
+    max_tokens_i = max(256, min(16384, int(max_tokens_i)))
+
+    payload: Dict[str, Any] = {
+        "model": str(model),
+        "max_tokens": int(max_tokens_i),
+        "messages": msgs,
         "tools": [
             {
                 "type": "code_execution_20250825",
@@ -118,13 +256,48 @@ def _anthropic_messages_code_execution(
             }
         ],
     }
+    if str(model or "").strip() == "claude-opus-4-5-20251101":
+        budget = 63_999
+        try:
+            budget = int(os.environ.get("DT_ANTHROPIC_THINKING_BUDGET", str(budget)) or budget)
+        except Exception:
+            budget = 63_999
+        budget = max(1, min(200_000, int(budget)))
+        max_out = max(1, int(payload.get("max_tokens") or max_tokens_i))
+        if max_out <= 1024:
+            max_out = 1025
+            payload["max_tokens"] = int(max_out)
+        budget = max(1024, min(int(budget), int(max_out) - 1))
+        payload["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
+        payload["temperature"] = 1.0
 
-    return _http_post_json(
-        url=f"{_ANTHROPIC_BASE_URL}/messages",
-        headers=_anthropic_headers(api_key=api_key, betas=betas, content_type="application/json"),
-        payload=payload,
-        timeout_s=float(timeout_s),
-    )
+    last_err: Optional[str] = None
+    for attempt in range(3):
+        try:
+            t_s = float(timeout_s)
+            if attempt == 1:
+                t_s = max(t_s, float(timeout_s) * 2.0)
+            if attempt == 2:
+                t_s = max(t_s, float(timeout_s) * 3.0)
+            return _http_post_json(
+                url=f"{_ANTHROPIC_BASE_URL}/messages",
+                headers=_anthropic_headers(api_key=api_key, betas=betas, content_type="application/json"),
+                payload=payload,
+                timeout_s=float(t_s),
+            )
+        except Exception as e:
+            last_err = str(e)
+            if attempt < 2 and ("HTTP 429" in last_err or "rate_limit_error" in last_err or "input tokens per minute" in last_err or "would exceed the rate limit" in last_err):
+                time.sleep(65.0)
+                continue
+            if attempt < 2 and ("timed out" in last_err.lower() or "timeout" in last_err.lower()):
+                time.sleep(2.0)
+                continue
+            if attempt < 2:
+                time.sleep(float(0.6 * (2**attempt)))
+                continue
+            raise
+    raise ValueError(last_err or "Anthropic request failed")
 
 
 def _anthropic_message_text(resp_json: Dict[str, Any]) -> str:
@@ -1321,11 +1494,58 @@ def _tests_get_protein_mask_maps(model_key: Any, *, challenge: str = "cancer") -
         payload = _tests_load_aging_model_payload(mk)
     else:
         raise ValueError("unknown challenge")
-    real_layers = _protein_layer_names_from_payload(payload)
+
+    real_layers: list[str] = []
+    try:
+        _, prot_feats = _load_bulk_omics_set("protein/Bulk Proteomics")
+    except Exception:
+        prot_feats = []
+    try:
+        data0 = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data0, dict) and prot_feats:
+            for f in list(prot_feats):
+                ent = data0.get(str(f))
+                if not isinstance(ent, dict) or ent.get("dtype") != "float32":
+                    continue
+                b64 = ent.get("b64")
+                if not isinstance(b64, str) or not b64:
+                    continue
+                real_layers.append(str(f))
+    except Exception:
+        real_layers = []
+
+    if not real_layers:
+        real_layers = _protein_layer_names_from_payload(payload)
+
+    try:
+        core_to_idx = _bulk_omics_get_core_index_map()
+    except Exception:
+        core_to_idx = {}
+
+    def _layer_to_mask(layer: str) -> Optional[str]:
+        core = _bulk_omics_core_key(layer)
+        idx = core_to_idx.get(str(core))
+        if idx is None:
+            return None
+        return f"protein_{int(idx)}"
+
+    if core_to_idx and real_layers and prot_feats:
+        real_layers2: list[str] = []
+        for rl in real_layers:
+            if _layer_to_mask(str(rl)) is not None:
+                real_layers2.append(str(rl))
+        real_layers2.sort(key=lambda s: int(core_to_idx.get(str(_bulk_omics_core_key(s))) or 10**9))
+        real_layers = real_layers2
+
     real_to_mask: Dict[str, str] = {}
     mask_to_real: Dict[str, str] = {}
+
     for i, real in enumerate(real_layers):
-        masked = f"protein_{int(i + 1)}"
+        masked: Optional[str] = None
+        if core_to_idx:
+            masked = _layer_to_mask(str(real))
+        if not masked:
+            masked = f"protein_{int(i + 1)}"
         real_to_mask[str(real)] = str(masked)
         mask_to_real[str(masked)] = str(real)
 
@@ -7669,9 +7889,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 except Exception:
                     mk = ""
                 real_to_mask, _ = _tests_get_protein_mask_maps(mk, challenge=challenge)
-                layers = [real_to_mask.get(k) for k in _protein_layer_names_from_payload(_tests_load_model_payload_for_challenge(challenge, mk))]
-                layers2 = [str(x) for x in layers if isinstance(x, str) and x]
-                self._send_json(200, {"ok": True, "challenge": challenge, "model": str(mk), "proteins": layers2})
+                vals = [str(v) for v in list(real_to_mask.values()) if isinstance(v, str) and v]
+                vals2 = sorted(set(vals), key=lambda s: int(s[len("protein_") :]) if s.startswith("protein_") and s[len("protein_") :].isdigit() else 10**9)
+                self._send_json(200, {"ok": True, "challenge": challenge, "model": str(mk), "proteins": vals2})
                 return
             if path in ("/api/tests/cancer/protein_layers", "/api/tests/hereditary_disease/protein_layers", "/api/tests/aging/protein_layers"):
                 if path.startswith("/api/tests/cancer/"):
@@ -7688,9 +7908,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 except Exception:
                     mk = ""
                 real_to_mask, _ = _tests_get_protein_mask_maps(mk, challenge=challenge)
-                layers = [real_to_mask.get(k) for k in _protein_layer_names_from_payload(_tests_load_model_payload_for_challenge(challenge, mk))]
-                layers2 = [str(x) for x in layers if isinstance(x, str) and x]
-                self._send_json(200, {"ok": True, "challenge": challenge, "model": str(mk), "protein_layers": layers2})
+                vals = [str(v) for v in list(real_to_mask.values()) if isinstance(v, str) and v]
+                vals2 = sorted(set(vals), key=lambda s: int(s[len("protein_") :]) if s.startswith("protein_") and s[len("protein_") :].isdigit() else 10**9)
+                self._send_json(200, {"ok": True, "challenge": challenge, "model": str(mk), "protein_layers": vals2})
                 return
             if path == "/api/spatial_tx/gene_sets":
                 self._send_json(200, {"ok": True, "gene_sets": _list_stx_gene_sets()})
@@ -7850,6 +8070,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 provider_req = body.get("provider")
                 model_req = body.get("model")
                 memory_limit_req = body.get("memory_limit")
+                max_tokens_req = body.get("max_tokens")
+                auto_continue_req = body.get("auto_continue")
+                max_continuations_req = body.get("max_continuations")
 
                 if not isinstance(instructions, str) or not instructions.strip():
                     raise ValueError("missing instructions")
@@ -7878,6 +8101,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 prov = str(provider_req or "openai").strip().lower() or "openai"
                 if prov == "claude":
                     prov = "anthropic"
+                if prov == "grok":
+                    prov = "xai"
 
                 selected: list[Dict[str, Any]] = []
                 if isinstance(file_ids_req, list) and file_ids_req:
@@ -7918,6 +8143,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     manifest = None
 
                 model = "gpt-5.2"
+                if prov == "anthropic":
+                    model = "claude-sonnet-4-5-20250929"
+                if prov == "xai":
+                    model = "grok-4"
+                if prov == "gemini":
+                    model = "gemini-2.5-pro"
                 memory_limit = str(memory_limit_req or "4g")
                 if memory_limit not in ("1g", "4g", "16g", "64g"):
                     memory_limit = "4g"
@@ -7935,6 +8166,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                     client = OpenAI(api_key=api_key)
                     file_ids: list[str] = []
+                    uploaded_bytes_total = 0
 
                     used_files: list[Dict[str, Any]] = []
                     for ent in selected:
@@ -7949,6 +8181,10 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             raw_bytes = p.read_bytes()
                         except Exception:
                             raw_bytes = b""
+                        try:
+                            uploaded_bytes_total += int(len(raw_bytes or b""))
+                        except Exception:
+                            pass
 
                         upload_name = str(p.name)
                         suf = str(p.suffix or "").lower()
@@ -7983,10 +8219,14 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             "container": {"type": "auto", "file_ids": file_ids, "memory_limit": memory_limit},
                         }
                     ]
+
+                    base_model, effort = _openai_base_model_and_effort(str(model))
+                    eff = str(effort or "medium")
                     resp = client.responses.create(
-                        model=model,
+                        model=str(base_model or model),
                         input=str(instructions_eff),
-                        reasoning={"effort": "medium"},
+                        text={"format": {"type": "text"}, "verbosity": "medium"},
+                        reasoning={"effort": eff, "summary": "auto"},
                         tools=tools,
                         include=["code_interpreter_call.outputs"],
                     )
@@ -8022,13 +8262,293 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     )
                     return
 
+                if prov in ("gemini",):
+                    api_key_g = os.environ.get("GEMINI_API_KEY")
+                    if not isinstance(api_key_g, str) or not api_key_g.strip():
+                        raise ValueError("missing GEMINI_API_KEY")
+                    base_url_g = str(os.environ.get("GEMINI_BASE_URL") or "").strip() or "https://generativelanguage.googleapis.com/v1beta"
+
+                    max_tokens_g = 8192
+                    try:
+                        if max_tokens_req is not None:
+                            max_tokens_g = int(max_tokens_req)
+                    except Exception:
+                        max_tokens_g = 8192
+                    max_tokens_g = max(256, min(65536, int(max_tokens_g)))
+
+                    used_files: list[Dict[str, Any]] = []
+                    parts: list[Dict[str, Any]] = [{"text": str(instructions_eff)}]
+
+                    uploaded_bytes_total = 0
+                    for ent in selected:
+                        rid0 = str(ent.get("run_id") or "")
+                        name0 = str(ent.get("name") or "")
+                        if not rid0 or not name0:
+                            continue
+                        p = _OMICS.file_path(rid0, name0)
+
+                        raw_bytes = b""
+                        try:
+                            raw_bytes = p.read_bytes()
+                        except Exception:
+                            raw_bytes = b""
+
+                        try:
+                            uploaded_bytes_total += int(len(raw_bytes or b""))
+                        except Exception:
+                            pass
+
+                        suf = str(p.suffix or "").lower()
+                        mime_type = "application/octet-stream"
+                        if suf == ".csv":
+                            mime_type = "text/csv"
+                        elif suf == ".tsv":
+                            mime_type = "text/tab-separated-values"
+                        elif suf == ".txt":
+                            mime_type = "text/plain"
+                        elif suf == ".json":
+                            mime_type = "application/json"
+
+                        if suf in (".csv", ".tsv", ".txt", ".json"):
+                            try:
+                                txt0 = raw_bytes.decode("utf-8", errors="replace")
+                                txt1 = _mask_disease_term(txt0)
+                                raw_bytes = txt1.encode("utf-8")
+                            except Exception:
+                                pass
+
+                        b64 = ""
+                        try:
+                            b64 = base64.b64encode(raw_bytes or b"").decode("ascii")
+                        except Exception:
+                            b64 = ""
+                        parts.append({"inlineData": {"mimeType": str(mime_type), "data": str(b64)}})
+
+                        used_files.append(
+                            {
+                                "run_id": rid0,
+                                "name": name0,
+                                "file_id": str(ent.get("file_id") or ""),
+                                "display_name": str(ent.get("display_name") or name0),
+                            }
+                        )
+
+                    if int(uploaded_bytes_total) > 18 * 1024 * 1024:
+                        raise ValueError("files too large for gemini inlineData")
+
+                    url = str(base_url_g).rstrip("/") + "/models/" + str(model) + ":generateContent"
+                    payload: Dict[str, Any] = {
+                        "tools": [{"code_execution": {}}],
+                        "contents": [{"role": "user", "parts": parts}],
+                        "generationConfig": {
+                            "temperature": 0.0,
+                            "maxOutputTokens": int(max_tokens_g),
+                        },
+                    }
+                    if str(model or "").strip().startswith("gemini-3-"):
+                        payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
+                    headers = {
+                        "x-goog-api-key": str(api_key_g),
+                        "content-type": "application/json",
+                    }
+
+                    resp_json: Dict[str, Any] = {}
+                    last_err: Optional[str] = None
+                    for attempt in range(3):
+                        try:
+                            t_s = float(600.0)
+                            if attempt == 1:
+                                t_s = float(900.0)
+                            if attempt == 2:
+                                t_s = float(1200.0)
+                            resp_json = _http_post_json(url=str(url), headers=headers, payload=payload, timeout_s=t_s)
+                            last_err = None
+                            break
+                        except Exception as e:
+                            last_err = str(e)
+                            if _should_retry_remote_http_error(last_err) and attempt < 2:
+                                try:
+                                    _LOG.warning("Gemini /generateContent retry attempt=%d error=%s", int(attempt + 1), str(last_err)[:300])
+                                except Exception:
+                                    pass
+                                try:
+                                    sleep_s = float(1.0 + (2.0 * float(attempt)))
+                                    hint_s = _retry_delay_seconds_from_error(last_err)
+                                    if hint_s is not None:
+                                        sleep_s = max(float(sleep_s), float(hint_s))
+                                    sleep_s = min(300.0, max(0.0, float(sleep_s)))
+                                    time.sleep(float(sleep_s))
+                                except Exception:
+                                    pass
+                                continue
+                            raise
+                    if last_err:
+                        raise ValueError(str(last_err))
+
+                    out_text = ""
+                    try:
+                        candidates = resp_json.get("candidates") if isinstance(resp_json, dict) else None
+                        if isinstance(candidates, list) and candidates:
+                            c0 = candidates[0] if isinstance(candidates[0], dict) else {}
+                            content0 = c0.get("content") if isinstance(c0, dict) else None
+                            parts0 = content0.get("parts") if isinstance(content0, dict) else None
+                            if isinstance(parts0, list) and parts0:
+                                out_chunks: list[str] = []
+                                for p0 in parts0:
+                                    if isinstance(p0, dict) and isinstance(p0.get("text"), str):
+                                        out_chunks.append(str(p0.get("text") or ""))
+                                out_text = "".join(out_chunks).strip()
+                    except Exception:
+                        out_text = ""
+
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "run_id": str(run_id or ""),
+                            "manifest": manifest,
+                            "files": used_files,
+                            "provider": "gemini",
+                            "gemini": {
+                                "base_url": str(base_url_g),
+                                "model": str(model),
+                                "max_tokens": int(max_tokens_g),
+                            },
+                            "output_text": str(out_text or ""),
+                            "response": resp_json,
+                        },
+                    )
+                    return
+
+                if prov in ("xai",):
+                    if OpenAI is None:
+                        raise ValueError("openai sdk not installed")
+                    api_key = os.environ.get("XAI_API_KEY")
+                    if not isinstance(api_key, str) or not api_key.strip():
+                        raise ValueError("missing XAI_API_KEY")
+                    base_url = str(os.environ.get("XAI_BASE_URL") or "").strip() or "https://api.x.ai/v1"
+
+                    client = OpenAI(api_key=api_key, base_url=str(base_url))
+                    file_ids: list[str] = []
+                    used_files: list[Dict[str, Any]] = []
+
+                    for ent in selected:
+                        rid0 = str(ent.get("run_id") or "")
+                        name0 = str(ent.get("name") or "")
+                        if not rid0 or not name0:
+                            continue
+                        p = _OMICS.file_path(rid0, name0)
+
+                        raw_bytes = b""
+                        try:
+                            raw_bytes = p.read_bytes()
+                        except Exception:
+                            raw_bytes = b""
+
+                        upload_name = str(p.name)
+                        suf = str(p.suffix or "").lower()
+                        if suf in (".csv", ".tsv", ".txt", ".json"):
+                            try:
+                                txt0 = raw_bytes.decode("utf-8", errors="replace")
+                                txt1 = _mask_disease_term(txt0)
+                                raw_bytes = txt1.encode("utf-8")
+                                upload_name = _mask_disease_term(upload_name)
+                            except Exception:
+                                pass
+
+                        bio = io.BytesIO(raw_bytes)
+                        try:
+                            bio.name = upload_name
+                        except Exception:
+                            pass
+                        fo = client.files.create(file=bio, purpose="user_data")
+                        fid = str(getattr(fo, "id", "") or "")
+                        if fid:
+                            file_ids.append(fid)
+                        used_files.append(
+                            {
+                                "run_id": rid0,
+                                "name": name0,
+                                "file_id": str(ent.get("file_id") or ""),
+                                "display_name": str(ent.get("display_name") or name0),
+                            }
+                        )
+
+                    input_parts: list[Dict[str, Any]] = [
+                        {"type": "input_text", "text": str(instructions_eff)}
+                    ]
+                    for fid in file_ids:
+                        input_parts.append({"type": "input_file", "file_id": str(fid)})
+
+                    tools = [{"type": "code_interpreter"}]
+                    resp = client.responses.create(
+                        model=str(model),
+                        input=[{"role": "user", "content": input_parts}],
+                        tools=tools,
+                    )
+
+                    out_text = ""
+                    try:
+                        out_text = str(getattr(resp, "output_text", "") or "")
+                    except Exception:
+                        out_text = ""
+
+                    resp_dump: Any = None
+                    try:
+                        resp_dump = resp.model_dump()
+                    except Exception:
+                        resp_dump = None
+
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "run_id": str(run_id or ""),
+                            "manifest": manifest,
+                            "files": used_files,
+                            "provider": "xai",
+                            "xai": {
+                                "base_url": str(base_url),
+                                "model": str(model),
+                                "file_ids": list(file_ids),
+                            },
+                            "output_text": str(out_text or ""),
+                            "response": resp_dump,
+                        },
+                    )
+                    return
+
                 if prov in ("anthropic",):
                     api_key_a = os.environ.get("ANTHROPIC_API_KEY")
                     if not isinstance(api_key_a, str) or not api_key_a.strip():
                         raise ValueError("missing ANTHROPIC_API_KEY")
 
+                    max_tokens_a = 8192
+                    try:
+                        if max_tokens_req is not None:
+                            max_tokens_a = int(max_tokens_req)
+                    except Exception:
+                        max_tokens_a = 8192
+                    max_tokens_a = max(256, min(16384, int(max_tokens_a)))
+
+                    auto_continue = True
+                    try:
+                        if auto_continue_req is not None:
+                            auto_continue = bool(auto_continue_req)
+                    except Exception:
+                        auto_continue = True
+
+                    max_continuations = 2
+                    try:
+                        if max_continuations_req is not None:
+                            max_continuations = int(max_continuations_req)
+                    except Exception:
+                        max_continuations = 2
+                    max_continuations = max(0, min(4, int(max_continuations)))
+
                     used_files: list[Dict[str, Any]] = []
                     file_ids: list[str] = []
+                    uploaded_bytes_total = 0
 
                     for ent in selected:
                         rid0 = str(ent.get("run_id") or "")
@@ -8058,7 +8578,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             api_key=str(api_key_a),
                             filename=str(upload_name),
                             file_bytes=(raw_bytes or b""),
-                            timeout_s=60.0,
+                            timeout_s=120.0,
                         )
                         fid = str(up.get("id") or "")
                         if fid:
@@ -8074,14 +8594,58 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     if not file_ids:
                         raise ValueError("no files uploaded")
 
-                    resp_json = _anthropic_messages_code_execution(
-                        api_key=str(api_key_a),
-                        model=str(model or "claude-sonnet-4-5"),
-                        instructions=str(instructions_eff),
-                        file_ids=list(file_ids),
-                        timeout_s=120.0,
-                    )
-                    out_text = _anthropic_message_text(resp_json if isinstance(resp_json, dict) else {})
+                    try:
+                        need_tokens = int(_approx_token_count_text(str(instructions_eff)))
+                        need_tokens += int(max(0, int(uploaded_bytes_total)) // 4)
+                        need_tokens += 500
+                        _anthropic_tpm_throttle(need_tokens=int(need_tokens))
+                    except Exception:
+                        pass
+
+                    resp_jsons: list[Dict[str, Any]] = []
+                    out_texts: list[str] = []
+
+                    content_blocks0: list[Dict[str, Any]] = [{"type": "text", "text": str(instructions_eff)}]
+                    for fid in list(file_ids):
+                        if str(fid or "").strip():
+                            content_blocks0.append({"type": "container_upload", "file_id": str(fid)})
+                    messages0: list[Dict[str, Any]] = [{"role": "user", "content": content_blocks0}]
+
+                    for i in range(int(max_continuations) + 1):
+                        resp_i = _anthropic_messages_code_execution(
+                            api_key=str(api_key_a),
+                            model=str(model or "claude-sonnet-4-5"),
+                            instructions=str(instructions_eff),
+                            file_ids=list(file_ids),
+                            timeout_s=600.0,
+                            max_tokens=int(max_tokens_a),
+                            messages=list(messages0),
+                        )
+                        resp_jsons.append(resp_i if isinstance(resp_i, dict) else {})
+                        out_i = _anthropic_message_text(resp_i if isinstance(resp_i, dict) else {})
+                        out_texts.append(str(out_i or ""))
+
+                        stop_r = str((resp_i if isinstance(resp_i, dict) else {}).get("stop_reason") or "").strip().lower()
+                        if (not auto_continue) or stop_r != "max_tokens" or i >= int(max_continuations):
+                            break
+
+                        tail = str(out_i or "")
+                        if len(tail) > 1400:
+                            tail = tail[-1400:]
+                        cont_prompt = (
+                            "Your previous message was cut off due to max_tokens. "
+                            "Continue immediately after the end of the previous message. Do not repeat any content. "
+                            "For reference, the end of your previous message was:\n\n"
+                            + tail
+                        )
+                        messages0 = [
+                            {"role": "user", "content": content_blocks0},
+                            {"role": "assistant", "content": [{"type": "text", "text": str(tail)}]},
+                            {"role": "user", "content": [{"type": "text", "text": cont_prompt}]},
+                        ]
+
+                    resp_json = resp_jsons[-1] if resp_jsons else {}
+                    out_text = "".join([str(x or "") for x in out_texts])
 
                     self._send_json(
                         200,
@@ -8094,6 +8658,10 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             "anthropic": {
                                 "model": str(model),
                                 "file_ids": list(file_ids),
+                                "max_tokens": int(max_tokens_a),
+                                "auto_continue": bool(auto_continue),
+                                "max_continuations": int(max_continuations),
+                                "continuations": int(max(0, len(resp_jsons) - 1)),
                             },
                             "output_text": str(out_text or ""),
                             "response": resp_json,
@@ -8219,9 +8787,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         ticks=int(ticks_i),
                         interventions_n=int(iv_n),
                     )
+                    groups = 2
+                    if str(challenge or "").strip().lower() in ("cancer", "hereditary_disease") and int(iv_n) > 0:
+                        groups = 3
                     charge = _tests_make_charge(
                         kind=f"tests_{challenge}_claim_cure",
-                        samples=int(2 * reps_i),
+                        samples=int(int(groups) * int(reps_i)),
                         unit_cost_cents=int(unit),
                         meta={"experiment": f"tests_{challenge}_claim_cure_v1", "player_id": _sanitize_player_id(player_id)},
                     )
@@ -9575,6 +10146,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 delta_med = float(med_t) - float(med_b)
                 extra_days = float(delta_med)
                 win = False
+                lifespan_recovery_pct = None
+                try:
+                    if float(med_b) > 0.0:
+                        lifespan_recovery_pct = float(med_t) / float(med_b) * 100.0
+                except Exception:
+                    lifespan_recovery_pct = None
 
                 files_text: Dict[str, Any] = {}
 
@@ -9635,22 +10212,6 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 metadata_name = f"metadata_{run_tag}.csv"
                 files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
 
-                manifest = {
-                    "experiment": f"tests_{challenge}_claim_cure_v1",
-                    "kind": "claim_cure",
-                    "player_id": _sanitize_player_id(player_id),
-                    "ticks": int(ticks_i),
-                    "replicates": int(reps_i),
-                    "seed": int(seed_i),
-                    "interventions": interventions_real,
-                    "baseline_healthy_median_tick": float(med_b),
-                    "treated_healthy_median_tick": float(med_t),
-                    "extra_days": float(extra_days),
-                    "delta_median_ticks": float(delta_med),
-                    "win": bool(win),
-                }
-                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
-
                 iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
                 unit = _tests_compute_unit_cost_cents(
                     challenge=challenge,
@@ -9678,9 +10239,35 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     msu = 0.0
                 if msu > 0.0:
                     try:
-                        score_lifedays_per_usd = float(max(0.0, float(extra_days))) / float(msu)
+                        score_lifedays_per_usd = float(extra_days) / float(msu)
                     except Exception:
                         score_lifedays_per_usd = None
+
+                score = None
+                if score_lifedays_per_usd is not None:
+                    try:
+                        score = float(score_lifedays_per_usd) * 10000.0
+                    except Exception:
+                        score = None
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_claim_cure_v1",
+                    "kind": "claim_cure",
+                    "player_id": _sanitize_player_id(player_id),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "seed": int(seed_i),
+                    "interventions": interventions_real,
+                    "baseline_healthy_median_tick": float(med_b),
+                    "treated_healthy_median_tick": float(med_t),
+                    "extra_days": float(extra_days),
+                    "score_lifedays_per_usd": score_lifedays_per_usd,
+                    "score": score,
+                    "delta_median_ticks": float(delta_med),
+                    "lifespan_recovery_pct": lifespan_recovery_pct,
+                    "win": bool(win),
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
 
                 self._send_json(
                     200,
@@ -9712,7 +10299,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         "treated_healthy_median_tick": float(med_t),
                         "extra_days": float(extra_days),
                         "score_lifedays_per_usd": score_lifedays_per_usd,
+                        "score": score,
                         "delta_median_ticks": float(delta_med),
+                        "lifespan_recovery_pct": lifespan_recovery_pct,
                         "win": bool(win),
                         "game": game,
                     },
@@ -9747,7 +10336,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 sick0 = _tests_load_model_payload_for_challenge(challenge, str(disease_key))
                 sick = _deepcopy_payload(sick0)
                 interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=str(disease_key), challenge=challenge)
-                if interventions_real:
+                run_treated = bool(interventions_real)
+                if run_treated:
                     sick["_tick_interventions"] = list(interventions_real)
 
                 death_names = _death_measurement_names_from_payload(healthy)
@@ -9773,7 +10363,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
                     rh = _run_lifespan_death_tick(healthy, ticks=int(ticks_i), seed0=int(seed0_h), death_names=death_names)
                     rs0 = _run_lifespan_death_tick(sick0, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names)
-                    rs = _run_lifespan_death_tick(sick, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names)
+                    rs = _run_lifespan_death_tick(sick, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names) if run_treated else rs0
                     try:
                         death_ticks_healthy.append(int(rh.get("death_tick")))
                     except Exception:
@@ -9811,6 +10401,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 delta_med = float(med_s) - float(med_h)
                 extra_days = float(med_s) - float(med_s0)
                 win = bool(abs(float(delta_med)) <= 0.5)
+                lifespan_recovery_pct = None
+                try:
+                    if float(med_h) > 0.0:
+                        lifespan_recovery_pct = float(med_s) / float(med_h) * 100.0
+                except Exception:
+                    lifespan_recovery_pct = None
 
                 files_text: Dict[str, Any] = {}
 
@@ -9846,13 +10442,23 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         cause = "survived_to_end"
                     sum_rows.append(["healthy", int(ticks_i), int(dt), str(cause)])
 
+                if run_treated:
+                    for ri in range(int(reps_i)):
+                        dt = int(death_ticks_sick_base[int(ri)]) if int(ri) < int(len(death_ticks_sick_base)) else int(ticks_i)
+                        dm = str(death_meas_sick_base[int(ri)]) if int(ri) < int(len(death_meas_sick_base)) else ""
+                        cause = str(dm or "")
+                        if int(dt) >= int(ticks_i):
+                            cause = "survived_to_end"
+                        sum_rows.append([f"baseline_{str(disease_key)}", int(ticks_i), int(dt), str(cause)])
+
                 for ri in range(int(reps_i)):
                     dt = int(death_ticks_sick[int(ri)]) if int(ri) < int(len(death_ticks_sick)) else int(ticks_i)
                     dm = str(death_meas_sick[int(ri)]) if int(ri) < int(len(death_meas_sick)) else ""
                     cause = str(dm or "")
                     if int(dt) >= int(ticks_i):
                         cause = "survived_to_end"
-                    sum_rows.append([str(disease_key), int(ticks_i), int(dt), str(cause)])
+                    sum_type = f"treated_{str(disease_key)}" if run_treated else str(disease_key)
+                    sum_rows.append([sum_type, int(ticks_i), int(dt), str(cause)])
 
                 files_text[fn_sum] = _csv_from_rows(sum_header, sum_rows)
 
@@ -9872,22 +10478,6 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 metadata_name = f"metadata_{run_tag}.csv"
                 files_text[metadata_name] = _csv_from_rows(meta_header, meta_rows)
 
-                manifest = {
-                    "experiment": f"tests_{challenge}_claim_cure_v1",
-                    "kind": "claim_cure",
-                    "player_id": _sanitize_player_id(player_id),
-                    "ticks": int(ticks_i),
-                    "replicates": int(reps_i),
-                    "seed": int(seed_i),
-                    "interventions": interventions_real,
-                    "baseline_disease_median_tick": float(med_s0),
-                    "treated_disease_median_tick": float(med_s),
-                    "extra_days": float(extra_days),
-                    "delta_median_ticks": float(delta_med),
-                    "win": bool(win),
-                }
-                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
-
                 iv_n = int(len(interventions)) if isinstance(interventions, list) else 0
                 unit = _tests_compute_unit_cost_cents(
                     challenge=challenge,
@@ -9898,7 +10488,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 )
                 charge = _tests_make_charge(
                     kind=f"tests_{challenge}_claim_cure",
-                    samples=int(2 * reps_i),
+                    samples=int(int((3 if run_treated else 2)) * int(reps_i)),
                     unit_cost_cents=int(unit),
                     meta={
                         "experiment": f"tests_{challenge}_claim_cure_v1",
@@ -9915,51 +10505,78 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     msu = 0.0
                 if msu > 0.0:
                     try:
-                        score_lifedays_per_usd = float(max(0.0, float(extra_days))) / float(msu)
+                        score_lifedays_per_usd = float(extra_days) / float(msu)
                     except Exception:
                         score_lifedays_per_usd = None
 
-                self._send_json(
-                    200,
-                    {
-                        "ok": True,
-                        "experiment": f"tests_{challenge}_claim_cure_v1",
-                        "ticks": int(ticks_i),
-                        "replicates": int(reps_i),
-                        "death_measurements": list(death_names),
-                        "run_id": str(omics_saved.get("run_id") or ""),
-                        "files": omics_saved.get("files"),
-                        "omics_inventory": {
-                            "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
-                            "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
-                        },
-                        "healthy": {
-                            **stats_healthy,
-                            "death_ticks": [int(x) for x in death_ticks_healthy],
-                            "death_measurements": [str(x) for x in death_meas_healthy],
-                            "curve": curve_healthy,
-                        },
-                        "baseline_sick": {
-                            **stats_sick_base,
-                            "death_ticks": [int(x) for x in death_ticks_sick_base],
-                            "death_measurements": [str(x) for x in death_meas_sick_base],
-                            "curve": curve_sick_base,
-                        },
-                        "sick": {
-                            **stats_sick,
-                            "death_ticks": [int(x) for x in death_ticks_sick],
-                            "death_measurements": [str(x) for x in death_meas_sick],
-                            "curve": curve_sick,
-                        },
-                        "baseline_disease_median_tick": float(med_s0),
-                        "treated_disease_median_tick": float(med_s),
-                        "extra_days": float(extra_days),
-                        "score_lifedays_per_usd": score_lifedays_per_usd,
-                        "delta_median_ticks": float(delta_med),
-                        "win": bool(win),
-                        "game": game,
+                score = None
+                if score_lifedays_per_usd is not None:
+                    try:
+                        score = float(score_lifedays_per_usd) * 10000.0
+                    except Exception:
+                        score = None
+
+                manifest = {
+                    "experiment": f"tests_{challenge}_claim_cure_v1",
+                    "kind": "claim_cure",
+                    "player_id": _sanitize_player_id(player_id),
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "seed": int(seed_i),
+                    "interventions": interventions_real,
+                    "baseline_disease_median_tick": float(med_s0),
+                    "treated_disease_median_tick": float(med_s),
+                    "extra_days": float(extra_days),
+                    "score_lifedays_per_usd": score_lifedays_per_usd,
+                    "score": score,
+                    "delta_median_ticks": float(delta_med),
+                    "lifespan_recovery_pct": lifespan_recovery_pct,
+                    "win": bool(win),
+                }
+                omics_saved = _OMICS.create_run({**manifest, "run_id": str(run_id0)}, files_text)
+
+                out_json = {
+                    "ok": True,
+                    "experiment": f"tests_{challenge}_claim_cure_v1",
+                    "ticks": int(ticks_i),
+                    "replicates": int(reps_i),
+                    "death_measurements": list(death_names),
+                    "run_id": str(omics_saved.get("run_id") or ""),
+                    "files": omics_saved.get("files"),
+                    "omics_inventory": {
+                        "inventory_url": f"/api/omics/inventory?player_id={_sanitize_player_id(player_id)}",
+                        "llm_message": str(_OMICS.inventory(player_id).get("llm_message") or ""),
                     },
-                )
+                    "healthy": {
+                        **stats_healthy,
+                        "death_ticks": [int(x) for x in death_ticks_healthy],
+                        "death_measurements": [str(x) for x in death_meas_healthy],
+                        "curve": curve_healthy,
+                    },
+                    "sick": {
+                        **stats_sick,
+                        "death_ticks": [int(x) for x in death_ticks_sick],
+                        "death_measurements": [str(x) for x in death_meas_sick],
+                        "curve": curve_sick,
+                    },
+                    "baseline_disease_median_tick": float(med_s0),
+                    "treated_disease_median_tick": float(med_s),
+                    "extra_days": float(extra_days),
+                    "score_lifedays_per_usd": score_lifedays_per_usd,
+                    "score": score,
+                    "delta_median_ticks": float(delta_med),
+                    "lifespan_recovery_pct": lifespan_recovery_pct,
+                    "win": bool(win),
+                    "game": game,
+                }
+                if run_treated:
+                    out_json["baseline_sick"] = {
+                        **stats_sick_base,
+                        "death_ticks": [int(x) for x in death_ticks_sick_base],
+                        "death_measurements": [str(x) for x in death_meas_sick_base],
+                        "curve": curve_sick_base,
+                    }
+                self._send_json(200, out_json)
                 return
 
             if self.path == "/api/experiments/spatial_tx":
