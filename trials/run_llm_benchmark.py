@@ -49,6 +49,37 @@ _BENCH_CHALLENGE = "cancer"
 _BENCH_PLAYER_ID = ""
 _BENCH_PROVIDER = ""
 _BENCH_MODEL = ""
+_BENCH_PROMPT_TEXT = ""
+_BENCH_PROMPT_FILE = ""
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _prompts_dir() -> Path:
+    return _repo_root() / "prompts"
+
+
+def _read_prompt_text(prompt_file: Optional[str]) -> Tuple[str, str]:
+    pf_in = str(prompt_file or "").strip()
+    explicit = bool(pf_in)
+    if not pf_in:
+        pf_in = "default.txt"
+
+    p = Path(pf_in).expanduser()
+    if not p.is_absolute():
+        p = _prompts_dir() / pf_in
+
+    if not (p.exists() and p.is_file()):
+        if explicit:
+            raise FileNotFoundError(f"Prompt file not found: {pf_in}")
+        return _PROMPT, ""
+
+    with open(str(p), "r", encoding="utf-8", errors="replace") as f:
+        txt = f.read()
+    label = pf_in if not Path(pf_in).is_absolute() else str(p)
+    return str(txt).strip(), str(label)
 
 
 _ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
@@ -721,6 +752,8 @@ Tool execution semantics:
 
 Now begin. Your budget is 5 million dollars but you can go into debt if needed so don't stop at 5 million. First, write a brief strategy for how you will solve the task (put it in next_step_rationale of your first JSON). Then your first API calls should usually be /api/health and /api/game/state.
 """.strip()
+
+_BENCH_PROMPT_TEXT = _PROMPT
 
 
 @dataclass
@@ -1713,6 +1746,80 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _action_has_required_fields(action: Dict[str, Any]) -> bool:
+    if not isinstance(action, dict):
+        return False
+    act = str(action.get("action") or "").strip().lower()
+    if act == "call_api":
+        if not isinstance(action.get("method"), str) or not str(action.get("method") or "").strip():
+            return False
+        if not isinstance(action.get("path"), str) or not str(action.get("path") or "").strip():
+            return False
+        if not isinstance(action.get("query"), dict):
+            return False
+        if not isinstance(action.get("body"), dict):
+            return False
+        if not isinstance(action.get("last_result_summary"), str):
+            return False
+        if not isinstance(action.get("next_step_rationale"), str):
+            return False
+        return True
+    if act == "final":
+        if not isinstance(action.get("win"), bool):
+            return False
+        if not isinstance(action.get("summary"), str) or not str(action.get("summary") or "").strip():
+            return False
+        kf = action.get("key_findings")
+        if not isinstance(kf, list) or any((not isinstance(x, str)) for x in kf):
+            return False
+        if not isinstance(action.get("proposed_interventions"), list):
+            return False
+        return True
+    return False
+
+
+def _repair_action_json_with_llm(
+    *,
+    provider: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    bad_text: str,
+    temperature: float,
+    max_tokens: int,
+    timeout_s: float,
+    dump_path: Optional[str],
+) -> str:
+    bad0 = str(bad_text or "")
+    if len(bad0) > 12000:
+        bad0 = bad0[:12000]
+    repair_prompt = (
+        "Your previous assistant message was malformed or incomplete JSON. "
+        "Return exactly one valid JSON object matching the Action schema. "
+        "Do not use markdown fences. Do not add extra text.\n\n"
+        "If action=call_api, you must include: action, method, path, query (object), body (object), "
+        "last_result_summary (string), next_step_rationale (string).\n"
+        "If action=final, you must include: action, win (boolean), summary (string), key_findings (array of strings), "
+        "proposed_interventions (array).\n\n"
+        "Malformed message to fix:\n"
+        + bad0
+    )
+
+    msgs2 = list(messages or [])
+    msgs2.append(_msg("user", repair_prompt))
+    try:
+        return llm_generate(
+            provider=str(provider),
+            model=str(model),
+            messages=msgs2,
+            temperature=float(temperature),
+            max_tokens=int(max_tokens),
+            timeout_s=float(timeout_s),
+            dump_path=str(dump_path or "") or None,
+        )
+    except Exception:
+        return ""
+
+
 def _parse_counts_csv_mean(csv_text: str, *, max_rows: int = 2000) -> Tuple[List[str], List[float]]:
     s = str(csv_text or "").strip()
     if not s:
@@ -1772,6 +1879,20 @@ def _llm_tool_result_compact(
             "ok": bool(ok),
             "status": "ok" if ok else "error",
         }
+
+    if path == "/api/discuss":
+        out2: Dict[str, Any] = {
+            "ok": bool(llm_json.get("ok") is True),
+        }
+        if "provider" in llm_json:
+            out2["provider"] = llm_json.get("provider")
+        if "model" in llm_json:
+            out2["model"] = llm_json.get("model")
+        advice = llm_json.get("advice")
+        if isinstance(advice, str) and advice.strip():
+            out2["advice"] = str(advice).strip()[:4000]
+        out2["note"] = "Advisor returned concise scientific guidance. Use it to decide the next cheapest disambiguating experiments or next intervention to try."
+        return out2
 
     if path == "/api/bulk_omics/sets":
         sets0 = llm_json.get("sets")
@@ -2272,6 +2393,7 @@ def run_benchmark(
     api_timeout_s: float,
     llm_timeout_s: float,
     reset_first: bool,
+    prompt_file: Optional[str] = None,
 ) -> Tuple[str, BenchMetrics, List[Dict[str, Any]]]:
     resumed = False
     loaded_state: Optional[Dict[str, Any]] = None
@@ -2279,6 +2401,38 @@ def run_benchmark(
         loaded_state = _load_json_file(str(resume_state))
         if isinstance(loaded_state, dict) and loaded_state.get("ok") is True:
             resumed = True
+
+    prompt_text = _PROMPT
+    prompt_file_used = ""
+    pf_arg = str(prompt_file or "").strip()
+    if resumed and isinstance(loaded_state, dict):
+        st_pf = loaded_state.get("prompt_file")
+        if isinstance(st_pf, str) and st_pf.strip():
+            prompt_file_used = st_pf.strip()
+            if pf_arg and pf_arg != prompt_file_used:
+                raise RuntimeError("resume_state prompt_file does not match")
+        elif pf_arg:
+            prompt_file_used = pf_arg
+        if isinstance(loaded_state.get("prompt"), str) and str(loaded_state.get("prompt") or "").strip():
+            prompt_text = str(loaded_state.get("prompt") or "")
+    if not resumed:
+        try:
+            prompt_text, prompt_file_used = _read_prompt_text(pf_arg)
+        except FileNotFoundError:
+            raise
+    if resumed and (not str(prompt_text or "").strip()):
+        try:
+            if isinstance(loaded_state, dict) and isinstance(loaded_state.get("messages"), list):
+                msgs0 = loaded_state.get("messages")
+                if msgs0 and isinstance(msgs0[0], dict) and str(msgs0[0].get("role") or "") == "system":
+                    prompt_text = str(msgs0[0].get("content") or "")
+        except Exception:
+            prompt_text = _PROMPT
+
+    global _BENCH_PROMPT_TEXT
+    _BENCH_PROMPT_TEXT = str(prompt_text or "")
+    global _BENCH_PROMPT_FILE
+    _BENCH_PROMPT_FILE = str(prompt_file_used or "")
 
     ch = _normalize_challenge(challenge)
     global _BENCH_CHALLENGE
@@ -2419,7 +2573,7 @@ def run_benchmark(
             step_start = 0
 
         if not messages:
-            messages.append(_msg("system", _PROMPT))
+            messages.append(_msg("system", prompt_text))
             messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
             notebook_msg = _msg("user", "LAB_NOTEBOOK:")
             messages.append(notebook_msg)
@@ -2458,7 +2612,7 @@ def run_benchmark(
     else:
         metrics = BenchMetrics(start_ts=time.time())
         # Use a system message for OpenAI-compatible providers.
-        messages.append(_msg("system", _PROMPT))
+        messages.append(_msg("system", prompt_text))
         messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
 
         notebook_msg = _msg("user", "LAB_NOTEBOOK:")
@@ -2493,7 +2647,8 @@ def run_benchmark(
                 "executor_provider": exec_provider if human_mode else None,
                 "executor_model": exec_model if human_mode else None,
                 "player_id": player_id,
-                "prompt": _PROMPT,
+                "prompt": prompt_text,
+                "prompt_file": prompt_file_used,
             },
         )
         if str(state_out or "").strip():
@@ -2517,6 +2672,7 @@ def run_benchmark(
             state_obj = {
                 "ok": True,
                 "challenge": str(ch),
+                "prompt_file": str(prompt_file_used or ""),
                 "base_url": str(base_url),
                 "provider": str(provider),
                 "model": str(model),
@@ -2679,29 +2835,56 @@ def run_benchmark(
             _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "llm_error", "error": str(e)})
             break
 
+        out_raw = out
+        out_effective = out
+
+        action0 = _extract_first_json_object(out_effective)
+        if not _action_has_required_fields(action0 if isinstance(action0, dict) else {}):
+            dump_path_repair = None
+            try:
+                if str(dump_path or "").strip():
+                    dump_path_repair = str(Path(str(dump_path)).with_name(f"llm_repair_step_{int(step):06d}.json"))
+            except Exception:
+                dump_path_repair = None
+            repaired = _repair_action_json_with_llm(
+                provider=str(used_provider),
+                model=str(used_model),
+                messages=messages,
+                bad_text=str(out_raw or ""),
+                temperature=0.0,
+                max_tokens=max(256, min(1200, int(max_tokens))),
+                timeout_s=float(llm_timeout_s),
+                dump_path=dump_path_repair,
+            )
+            if str(repaired or "").strip():
+                action1 = _extract_first_json_object(repaired)
+                if _action_has_required_fields(action1 if isinstance(action1, dict) else {}):
+                    out_effective = str(repaired)
+
         seq += 1
-        transcript.append({"seq": seq, "type": "llm", "step": step, "text": out})
-        action_preview = _extract_first_json_object(out)
+        transcript.append({"seq": seq, "type": "llm", "step": step, "text": out_effective})
+        action_preview = _extract_first_json_object(out_effective)
         lrs_preview = action_preview.get("last_result_summary") if isinstance(action_preview, dict) else None
         nsr_preview = action_preview.get("next_step_rationale") if isinstance(action_preview, dict) else None
-        _write_event_line(
-            events_fp,
-            {
-                "seq": seq,
-                "ts": time.time(),
-                "type": "llm",
-                "step": step,
-                "text": out,
-                "provider_used": str(used_provider),
-                "model_used": str(used_model),
-                "last_result_summary": lrs_preview,
-                "next_step_rationale": nsr_preview,
-            },
-        )
-        out_llm_safe = _llm_sanitize_text(out)
+        ev_obj = {
+            "seq": seq,
+            "ts": time.time(),
+            "type": "llm",
+            "step": step,
+            "text": out_effective,
+            "provider_used": str(used_provider),
+            "model_used": str(used_model),
+            "last_result_summary": lrs_preview,
+            "next_step_rationale": nsr_preview,
+        }
+        if str(out_effective or "") != str(out_raw or ""):
+            ev_obj["text_raw"] = str(out_raw or "")[:8000]
+        _write_event_line(events_fp, ev_obj)
+
+        out_llm_safe = _llm_sanitize_text(out_effective)
         messages.append(_msg("assistant", out_llm_safe))
 
-        action = _extract_first_json_object(out)
+        action = _extract_first_json_object(out_effective)
         if not action or "action" not in action:
             messages.append(
                 _msg(
@@ -3218,6 +3401,7 @@ def main() -> int:
     ap.add_argument("--artifacts-dir", default="", help="(legacy) Alias for --files-dir.")
     ap.add_argument("--state-out", default="", help="Optional JSON checkpoint file for resuming a run.")
     ap.add_argument("--resume-state", default="", help="Resume a run from a previous --state-out checkpoint.")
+    ap.add_argument("--prompt-file", default="", help="Optional prompt file name (relative to prompts/) or absolute path.")
     ap.add_argument("--print-prompt", action="store_true", help="Print the benchmark prompt and exit.")
     ap.add_argument("--run-id", default="", help="Optional run_id label for tracking (e.g. run_...).")
     ap.add_argument("--suite-id", default="", help="Optional suite_id label for tracking (e.g. suite_...).")
@@ -3225,7 +3409,8 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.print_prompt:
-        sys.stdout.write(_PROMPT + "\n")
+        p_txt, _ = _read_prompt_text(str(args.prompt_file or "").strip())
+        sys.stdout.write(str(p_txt) + "\n")
         return 0
 
     events_fp = None
@@ -3259,6 +3444,7 @@ def main() -> int:
         api_timeout_s=float(args.api_timeout),
         llm_timeout_s=float(args.llm_timeout),
         reset_first=bool(args.reset_first),
+        prompt_file=str(args.prompt_file or "").strip() or None,
     )
 
     if events_fp is not None:
@@ -3266,9 +3452,6 @@ def main() -> int:
             events_fp.close()
         except Exception:
             pass
-
-    def _repo_root() -> Path:
-        return Path(__file__).resolve().parents[1]
 
     def _git_cmd(args2: List[str]) -> Optional[str]:
         try:
@@ -3314,7 +3497,8 @@ def main() -> int:
         "ok": True,
         "run_id": run_id,
         "suite_id": suite_id,
-        "prompt": _PROMPT,
+        "prompt": str(_BENCH_PROMPT_TEXT or _PROMPT),
+        "prompt_file": str(_BENCH_PROMPT_FILE or ""),
         "challenge": str(args.challenge),
         "provider": str(args.provider),
         "model": str(args.model),

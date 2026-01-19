@@ -53,6 +53,27 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _prompts_dir() -> Path:
+    return _repo_root() / "prompts"
+
+
+def _list_prompt_files() -> List[str]:
+    try:
+        d = _prompts_dir()
+        if not (d.exists() and d.is_dir()):
+            return []
+        out: List[str] = []
+        for p in sorted(d.glob("*.txt")):
+            try:
+                if p.is_file():
+                    out.append(p.name)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
 @st.cache_resource
 def _load_runner_module() -> Any:
     p = (_repo_root() / "trials" / "run_llm_benchmark.py").resolve()
@@ -662,20 +683,21 @@ def _detect_issues(events: List[Dict[str, Any]], paths: RunPaths) -> List[Dict[s
             sev = None
             kind = None
             summary = ""
+            rj = ev.get("response_json")
+            ignore_err = bool(isinstance(rj, dict) and str(rj.get("error_kind") or "").strip() == "all_replicates_died")
             try:
                 st_i = int(status)
             except Exception:
                 st_i = None
 
-            if st_i is not None and st_i >= 400:
+            if (not ignore_err) and st_i is not None and st_i >= 400:
                 sev = "error" if st_i >= 500 else "warn"
                 kind = "api_http_error"
                 summary = f"API {method} {path} -> HTTP {st_i}"
                 if st_i == 429:
                     sev = "warn"
                     kind = "api_rate_limited"
-            rj = ev.get("response_json")
-            if sev is None and isinstance(rj, dict):
+            if (not ignore_err) and sev is None and isinstance(rj, dict):
                 if rj.get("ok") is False:
                     sev = "warn"
                     kind = "api_ok_false"
@@ -686,7 +708,7 @@ def _detect_issues(events: List[Dict[str, Any]], paths: RunPaths) -> List[Dict[s
                     if not summary:
                         summary = f"API {method} {path} returned error field"
 
-            if sev is not None:
+            if (not ignore_err) and sev is not None:
                 out.append(
                     {
                         "severity": str(sev),
@@ -721,18 +743,19 @@ def _detect_issues(events: List[Dict[str, Any]], paths: RunPaths) -> List[Dict[s
             path = str(ev.get("path") or payload.get("path") or "")
             sev = None
             kind = None
+            rj = payload.get("response_json")
+            ignore_err = bool(isinstance(rj, dict) and str(rj.get("error_kind") or "").strip() == "all_replicates_died")
             try:
                 st_i = int(status)
             except Exception:
                 st_i = None
-            if st_i is not None and st_i >= 400:
+            if (not ignore_err) and st_i is not None and st_i >= 400:
                 sev = "error" if st_i >= 500 else "warn"
                 kind = "tool_http_error"
                 if st_i == 429:
                     sev = "warn"
                     kind = "tool_rate_limited"
-            rj = payload.get("response_json")
-            if sev is None and isinstance(rj, dict):
+            if (not ignore_err) and sev is None and isinstance(rj, dict):
                 if rj.get("ok") is False:
                     sev = "warn"
                     kind = "tool_ok_false"
@@ -744,7 +767,7 @@ def _detect_issues(events: List[Dict[str, Any]], paths: RunPaths) -> List[Dict[s
                 if re.search(r"max[_\s]?tokens|stop_reason\s*[:=]\s*max_tokens", rt, flags=re.IGNORECASE):
                     sev = "warn"
                     kind = "possible_truncation"
-            if sev is not None:
+            if (not ignore_err) and sev is not None:
                 out.append(
                     {
                         "severity": str(sev),
@@ -2480,6 +2503,22 @@ with st.sidebar:
         else:
             model = st.text_input("Model", value="", key="model", disabled=ui_locked_global)
 
+        st.subheader("Prompt")
+        prompt_files = _list_prompt_files()
+        if not prompt_files:
+            prompt_files = ["default.txt"]
+        prev_prompt = str(st.session_state.get("prompt_file") or "").strip()
+        if prev_prompt not in prompt_files:
+            prev_prompt = prompt_files[0]
+        prompt_file = st.selectbox(
+            "Initial prompt",
+            options=prompt_files,
+            index=int(prompt_files.index(prev_prompt)),
+            key="prompt_file_choice",
+            disabled=ui_locked_global,
+        )
+        st.session_state["prompt_file"] = str(prompt_file)
+
         st.subheader("Saved runs")
         runs = _list_runs()
         running_set = set(_running_runs())
@@ -2656,6 +2695,7 @@ if resume_clicked:
             st_provider = "claude"
         st_model = str(st_state.get("model") or "").strip() or str(model)
         st_challenge = str(st_state.get("challenge") or "").strip() or str(challenge)
+        st_prompt_file = str(st_state.get("prompt_file") or "").strip()
 
         exec_provider = ""
         exec_model = ""
@@ -2709,6 +2749,8 @@ if resume_clicked:
             "--model",
             str(st_model),
         ]
+        if st_prompt_file:
+            cmd.extend(["--prompt-file", str(st_prompt_file)])
         if st_provider == "human":
             cmd.extend(["--executor-provider", str(exec_provider), "--executor-model", str(exec_model), "--human-poll", str(float(exec_poll))])
         cmd.extend([
@@ -2789,6 +2831,9 @@ if start_clicked:
             "--model",
             str(model),
         ]
+        prompt_file = str(st.session_state.get("prompt_file") or "").strip()
+        if prompt_file:
+            cmd.extend(["--prompt-file", str(prompt_file)])
         if provider == "human":
             cmd.extend([
                 "--executor-provider",

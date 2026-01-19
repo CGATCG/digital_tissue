@@ -181,6 +181,224 @@ def _openai_base_model_and_effort(model: str) -> tuple[str, Optional[str]]:
     return m, None
 
 
+_DISCUSS_ADVISOR_SYSTEM_PROMPT = (
+    "You are a strict scientific advisor helping another agent run efficient, reliable experiments in a biology simulator. "
+    "Your job is to give short, concrete, actionable advice.\n\n"
+    "Guidelines:\n"
+    "- Favor power / sample size reasoning: recommend increasing replicates when uncertainty is high.\n"
+    "- Emphasize controls and matched comparisons (healthy vs disease; disease vs disease+treatment at the same ticks).\n"
+    "- Small molecular changes can have large phenotypic effects; do not dismiss small log2 fold-changes by default.\n"
+    "- Prefer cheap experiments first; escalate to expensive studies only after evidence.\n"
+    "- If a result is ambiguous, propose the minimum follow-up that disambiguates it.\n"
+    "- Be cautious about confounding and multiple comparisons; focus on effect size + consistency across replicates.\n\n"
+    "Output requirements:\n"
+    "- Return at most 6 bullet points.\n"
+    "- Each bullet must be an imperative action (e.g., 'Run ...', 'Compare ...', 'Increase replicates to ...').\n"
+    "- No long explanations, no markdown fences, no code."
+)
+
+
+def _discuss_postprocess_advice(text: str) -> str:
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    lines = []
+    for ln in t.splitlines():
+        s = str(ln or "")
+        if s.strip().startswith("```"):
+            continue
+        lines.append(s)
+    t2 = "\n".join(lines).strip()
+    if len(t2) > 2200:
+        t2 = t2[:2200].rstrip()
+    return t2
+
+
+def _discuss_llm_generate(*, provider: str, model: str, system_prompt: str, user_prompt: str, timeout_s: float, max_tokens: int) -> str:
+    prov = str(provider or "").strip().lower() or "openai"
+    if prov == "claude":
+        prov = "anthropic"
+    if prov == "grok":
+        prov = "xai"
+
+    if prov in ("openai", "openai_compat"):
+        if OpenAI is None:
+            raise ValueError("openai sdk not installed")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("missing OPENAI_API_KEY")
+
+        client = OpenAI(api_key=str(api_key))
+        base_model, effort = _openai_base_model_and_effort(str(model))
+        req: Dict[str, Any] = {
+            "model": str(base_model or model),
+            "input": [
+                {"role": "system", "content": str(system_prompt)},
+                {"role": "user", "content": str(user_prompt)},
+            ],
+            "text": {"format": {"type": "text"}, "verbosity": "low"},
+            "timeout": float(timeout_s),
+        }
+        if effort is not None:
+            req["reasoning"] = {"effort": str(effort)}
+
+        try:
+            resp = client.responses.create(**req, max_output_tokens=int(max_tokens))
+        except Exception:
+            resp = client.responses.create(**req)
+
+        try:
+            return str(getattr(resp, "output_text", "") or "")
+        except Exception:
+            return ""
+
+    if prov in ("xai",):
+        if OpenAI is None:
+            raise ValueError("openai sdk not installed")
+        api_key = os.environ.get("XAI_API_KEY")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("missing XAI_API_KEY")
+        base_url = str(os.environ.get("XAI_BASE_URL") or "").strip() or "https://api.x.ai/v1"
+
+        client = OpenAI(api_key=str(api_key), base_url=str(base_url))
+        req: Dict[str, Any] = {
+            "model": str(model),
+            "input": [
+                {"role": "system", "content": str(system_prompt)},
+                {"role": "user", "content": str(user_prompt)},
+            ],
+            "text": {"format": {"type": "text"}, "verbosity": "low"},
+        }
+        try:
+            resp = client.responses.create(**req, max_output_tokens=int(max_tokens))
+        except Exception:
+            resp = client.responses.create(**req)
+        try:
+            return str(getattr(resp, "output_text", "") or "")
+        except Exception:
+            return ""
+
+    if prov in ("gemini",):
+        api_key_g = os.environ.get("GEMINI_API_KEY")
+        if not isinstance(api_key_g, str) or not api_key_g.strip():
+            raise ValueError("missing GEMINI_API_KEY")
+        base_url_g = str(os.environ.get("GEMINI_BASE_URL") or "").strip() or "https://generativelanguage.googleapis.com/v1beta"
+        url = str(base_url_g).rstrip("/") + "/models/" + str(model) + ":generateContent"
+        headers = {
+            "x-goog-api-key": str(api_key_g),
+            "content-type": "application/json",
+        }
+        payload: Dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": str(system_prompt)}]},
+            "contents": [{"role": "user", "parts": [{"text": str(user_prompt)}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": int(max_tokens)},
+        }
+
+        resp_json: Dict[str, Any] = {}
+        last_err: Optional[str] = None
+        for attempt in range(3):
+            try:
+                t_s = float(timeout_s)
+                if attempt == 1:
+                    t_s = max(t_s, float(timeout_s) * 1.5)
+                if attempt == 2:
+                    t_s = max(t_s, float(timeout_s) * 2.0)
+                resp_json = _http_post_json(url=str(url), headers=headers, payload=payload, timeout_s=float(t_s))
+                last_err = None
+                break
+            except Exception as e:
+                last_err = str(e)
+                if _should_retry_remote_http_error(last_err) and attempt < 2:
+                    try:
+                        sleep_s = float(1.0 + (2.0 * float(attempt)))
+                        hint_s = _retry_delay_seconds_from_error(last_err)
+                        if hint_s is not None:
+                            sleep_s = max(float(sleep_s), float(hint_s))
+                        sleep_s = min(120.0, max(0.0, float(sleep_s)))
+                        time.sleep(float(sleep_s))
+                    except Exception:
+                        pass
+                    continue
+                raise
+        if last_err:
+            raise ValueError(str(last_err))
+
+        try:
+            candidates = resp_json.get("candidates") if isinstance(resp_json, dict) else None
+            if isinstance(candidates, list) and candidates:
+                c0 = candidates[0] if isinstance(candidates[0], dict) else {}
+                content0 = c0.get("content") if isinstance(c0, dict) else None
+                parts0 = content0.get("parts") if isinstance(content0, dict) else None
+                if isinstance(parts0, list) and parts0:
+                    out_chunks: list[str] = []
+                    for p0 in parts0:
+                        if isinstance(p0, dict) and isinstance(p0.get("text"), str):
+                            out_chunks.append(str(p0.get("text") or ""))
+                    return "".join(out_chunks).strip()
+        except Exception:
+            return ""
+        return ""
+
+    if prov in ("anthropic",):
+        api_key_a = os.environ.get("ANTHROPIC_API_KEY")
+        if not isinstance(api_key_a, str) or not api_key_a.strip():
+            raise ValueError("missing ANTHROPIC_API_KEY")
+
+        try:
+            need_tokens = int(_approx_token_count_text(str(system_prompt)))
+            need_tokens += int(_approx_token_count_text(str(user_prompt)))
+            need_tokens += 500
+            _anthropic_tpm_throttle(need_tokens=int(need_tokens))
+        except Exception:
+            pass
+
+        payload = {
+            "model": str(model),
+            "max_tokens": int(max(256, min(8192, int(max_tokens)))),
+            "temperature": 0.0,
+            "system": str(system_prompt),
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": str(user_prompt)}]},
+            ],
+        }
+
+        last_err: Optional[str] = None
+        resp_json: Dict[str, Any] = {}
+        for attempt in range(3):
+            try:
+                t_s = float(timeout_s)
+                if attempt == 1:
+                    t_s = max(t_s, float(timeout_s) * 2.0)
+                if attempt == 2:
+                    t_s = max(t_s, float(timeout_s) * 3.0)
+                resp_json = _http_post_json(
+                    url=f"{_ANTHROPIC_BASE_URL}/messages",
+                    headers=_anthropic_headers(api_key=str(api_key_a), betas=[], content_type="application/json"),
+                    payload=payload,
+                    timeout_s=float(t_s),
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = str(e)
+                if attempt < 2 and ("HTTP 429" in last_err or "rate_limit_error" in last_err or "input tokens per minute" in last_err or "would exceed the rate limit" in last_err):
+                    time.sleep(65.0)
+                    continue
+                if attempt < 2 and ("timed out" in last_err.lower() or "timeout" in last_err.lower()):
+                    time.sleep(2.0)
+                    continue
+                if attempt < 2:
+                    time.sleep(float(0.6 * (2**attempt)))
+                    continue
+                raise
+        if last_err:
+            raise ValueError(str(last_err))
+
+        return _anthropic_message_text(resp_json if isinstance(resp_json, dict) else {})
+
+    raise ValueError(f"unsupported provider: {prov}")
+
+
 def _anthropic_upload_file(*, api_key: str, filename: str, file_bytes: bytes, timeout_s: float) -> Dict[str, Any]:
     betas = ["files-api-2025-04-14"]
     last_err: Optional[str] = None
@@ -8058,6 +8276,94 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/doc/clear":
                 _DOC.clear_active()
                 self._send_json(200, _DOC.status())
+                return
+
+            if self.path == "/api/discuss":
+                body = self._read_json_body()
+                player_id = body.get("player_id")
+                pid = _sanitize_player_id(player_id)
+                if not pid:
+                    raise ValueError("missing player_id")
+
+                problem = body.get("problem")
+                if not isinstance(problem, str) or not problem.strip():
+                    problem = body.get("question")
+                if not isinstance(problem, str) or not problem.strip():
+                    problem = body.get("message")
+                if not isinstance(problem, str) or not problem.strip():
+                    raise ValueError("missing problem")
+
+                extra_ctx = body.get("context")
+                ctx_txt = ""
+                if isinstance(extra_ctx, str) and extra_ctx.strip():
+                    ctx_txt = str(extra_ctx).strip()
+
+                prov = str(os.environ.get("DT_DISCUSS_PROVIDER") or "openai").strip().lower() or "openai"
+                model = str(os.environ.get("DT_DISCUSS_MODEL") or "").strip()
+                if prov == "claude":
+                    prov = "anthropic"
+                if prov == "grok":
+                    prov = "xai"
+                if not model:
+                    if prov == "anthropic":
+                        model = "claude-sonnet-4-5-20250929"
+                    elif prov == "xai":
+                        model = "grok-4"
+                    elif prov == "gemini":
+                        model = "gemini-2.5-pro"
+                    else:
+                        model = "gpt-5.2"
+
+                timeout_s = 60.0
+                try:
+                    timeout_s = float(os.environ.get("DT_DISCUSS_TIMEOUT_S", str(timeout_s)) or timeout_s)
+                except Exception:
+                    timeout_s = 60.0
+                timeout_s = max(5.0, min(600.0, float(timeout_s)))
+
+                max_tokens = 500
+                try:
+                    max_tokens = int(os.environ.get("DT_DISCUSS_MAX_TOKENS", str(max_tokens)) or max_tokens)
+                except Exception:
+                    max_tokens = 500
+                max_tokens = max(64, min(2000, int(max_tokens)))
+
+                user_prompt = "Player problem:\n" + str(problem).strip()
+                if ctx_txt:
+                    user_prompt = user_prompt + "\n\nAdditional context:\n" + str(ctx_txt)
+
+                advice_raw = _discuss_llm_generate(
+                    provider=str(prov),
+                    model=str(model),
+                    system_prompt=str(_DISCUSS_ADVISOR_SYSTEM_PROMPT),
+                    user_prompt=str(user_prompt),
+                    timeout_s=float(timeout_s),
+                    max_tokens=int(max_tokens),
+                )
+                advice = _discuss_postprocess_advice(advice_raw)
+
+                try:
+                    _LOG.info(
+                        "discuss player_id=%s provider=%s model=%s problem_chars=%d advice_chars=%d",
+                        str(pid),
+                        str(prov),
+                        str(model),
+                        int(len(str(problem or ""))),
+                        int(len(str(advice or ""))),
+                    )
+                except Exception:
+                    pass
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "player_id": str(pid),
+                        "provider": str(prov),
+                        "model": str(model),
+                        "advice": str(advice or ""),
+                    },
+                )
                 return
 
             if self.path == "/api/omics/analyze":
