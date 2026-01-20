@@ -510,10 +510,10 @@ The claim_cure response includes:
 
 This means you should increase lifespan while keeping total money_spent in mind. You are allowed to run claim_cure even if you are not close to a "win" yet; early attempts are expected.
 
-Win is a ceiling condition (treatment matches healthy controls):
+Win is a ceiling condition (treatment reaches >=90% of healthy lifespan):
 - win: boolean
 - delta_median_ticks: treated_disease_median_tick - healthy_median_tick
-- win if abs(delta_median_ticks) <= 0.5
+- win if lifespan_recovery_pct >= 90.0
 
 If win=true, the run will stop automatically (the disease cannot be improved beyond matching healthy controls).
 
@@ -713,7 +713,7 @@ Win check (final validation):
 - What it does:
   - Runs a head-to-head survival test. For disease challenges: healthy controls vs treated-disease. For aging: baseline healthy vs treated healthy.
 - What to do with the result:
-  - For disease challenges: use win and delta_median_ticks to decide whether you are allowed to output action="final".
+  - For disease challenges: use win (based on lifespan_recovery_pct) to decide whether you are allowed to output action="final".
   - For aging: there is no win condition. Optimize score_lifedays_per_usd (and extra_days) and you may output action="final" at any time, but win must be false.
 
 # 9) Output format (BENCHMARK CRITICAL)

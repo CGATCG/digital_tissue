@@ -8,9 +8,12 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import csv
 import io
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -246,6 +249,34 @@ def _write_pid(path: Path, pid: int) -> None:
         pass
 
 
+def _write_json_atomic(path: Path, obj: Any) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    txt = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    fd: Optional[int] = None
+    tmp_path = ""
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=str(p.name) + ".", suffix=".tmp", dir=str(p.parent))
+        with os.fdopen(int(fd), "w", encoding="utf-8") as f:
+            f.write(txt)
+        fd = None
+        os.replace(str(tmp_path), str(p))
+    finally:
+        try:
+            if fd is not None:
+                try:
+                    os.close(int(fd))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if tmp_path and os.path.exists(str(tmp_path)):
+                os.unlink(str(tmp_path))
+        except Exception:
+            pass
+
+
 def _clear_pid(path: Path) -> None:
     try:
         path.unlink()
@@ -467,6 +498,80 @@ def _preflight_inspect(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "details": iss,
                 }
             )
+    return out
+
+
+def _extract_omics_csv_refs_from_report(report: Any, *, base_url: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return []
+    if not isinstance(report, dict):
+        return []
+    tr = report.get("transcript")
+    if not isinstance(tr, list):
+        return []
+    for ent in tr:
+        if not isinstance(ent, dict):
+            continue
+        if str(ent.get("type") or "") != "api":
+            continue
+        res = ent.get("result")
+        rj = res.get("response_json") if isinstance(res, dict) else None
+        if not isinstance(rj, dict):
+            continue
+        rid = str(rj.get("run_id") or "").strip()
+        files = rj.get("files")
+        if not rid or (not isinstance(files, list)) or (not files):
+            continue
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name") or "").strip()
+            if not name.lower().endswith(".csv"):
+                continue
+            try:
+                nbytes = int(f.get("bytes") or 0)
+            except Exception:
+                nbytes = 0
+            q_rid = urllib.parse.quote(rid, safe="")
+            q_name = urllib.parse.quote(name, safe="")
+            url = f"{base}/api/omics/file?run_id={q_rid}&name={q_name}"
+            out.append(
+                {
+                    "source": "omics",
+                    "event_seq": ent.get("seq"),
+                    "api_path": ent.get("path"),
+                    "omics_run_id": rid,
+                    "name": name,
+                    "bytes": nbytes,
+                    "url": url,
+                }
+            )
+    return out
+
+
+def _scan_local_csv_files(files_dir: Path, *, limit: int = 3000) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        if not (files_dir.exists() and files_dir.is_dir()):
+            return []
+        for p in files_dir.rglob("*.csv"):
+            if len(out) >= int(limit):
+                break
+            try:
+                if not p.is_file():
+                    continue
+            except Exception:
+                continue
+            try:
+                sz = int(p.stat().st_size)
+            except Exception:
+                sz = 0
+            out.append({"path": str(p), "bytes": int(sz), "event_seq": None})
+    except Exception:
+        return []
+    out.sort(key=lambda d: str(d.get("path") or ""))
     return out
 
 
@@ -781,8 +886,8 @@ def _detect_issues(events: List[Dict[str, Any]], paths: RunPaths) -> List[Dict[s
                 )
             continue
 
-    out.extend(_issues_from_text(text=_tail_text(paths.stderr_path), source="runner_stderr"))
-    out.extend(_issues_from_text(text=_tail_text(paths.stdout_path), source="runner_stdout"))
+    out.extend(_issues_from_text(text=_tail_text_cached(paths.stderr_path), source="runner_stderr"))
+    out.extend(_issues_from_text(text=_tail_text_cached(paths.stdout_path), source="runner_stdout"))
 
     def _sort_key(x: Dict[str, Any]) -> Tuple[int, float]:
         seq0 = x.get("seq")
@@ -815,6 +920,39 @@ def _tail_text(path: Path, *, max_bytes: int = 80_000) -> str:
         return raw.decode("utf-8", errors="replace")
     except Exception as e:
         return f"ERROR reading {path}: {e}"
+
+
+def _tail_text_cached(path: Path, *, max_bytes: int = 80_000) -> str:
+    try:
+        if not path.exists() or not path.is_file():
+            return ""
+        st0 = path.stat()
+        key = f"{str(path)}::{int(max_bytes)}"
+
+        cache0 = st.session_state.get("tail_cache")
+        if not isinstance(cache0, dict):
+            cache0 = {}
+            st.session_state["tail_cache"] = cache0
+
+        ent = cache0.get(key)
+        if isinstance(ent, dict):
+            try:
+                if float(ent.get("mtime") or 0.0) == float(st0.st_mtime) and int(ent.get("size") or 0) == int(st0.st_size):
+                    txt0 = ent.get("text")
+                    return str(txt0 or "")
+            except Exception:
+                pass
+
+        txt = _tail_text(path, max_bytes=int(max_bytes))
+        cache0[key] = {
+            "mtime": float(st0.st_mtime),
+            "size": int(st0.st_size),
+            "text": str(txt or ""),
+        }
+        st.session_state["tail_cache"] = cache0
+        return txt
+    except Exception:
+        return _tail_text(path, max_bytes=int(max_bytes))
 
 
 def _tail_jsonl_lines(path: Path, *, max_lines: int, max_scan_bytes: int = 24_000_000, chunk_size: int = 128_000) -> List[str]:
@@ -910,6 +1048,109 @@ def _read_events(path: Path, *, max_events: Optional[int] = 600, read_all: bool 
         return []
 
 
+def _read_events_incremental(path: Path, *, run_key: str, max_events: int = 600) -> List[Dict[str, Any]]:
+    try:
+        if not path.exists() or not path.is_file():
+            return []
+
+        st0 = path.stat()
+        inode = (int(getattr(st0, "st_dev", 0) or 0), int(getattr(st0, "st_ino", 0) or 0))
+        size = int(getattr(st0, "st_size", 0) or 0)
+
+        cache0 = st.session_state.get("events_cache")
+        if not isinstance(cache0, dict):
+            cache0 = {}
+            st.session_state["events_cache"] = cache0
+
+        ent0 = cache0.get(str(run_key))
+        ent: Dict[str, Any] = ent0 if isinstance(ent0, dict) else {}
+
+        prev_inode = ent.get("inode")
+        prev_pos = ent.get("pos")
+        prev_buf = ent.get("buf")
+        prev_max = ent.get("max_events")
+        events0 = ent.get("events")
+        events: List[Dict[str, Any]] = events0 if isinstance(events0, list) else []
+        buf = str(prev_buf or "") if isinstance(prev_buf, str) else ""
+        pos = int(prev_pos) if isinstance(prev_pos, int) else None
+
+        need_reset = False
+        if prev_inode != inode:
+            need_reset = True
+        if pos is None:
+            need_reset = True
+        if pos is not None and size < int(pos):
+            need_reset = True
+        if prev_max is None or int(prev_max) != int(max_events):
+            need_reset = True
+
+        if need_reset:
+            events = []
+            buf = ""
+            lines = _tail_jsonl_lines(path, max_lines=int(max_events))
+            for ln in lines:
+                try:
+                    obj = json.loads(ln)
+                    if isinstance(obj, dict):
+                        events.append(obj)
+                except Exception:
+                    continue
+            events.sort(key=lambda e: int(e.get("seq") or 0))
+            if len(events) > int(max_events):
+                events = events[-int(max_events) :]
+            pos = int(size)
+        else:
+            raw = b""
+            with path.open("rb") as f:
+                try:
+                    f.seek(int(pos or 0))
+                except Exception:
+                    f.seek(0)
+                raw = f.read()
+            pos = int(size)
+            txt = raw.decode("utf-8", errors="replace") if raw else ""
+            if buf:
+                txt = buf + txt
+
+            if txt and (not txt.endswith("\n")):
+                i = txt.rfind("\n")
+                if i >= 0:
+                    buf = txt[i + 1 :]
+                    txt = txt[: i + 1]
+                else:
+                    buf = txt
+                    txt = ""
+            else:
+                buf = ""
+
+            if txt.strip():
+                for ln in txt.splitlines():
+                    if not str(ln).strip():
+                        continue
+                    try:
+                        obj = json.loads(ln)
+                        if isinstance(obj, dict):
+                            events.append(obj)
+                    except Exception:
+                        continue
+
+            events.sort(key=lambda e: int(e.get("seq") or 0))
+            if len(events) > int(max_events):
+                events = events[-int(max_events) :]
+
+        cache0[str(run_key)] = {
+            "inode": inode,
+            "pos": int(pos or 0),
+            "buf": str(buf or ""),
+            "events": events,
+            "max_events": int(max_events),
+        }
+        st.session_state["events_cache"] = cache0
+        return events
+    except Exception:
+        return []
+
+
 def _api_response_summary(rj: Any) -> Any:
     if not isinstance(rj, dict):
         if isinstance(rj, list):
@@ -949,18 +1190,18 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
         if not path.exists() or not path.is_file():
             return None
-        with path.open("r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return None
 
 
-def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
-    tmp = Path(str(path) + ".tmp")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+def _http_get_bytes(url: str, *, timeout_s: float = 30.0) -> bytes:
+    u = str(url or "").strip()
+    if not u:
+        return b""
+    req = urllib.request.Request(u, method="GET")
+    with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+        return bytes(resp.read())
 
 
 def _llm_payloads_dir(paths: RunPaths) -> Path:
@@ -1001,7 +1242,7 @@ def _payload_text_blocks(v: Any) -> str:
     return str(v)
 
 
-def _latest_llm_prompt_text(paths: RunPaths, *, max_chars: int = 120_000) -> Tuple[str, str]:
+def _latest_llm_prompt_text(paths: RunPaths, *, max_chars: int = 0) -> Tuple[str, str]:
     p = _latest_llm_payload_path(paths)
     if p is None:
         return "", ""
@@ -1024,6 +1265,8 @@ def _latest_llm_prompt_text(paths: RunPaths, *, max_chars: int = 120_000) -> Tup
         if prov == "openai" and isinstance(obj.get("request"), dict):
             req = obj.get("request")
             msgs = req.get("messages") if isinstance(req.get("messages"), list) else []
+            if not msgs:
+                msgs = req.get("input") if isinstance(req.get("input"), list) else []
             lines: List[str] = [header, f"provider=openai model={req.get('model')}", "", "MESSAGES:"]
             for m in msgs:
                 if not isinstance(m, dict):
@@ -1032,6 +1275,10 @@ def _latest_llm_prompt_text(paths: RunPaths, *, max_chars: int = 120_000) -> Tup
                 content = _payload_text_blocks(m.get("content"))
                 lines.append(f"[{role}]\n{content}\n")
             txt = "\n".join(lines).strip()
+            if len(msgs) <= 0:
+                txt = header + "\n\n" + raw
+            elif str(txt or "").strip().endswith("MESSAGES:"):
+                txt = header + "\n\n" + raw
         elif ("messages" in obj) and ("model" in obj):
             msgs = obj.get("messages") if isinstance(obj.get("messages"), list) else []
             sys_blocks = obj.get("system")
@@ -1052,8 +1299,8 @@ def _latest_llm_prompt_text(paths: RunPaths, *, max_chars: int = 120_000) -> Tup
     else:
         txt = header + "\n\n" + raw
 
-    if len(txt) > int(max_chars):
-        txt = txt[-int(max_chars) :]
+    if isinstance(max_chars, int) and int(max_chars) > 0 and len(txt) > int(max_chars):
+        txt = txt[: int(max_chars)]
     return txt, h
 
 
@@ -1062,6 +1309,65 @@ def _read_lab_notebook(paths: RunPaths) -> str:
     if not isinstance(st_state, dict):
         return ""
     return str(st_state.get("notebook") or "").strip()
+
+
+def _read_lab_notebook_cached(paths: RunPaths, *, run_key: str) -> Tuple[str, str]:
+    try:
+        p = paths.state_path
+        if not p.exists() or not p.is_file():
+            return "", ""
+        st0 = p.stat()
+        cache0 = st.session_state.get("notebook_cache")
+        if not isinstance(cache0, dict):
+            cache0 = {}
+            st.session_state["notebook_cache"] = cache0
+        ent = cache0.get(str(run_key))
+        if isinstance(ent, dict) and float(ent.get("mtime") or 0.0) == float(st0.st_mtime):
+            return str(ent.get("text") or ""), str(ent.get("hash") or "")
+
+        txt = _read_lab_notebook(paths)
+        h = hashlib.sha256(txt.encode("utf-8", errors="replace")).hexdigest() if txt else ""
+        cache0[str(run_key)] = {"mtime": float(st0.st_mtime), "text": str(txt or ""), "hash": str(h or "")}
+        st.session_state["notebook_cache"] = cache0
+        return str(txt or ""), str(h or "")
+    except Exception:
+        return "", ""
+
+
+_LATEST_LLM_PROMPT_CACHE_VERSION = 3
+
+
+def _latest_llm_prompt_text_cached(paths: RunPaths, *, run_key: str, max_chars: int = 0) -> Tuple[str, str]:
+    try:
+        p = _latest_llm_payload_path(paths)
+        if p is None or (not p.exists()) or (not p.is_file()):
+            return "", ""
+        st0 = p.stat()
+        cache0 = st.session_state.get("latest_prompt_cache")
+        if not isinstance(cache0, dict):
+            cache0 = {}
+            st.session_state["latest_prompt_cache"] = cache0
+        ent = cache0.get(str(run_key))
+        if isinstance(ent, dict):
+            if (
+                int(ent.get("v") or 0) == int(_LATEST_LLM_PROMPT_CACHE_VERSION)
+                and str(ent.get("path") or "") == str(p)
+                and float(ent.get("mtime") or 0.0) == float(st0.st_mtime)
+            ):
+                return str(ent.get("text") or ""), str(ent.get("hash") or "")
+
+        txt, h = _latest_llm_prompt_text(paths, max_chars=int(max_chars))
+        cache0[str(run_key)] = {
+            "v": int(_LATEST_LLM_PROMPT_CACHE_VERSION),
+            "path": str(p),
+            "mtime": float(st0.st_mtime),
+            "text": str(txt or ""),
+            "hash": str(h or ""),
+        }
+        st.session_state["latest_prompt_cache"] = cache0
+        return str(txt or ""), str(h or "")
+    except Exception:
+        return "", ""
 
 
 def _extract_files(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1084,6 +1390,50 @@ def _extract_files(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ent["path"] = ev.get("path")
             ent["method"] = ev.get("method")
             out.append(ent)
+    return out
+
+
+def _extract_omics_csv_refs(events: List[Dict[str, Any]], *, base_url: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("type") or "") != "api":
+            continue
+        rj = ev.get("response_json")
+        if not isinstance(rj, dict):
+            continue
+        rid = str(rj.get("run_id") or "").strip()
+        files = rj.get("files")
+        if not rid or (not isinstance(files, list)) or (not files):
+            continue
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name") or "").strip()
+            if not name.lower().endswith(".csv"):
+                continue
+            try:
+                nbytes = int(f.get("bytes") or 0)
+            except Exception:
+                nbytes = 0
+            q_rid = urllib.parse.quote(rid, safe="")
+            q_name = urllib.parse.quote(name, safe="")
+            url = f"{base}/api/omics/file?run_id={q_rid}&name={q_name}"
+            out.append(
+                {
+                    "source": "omics",
+                    "event_seq": ev.get("seq"),
+                    "api_path": ev.get("path"),
+                    "omics_run_id": rid,
+                    "name": name,
+                    "bytes": nbytes,
+                    "url": url,
+                }
+            )
     return out
 
 
@@ -1908,15 +2258,18 @@ def _openai_chunk_notes(*, api_key: str, chunk: str, run_id: str, proc_alive: bo
         raise RuntimeError("openai python package not available")
     client = OpenAI(api_key=str(api_key))
     sys_msg = (
-        "You are monitoring an LLM benchmark run. Summarize ONLY the provided log excerpt into factual notes. "
-        "Do not speculate. Keep it short and concrete."
+        "You are monitoring an LLM benchmark where an agent takes actions in a biology strategy puzzle. "
+        "Summarize ONLY the provided log excerpt into factual notes about actions, results, and errors. "
+        "Assume the excerpt is valid and do not comment on truncation or missing context. Do not speculate."
     )
     user_msg = (
         f"Run: {run_id}\n"
         f"Status: {'RUNNING' if proc_alive else 'STOPPED/DONE'}\n"
         f"Excerpt: {int(chunk_i) + 1}/{int(chunk_n)}\n"
         "\n"
-        "Write 6-12 short bullet-like lines (plain text, one per line) capturing: key actions, key results, errors, and next intentions if stated. "
+        "The log below represents a series of actions that an agent took to solve a biological puzzle.\n"
+        "Summarize the events at a high level, focusing on actions, outcomes, and decisions.\n"
+        "Write 18-30 short bullet-like lines (plain text, one per line) capturing: key actions, key results, errors, and next intentions if stated. "
         "Do not add anything not present in the excerpt.\n"
         "\n"
         "LOG EXCERPT:\n"
@@ -1926,14 +2279,58 @@ def _openai_chunk_notes(*, api_key: str, chunk: str, run_id: str, proc_alive: bo
         resp = client.chat.completions.create(
             model="gpt-5.2",
             messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-            max_completion_tokens=420,
+            max_completion_tokens=1200,
             reasoning_effort="medium",
         )
     except TypeError:
         resp = client.chat.completions.create(
             model="gpt-5.2",
             messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-            max_completion_tokens=420,
+            max_completion_tokens=1200,
+        )
+    out = None
+    try:
+        out = resp.choices[0].message.content
+    except Exception:
+        out = None
+    return _mask_disease_term(str(out or "").strip())
+
+
+def _openai_story_concise_from_llm_reasons(*, api_key: str, reason_log: str, run_id: str, proc_alive: bool) -> str:
+    if OpenAI is None:
+        raise RuntimeError("openai python package not available")
+    client = OpenAI(api_key=str(api_key))
+
+    sys_msg = (
+        "You are monitoring an LLM benchmark where an agent tries to solve a biological puzzle. "
+        "The input is the agent's own step-by-step notes: last_result_summary and next_step_rationale. "
+        "Write a concise, high-level story for a human evaluator. "
+        "Only use information present in the input. Do not speculate." 
+    )
+    user_msg = (
+        f"Run: {run_id}\n"
+        f"Status: {'RUNNING' if proc_alive else 'STOPPED/DONE'}\n"
+        "\n"
+        "Turn the step summaries below into a concise high-level story. "
+        "Focus on: what the agent tried, what it learned, and what it intends to do next. "
+        "Constraints: 3-6 sentences total, <= 180 words, no bullets, no speculation.\n"
+        "\n"
+        "STEP SUMMARIES:\n"
+        f"{_mask_disease_term(str(reason_log or ''))}"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-5.2",
+            messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+            max_completion_tokens=520,
+            reasoning_effort="medium",
+        )
+    except TypeError:
+        resp = client.chat.completions.create(
+            model="gpt-5.2",
+            messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+            max_completion_tokens=520,
         )
     out = None
     try:
@@ -1954,7 +2351,7 @@ def _openai_story_full(*, api_key: str, full_text: str, run_id: str, proc_alive:
     return _openai_story(api_key=api_key, digest=merged, run_id=run_id, proc_alive=proc_alive)
 
 
-def _event_digest(events: List[Dict[str, Any]], *, max_events: int = 220, max_chars: int = 16_000) -> str:
+def _event_digest(events: List[Dict[str, Any]], *, max_events: int = 220, max_chars: int = 0) -> str:
     evs = [e for e in events if isinstance(e, dict)]
     evs = evs[-max_events:]
     lines: List[str] = []
@@ -1999,9 +2396,50 @@ def _event_digest(events: List[Dict[str, Any]], *, max_events: int = 220, max_ch
             lines.append(f"#{seq} {t} {_truncate(ev.get('path') or ev.get('payload') or '', 120)}")
 
     txt = "\n".join(lines).strip()
-    if len(txt) <= max_chars:
+    if not isinstance(max_chars, int) or int(max_chars) <= 0:
         return txt
-    return txt[-max_chars:]
+    if len(txt) <= int(max_chars):
+        return txt
+    return txt[-int(max_chars) :]
+
+
+def _llm_reason_digest(
+    events: List[Dict[str, Any]],
+    report: Any,
+    *,
+    max_steps: int = 80,
+    max_chars: int = 0,
+) -> str:
+    src: List[Dict[str, Any]] = []
+    tr = report.get("transcript") if isinstance(report, dict) else None
+    if isinstance(tr, list):
+        src = [e for e in tr if isinstance(e, dict)]
+    else:
+        src = [e for e in (events or []) if isinstance(e, dict)]
+
+    llm_rows: List[str] = []
+    for ev in src:
+        if str(ev.get("type") or "") != "llm":
+            continue
+        step = ev.get("step")
+        lrs, nsr = _llm_reason_fields(ev)
+        if not (isinstance(lrs, str) or isinstance(nsr, str)):
+            continue
+        lrs_s = str(lrs or "").strip()
+        nsr_s = str(nsr or "").strip()
+        if not (lrs_s or nsr_s):
+            continue
+        llm_rows.append(f"step {step}: last_result_summary={_truncate(lrs_s, 500)} | next_step_rationale={_truncate(nsr_s, 700)}")
+
+    if not llm_rows:
+        return ""
+    llm_rows = llm_rows[-max(1, int(max_steps)) :]
+    txt = "\n".join(llm_rows).strip()
+    if not isinstance(max_chars, int) or int(max_chars) <= 0:
+        return txt
+    if len(txt) <= int(max_chars):
+        return txt
+    return txt[-int(max_chars) :]
 
 
 def _local_story(events: List[Dict[str, Any]]) -> str:
@@ -2033,18 +2471,19 @@ def _openai_story(*, api_key: str, digest: str, run_id: str, proc_alive: bool) -
 
     sys_msg = (
         "You are monitoring an LLM benchmark where an agent tries to solve a biological puzzle. "
+        "The input is a log of the agent's messages/actions and tool/API results. "
         "Your job is to help a human evaluator understand what happened and what the agent is doing now. "
-        "Do not speculate. Only use information present in the log digest. "
+        "Only use information present in the log. Do not speculate. Do not comment on truncation or missing context. "
         "Be ultra-concise and clear."
     )
     user_msg = (
         f"Run: {run_id}\n"
         f"Status: {'RUNNING' if proc_alive else 'STOPPED/DONE'}\n"
         "\n"
-        "Provide a high-level ultra concise summary of what is happening in just a few sentences. "
-        "Frame it as a story. Mention: what it tried, what it learned, and what it will do next. "
+        "The log below represents a series of actions an agent took to solve a biological puzzle.\n"
+        "Summarize the events at a high level, as completely as possible. Mention: what it tried, what it learned, and what it will do next. "
         "If there were errors or obvious misinterpretations, mention them briefly. "
-        "Constraints: 2-4 sentences total, <= 80 words, no bullets, no speculation.\n"
+        "Constraints: 10-18 sentences total, <= 500 words, no bullets, no speculation.\n"
         "\n"
         "LOG DIGEST:\n"
         f"{_mask_disease_term(digest)}"
@@ -2053,14 +2492,14 @@ def _openai_story(*, api_key: str, digest: str, run_id: str, proc_alive: bool) -
         resp = client.chat.completions.create(
             model="gpt-5.2",
             messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-            max_completion_tokens=260,
+            max_completion_tokens=1200,
             reasoning_effort="medium",
         )
     except TypeError:
         resp = client.chat.completions.create(
             model="gpt-5.2",
             messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-            max_completion_tokens=260,
+            max_completion_tokens=1200,
         )
     out = None
     try:
@@ -2330,9 +2769,13 @@ with st.sidebar:
                 )
 
         st.subheader("Refresh")
-        auto_refresh = bool(st.checkbox("Auto refresh", value=True))
+        auto_refresh = bool(st.checkbox("Auto refresh", value=False))
         refresh_s = float(st.number_input("Refresh interval (s)", min_value=0.2, max_value=10.0, value=1.0, step=0.2))
         manual_refresh_clicked = st.button("Refresh now", use_container_width=True)
+
+        with st.expander("Monitor performance", expanded=False):
+            events_window = int(st.number_input("Loaded events window", min_value=100, max_value=5000, value=600, step=100))
+            incremental_events = bool(st.checkbox("Incremental event loading (recommended)", value=True))
 
     with tab_run:
         st.header("Run")
@@ -2524,7 +2967,6 @@ with st.sidebar:
         running_set = set(_running_runs())
         active_run_id = str(st.session_state.get("active_run_id") or "").strip()
         any_running = bool(running_set)
-        selected_running = bool(active_run_id and active_run_id in running_set)
         options = [""] + runs
         idx = 0
         try:
@@ -2539,21 +2981,36 @@ with st.sidebar:
             format_func=lambda x: (str(x) + (" (running)" if str(x) in running_set else "")) if str(x) else "",
             disabled=ui_locked_global,
         )
-        if sel_run:
-            st.session_state["active_run_id"] = str(sel_run)
-            _write_active_run_id(str(sel_run))
+        selected_run_id = str(sel_run or "").strip()
+        st.session_state["active_run_id"] = str(selected_run_id)
+        if selected_run_id:
+            _write_active_run_id(str(selected_run_id))
+        else:
+            try:
+                p = _active_run_id_path()
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+        selected_running = bool(selected_run_id and selected_run_id in running_set)
 
         resumable = False
         try:
-            if active_run_id:
-                resumable = bool(_paths_for_run(active_run_id).state_path.exists())
+            if selected_run_id:
+                resumable = bool(_paths_for_run(selected_run_id).state_path.exists())
         except Exception:
             resumable = False
 
+        selected_has_run = bool(selected_run_id)
         col_a, col_b, col_c = st.columns(3)
-        start_clicked = col_a.button("Start new", use_container_width=True, disabled=bool(ui_locked_global))
+        start_clicked = col_a.button("Start new", use_container_width=True, disabled=bool(ui_locked_global or selected_has_run))
         stop_clicked = col_b.button("Stop", use_container_width=True, disabled=bool((not any_running) or bool(running_suites_global)))
-        resume_clicked = col_c.button("Resume", use_container_width=True, disabled=bool(ui_locked_global or selected_running or (not resumable)))
+        resume_clicked = col_c.button(
+            "Resume",
+            use_container_width=True,
+            disabled=bool(ui_locked_global or (not selected_has_run) or selected_running or (not resumable)),
+        )
 
     with tab_suite:
         st.header("Suite")
@@ -3052,7 +3509,19 @@ if (not proc_alive) and proc is not None:
         pass
 
 
-events = _read_events(paths.events_path)
+try:
+    events_window
+except Exception:
+    events_window = 600
+try:
+    incremental_events
+except Exception:
+    incremental_events = True
+
+if incremental_events:
+    events = _read_events_incremental(paths.events_path, run_key=str(active_run_id), max_events=int(events_window))
+else:
+    events = _read_events(paths.events_path, max_events=int(events_window))
 report = _load_json(paths.report_path)
 
 end_metrics = _latest_end_metrics(events)
@@ -3097,14 +3566,92 @@ with tabs[0]:
     st.subheader("Human-in-the-loop")
     human_dir = paths.run_dir / "human_mode"
     pending = _load_json(human_dir / "pending.json")
-    if not isinstance(pending, dict) or pending.get("waiting") is not True:
-        st.info("Runner is not currently waiting for human input.")
+    waiting = bool(isinstance(pending, dict) and pending.get("waiting") is True)
+    step = int(pending.get("step") or 0) if isinstance(pending, dict) else 0
+    expecting = str(pending.get("expecting") or f"input_step_{step:06d}.json") if isinstance(pending, dict) else ""
+
+    last_llm: Optional[Dict[str, Any]] = None
+    for ev in reversed(events or []):
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("type") or "") == "llm":
+            last_llm = ev
+            break
+
+    last_action = ""
+    last_lrs = ""
+    last_nsr = ""
+    last_step = None
+    if isinstance(last_llm, dict):
+        act_obj = _parse_first_json(str(last_llm.get("text") or ""))
+        act = act_obj.get("action") if isinstance(act_obj, dict) else None
+        method = act_obj.get("method") if isinstance(act_obj, dict) else None
+        path = act_obj.get("path") if isinstance(act_obj, dict) else None
+        last_step = last_llm.get("step")
+        last_action = " ".join([str(x or "").strip() for x in [act, method, path] if str(x or "").strip()]).strip()
+        lrs0, nsr0 = _llm_reason_fields(last_llm)
+        last_lrs = str(lrs0 or "").strip()
+        last_nsr = str(nsr0 or "").strip()
+
+    last_result_line = ""
+    for ev in reversed(events or []):
+        if not isinstance(ev, dict):
+            continue
+        t = str(ev.get("type") or "")
+        if t == "tool_result":
+            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+            st0 = payload.get("http_status")
+            pth = str(ev.get("path") or payload.get("path") or "")
+            err = ""
+            rj = payload.get("response_json") if isinstance(payload.get("response_json"), dict) else {}
+            if isinstance(rj, dict) and isinstance(rj.get("error"), str) and str(rj.get("error") or "").strip():
+                err = str(rj.get("error") or "")
+            last_result_line = f"TOOL_RESULT {pth} status={st0} {(_truncate(err, 120) if err else '')}".strip()
+            break
+        if t == "api":
+            st0 = ev.get("http_status")
+            pth = str(ev.get("path") or "")
+            err = ""
+            rj = ev.get("response_json") if isinstance(ev.get("response_json"), dict) else {}
+            if isinstance(rj, dict) and isinstance(rj.get("error"), str) and str(rj.get("error") or "").strip():
+                err = str(rj.get("error") or "")
+            last_result_line = f"API {ev.get('method')} {pth} status={st0} {(_truncate(err, 120) if err else '')}".strip()
+            break
+        if t == "llm_error":
+            last_result_line = f"LLM_ERROR {_truncate(ev.get('error'), 200)}".strip()
+            break
+
+    turn = "YOUR TURN" if waiting else ("RUNNING" if proc_alive else "IDLE/DONE")
+    cols = st.columns(3)
+    cols[0].metric("Turn", turn)
+    cols[1].metric("Current step", str(step if waiting else (last_step if last_step is not None else "—")))
+    cols[2].metric("Awaiting", expecting if waiting else "—")
+
+    if waiting:
+        st.success("The runner is paused and waiting for your instructions.")
     else:
-        step = int(pending.get("step") or 0)
-        expecting = str(pending.get("expecting") or f"input_step_{step:06d}.json")
-        st.write({"step": step, "expecting": expecting, "player_id": pending.get("player_id")})
-        if isinstance(pending.get("error"), str) and str(pending.get("error") or "").strip():
-            st.warning(str(pending.get("error")))
+        if proc_alive:
+            st.info("The runner is still executing. You can submit instructions when it pauses for human input.")
+        else:
+            st.info("The runner is not currently waiting for human input.")
+
+    if last_action or last_lrs or last_nsr or last_result_line:
+        with st.expander("What’s happening now", expanded=True):
+            if last_action:
+                st.markdown(f"**Last agent action:** {last_action}")
+            if last_lrs:
+                st.markdown(f"**Last result summary:** {_truncate(last_lrs, 1200)}")
+            if last_nsr:
+                st.markdown(f"**Next step rationale:** {_truncate(last_nsr, 1200)}")
+            if last_result_line:
+                st.markdown(f"**Latest result:** {last_result_line}")
+
+    if isinstance(pending, dict) and (pending.get("waiting") is True):
+        with st.expander("Raw human-mode state", expanded=False):
+            st.write({"step": step, "expecting": expecting, "player_id": pending.get("player_id")})
+            if isinstance(pending.get("error"), str) and str(pending.get("error") or "").strip():
+                st.warning(str(pending.get("error")))
+
         mode = st.radio("Submit type", options=["Directive text", "Full action_json"], index=0, horizontal=True)
         with st.form(key=f"human_submit_{active_run_id}_{step}"):
             txt = st.text_area("Your directive", value="", height=140)
@@ -3112,6 +3659,7 @@ with tabs[0]:
             if mode == "Full action_json":
                 action_json_raw = st.text_area("Action JSON", value="{}", height=220)
             submitted = st.form_submit_button("Submit to runner", use_container_width=True)
+
         col_a, col_b = st.columns(2)
         stop_clicked2 = col_a.button("Stop run (write stop.json)", use_container_width=True)
         if stop_clicked2:
@@ -3145,36 +3693,63 @@ with tabs[1]:
     min_refresh_s = 45.0
     show_digest = False
     allow_auto = False
-    use_lab_notebook = True
-    prefer_latest_prompt = True
+    story_source = "LLM step summaries (last_result_summary + next_step_rationale)"
+    max_llm_steps_for_story = 80
     with st.expander("Story settings", expanded=False):
         max_events_for_story = int(
             st.number_input("Events window", min_value=50, max_value=800, value=220, step=10)
+        )
+        max_llm_steps_for_story = int(
+            st.number_input("LLM steps window", min_value=10, max_value=400, value=80, step=10)
         )
         min_refresh_s = float(
             st.number_input("Min story refresh (s)", min_value=5.0, max_value=600.0, value=45.0, step=5.0)
         )
         allow_auto = bool(st.checkbox("Auto-update story (costs tokens)", value=False))
-        use_lab_notebook = bool(st.checkbox("Use LAB_NOTEBOOK (recommended)", value=True))
-        prefer_latest_prompt = bool(st.checkbox("Prefer latest outbound LLM prompt (llm_payloads)", value=True))
+        story_source = str(
+            st.selectbox(
+                "Story input",
+                options=[
+                    "LLM step summaries (last_result_summary + next_step_rationale)",
+                    "Latest outbound LLM prompt (llm_payloads)",
+                    "LAB_NOTEBOOK",
+                    "EVENT_DIGEST",
+                ],
+                index=0,
+            )
+        )
         show_digest = bool(st.checkbox("Show digest (debug)", value=False))
 
-    notebook_txt = _read_lab_notebook(paths) if use_lab_notebook else ""
-    nb_hash = hashlib.sha256(notebook_txt.encode("utf-8", errors="replace")).hexdigest() if notebook_txt else ""
+    notebook_txt = ""
+    nb_hash = ""
     latest_prompt_txt, latest_prompt_hash = ("", "")
-    if prefer_latest_prompt:
-        latest_prompt_txt, latest_prompt_hash = _latest_llm_prompt_text(paths)
+    if story_source == "LAB_NOTEBOOK":
+        notebook_txt, nb_hash = _read_lab_notebook_cached(paths, run_key=str(active_run_id))
+    elif story_source == "Latest outbound LLM prompt (llm_payloads)":
+        latest_prompt_txt, latest_prompt_hash = _latest_llm_prompt_text_cached(paths, run_key=str(active_run_id))
     last_ev = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else {}
+
+    report_mtime_story = 0.0
+    try:
+        if paths is not None and paths.report_path.exists():
+            report_mtime_story = float(paths.report_path.stat().st_mtime)
+    except Exception:
+        report_mtime_story = 0.0
+
     fp = _json_compact(
         {
             "run": active_run_id,
+            "proc_alive": bool(proc_alive),
+            "latest_prompt_parser_v": int(_LATEST_LLM_PROMPT_CACHE_VERSION),
             "last_seq": last_ev.get("seq"),
             "last_type": last_ev.get("type"),
             "last_ts": last_ev.get("ts"),
-            "use_lab_notebook": bool(use_lab_notebook),
+            "story_source": str(story_source),
+            "max_llm_steps_for_story": int(max_llm_steps_for_story),
+            "report_mtime": float(report_mtime_story),
             "nb_hash": nb_hash,
-            "prefer_latest_prompt": bool(prefer_latest_prompt),
             "latest_prompt_hash": str(latest_prompt_hash or ""),
+            "max_events_for_story": int(max_events_for_story),
         }
     )
     digest_hash = hashlib.sha256(fp.encode("utf-8", errors="replace")).hexdigest()
@@ -3232,20 +3807,35 @@ with tabs[1]:
         if key:
             if not job_running:
                 try:
-                    if prefer_latest_prompt and latest_prompt_txt.strip():
-                        full_txt = "LATEST_LLM_PROMPT:\n" + latest_prompt_txt
-                    elif use_lab_notebook and notebook_txt.strip():
-                        full_txt = "LAB_NOTEBOOK:\n" + notebook_txt
+                    if story_source == "LLM step summaries (last_result_summary + next_step_rationale)":
+                        reason = _llm_reason_digest(
+                            events,
+                            report,
+                            max_steps=int(max_llm_steps_for_story),
+                        )
+                        full_txt = "LLM_STEP_SUMMARIES:\n" + str(reason or "")
+                        fut = _story_executor().submit(
+                            _openai_story_concise_from_llm_reasons,
+                            api_key=key,
+                            reason_log=full_txt,
+                            run_id=str(active_run_id),
+                            proc_alive=bool(proc_alive),
+                        )
                     else:
-                        digest = _event_digest(events, max_events=int(max_events_for_story))
-                        full_txt = "EVENT_DIGEST:\n" + digest
-                    fut = _story_executor().submit(
-                        _openai_story_full,
-                        api_key=key,
-                        full_text=full_txt,
-                        run_id=str(active_run_id),
-                        proc_alive=bool(proc_alive),
-                    )
+                        if story_source == "Latest outbound LLM prompt (llm_payloads)" and latest_prompt_txt.strip():
+                            full_txt = "LATEST_LLM_PROMPT:\n" + latest_prompt_txt
+                        elif story_source == "LAB_NOTEBOOK" and notebook_txt.strip():
+                            full_txt = "LAB_NOTEBOOK:\n" + notebook_txt
+                        else:
+                            digest = _event_digest(events, max_events=int(max_events_for_story))
+                            full_txt = "EVENT_DIGEST:\n" + digest
+                        fut = _story_executor().submit(
+                            _openai_story_full,
+                            api_key=key,
+                            full_text=full_txt,
+                            run_id=str(active_run_id),
+                            proc_alive=bool(proc_alive),
+                        )
                     st.session_state["story_job"] = fut
                     st.session_state["story_job_meta"] = {
                         "run_id": str(active_run_id),
@@ -3278,13 +3868,16 @@ with tabs[1]:
         st.info("No story yet. Click 'Update story now'.")
 
     if show_digest:
-        if prefer_latest_prompt and latest_prompt_txt.strip():
+        if story_source == "LLM step summaries (last_result_summary + next_step_rationale)":
+            dig = _llm_reason_digest(events, report, max_steps=int(max_llm_steps_for_story))
+            st.text_area("LLM step summaries (debug)", value=dig, height=240)
+        elif story_source == "Latest outbound LLM prompt (llm_payloads)" and latest_prompt_txt.strip():
             st.text_area("LATEST_LLM_PROMPT (debug)", value=latest_prompt_txt, height=240)
-        elif use_lab_notebook:
+        elif story_source == "LAB_NOTEBOOK":
             st.text_area("LAB_NOTEBOOK (debug)", value=notebook_txt, height=240)
         else:
             dig = _event_digest(events, max_events=int(max_events_for_story))
-            st.text_area("Digest", value=dig, height=240)
+            st.text_area("EVENT_DIGEST (debug)", value=dig, height=240)
 
 with tabs[2]:
     st.subheader("Live events")
@@ -3310,6 +3903,8 @@ with tabs[2]:
         )
     max_show = int(st.number_input("Max events shown", min_value=50, max_value=2000, value=300, step=50))
 
+    fast_live_view = bool(st.checkbox("Fast live view (recommended)", value=True))
+
     with st.expander("Performance", expanded=False):
         lazy_api = bool(st.checkbox("Lazy-load API/tool JSON (recommended)", value=True))
         show_full_api_default = bool(st.checkbox("Show full API response_json by default", value=False, disabled=lazy_api))
@@ -3318,9 +3913,7 @@ with tabs[2]:
     shown = [ev for ev in events if str(ev.get("type")) in set(show_types)]
     shown = shown[-max_show:]
 
-    expanded_llm = False
-
-    for ev in reversed(shown):
+    def _event_title(ev: Dict[str, Any]) -> str:
         t = str(ev.get("type") or "")
         seq = ev.get("seq")
         title = f"#{seq} {t}"
@@ -3328,102 +3921,160 @@ with tabs[2]:
             title = f"#{seq} API {ev.get('method')} {ev.get('path')} ({ev.get('http_status')})"
         if t == "llm":
             title = f"#{seq} LLM step={ev.get('step')}"
-        expand = False
-        if auto_expand_latest_llm and (not expanded_llm) and t == "llm":
-            expand = True
-            expanded_llm = True
-        with st.expander(title, expanded=expand):
-            if t == "llm":
-                lrs, nsr = _llm_reason_fields(ev)
-                act_obj = _parse_first_json(str(ev.get("text") or ""))
-                if isinstance(act_obj, dict):
-                    st.write(
-                        {
-                            "action": act_obj.get("action"),
-                            "method": act_obj.get("method"),
-                            "path": act_obj.get("path"),
-                        }
-                    )
-                if isinstance(lrs, str) and lrs.strip():
-                    st.markdown("Last result summary")
-                    st.write(lrs)
-                if isinstance(nsr, str) and nsr.strip():
-                    st.markdown("Next step rationale")
-                    st.write(nsr)
-                st.code(str(ev.get("text") or ""), language="")
-            elif t in ("api", "tool_result"):
-                if t == "api":
-                    rj = ev.get("response_json") if isinstance(ev.get("response_json"), dict) else None
-                    st.write({"seconds": ev.get("seconds"), "status": ev.get("http_status")})
-                    if rj is not None:
-                        if lazy_api:
+        return title
+
+    def _render_event_body(ev: Dict[str, Any], *, lazy_api: bool, show_full_api_default: bool, show_full_tool_default: bool) -> None:
+        t = str(ev.get("type") or "")
+        seq = ev.get("seq")
+        if t == "llm":
+            lrs, nsr = _llm_reason_fields(ev)
+            act_obj = _parse_first_json(str(ev.get("text") or ""))
+            if isinstance(act_obj, dict):
+                st.write(
+                    {
+                        "action": act_obj.get("action"),
+                        "method": act_obj.get("method"),
+                        "path": act_obj.get("path"),
+                    }
+                )
+            if isinstance(lrs, str) and lrs.strip():
+                st.markdown("Last result summary")
+                st.write(lrs)
+            if isinstance(nsr, str) and nsr.strip():
+                st.markdown("Next step rationale")
+                st.write(nsr)
+            st.code(str(ev.get("text") or ""), language="")
+            return
+
+        if t in ("api", "tool_result"):
+            if t == "api":
+                rj = ev.get("response_json") if isinstance(ev.get("response_json"), dict) else None
+                st.write({"seconds": ev.get("seconds"), "status": ev.get("http_status")})
+                if rj is not None:
+                    if lazy_api:
+                        st.markdown("Response summary")
+                        st.json(_api_response_summary(rj))
+                        if st.button("Load full response_json", key=f"api_full_{seq}"):
+                            st.json(rj)
+                    else:
+                        if show_full_api_default:
+                            st.json(rj)
+                        else:
                             st.markdown("Response summary")
                             st.json(_api_response_summary(rj))
-                            if st.button("Load full response_json", key=f"api_full_{seq}"):
-                                st.json(rj)
-                        else:
-                            if show_full_api_default:
-                                st.json(rj)
-                            else:
-                                st.markdown("Response summary")
-                                st.json(_api_response_summary(rj))
-                    items = ev.get("files")
-                    if not isinstance(items, list):
-                        items = ev.get("artifacts")
-                    if isinstance(items, list) and items:
-                        st.markdown("Files")
-                        for a in items:
-                            if not isinstance(a, dict):
-                                continue
-                            p = a.get("path")
-                            if isinstance(p, str) and p:
-                                st.code(p)
-                            prev = str(a.get("preview") or "")
-                            if prev:
-                                st.code(prev, language="csv")
-                else:
-                    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else None
-                    if payload is None:
-                        st.json(ev)
-                    else:
-                        st.write(
-                            {
-                                "tool": ev.get("tool"),
-                                "path": ev.get("path"),
-                                "seconds": payload.get("seconds"),
-                                "status": payload.get("http_status"),
-                            }
-                        )
-                        rj = payload.get("response_json") if isinstance(payload.get("response_json"), dict) else None
-                        if rj is not None:
-                            st.markdown("LLM-facing TOOL_RESULT (compact)")
-                            if lazy_api:
-                                st.json(_api_response_summary(rj))
-                                if st.button("Load full TOOL_RESULT", key=f"tool_full_{seq}"):
-                                    st.json(rj)
-                            else:
-                                if show_full_tool_default:
-                                    st.json(rj)
-                                else:
-                                    st.json(_api_response_summary(rj))
-                        rj2 = (
-                            payload.get("api_response_json_summary")
-                            if isinstance(payload.get("api_response_json_summary"), dict)
-                            else None
-                        )
-                        if rj2 is not None:
-                            st.markdown("Raw API response summary (debug)")
-                            st.json(rj2)
-                        rt = payload.get("response_text")
-                        if isinstance(rt, str) and rt.strip():
-                            st.code(rt, language="")
-            else:
+                items = ev.get("files")
+                if not isinstance(items, list):
+                    items = ev.get("artifacts")
+                if isinstance(items, list) and items:
+                    st.markdown("Files")
+                    for a in items:
+                        if not isinstance(a, dict):
+                            continue
+                        p = a.get("path")
+                        if isinstance(p, str) and p:
+                            st.code(p)
+                        prev = str(a.get("preview") or "")
+                        if prev:
+                            st.code(prev, language="csv")
+                return
+
+            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else None
+            if payload is None:
                 st.json(ev)
+                return
+            st.write(
+                {
+                    "tool": ev.get("tool"),
+                    "path": ev.get("path"),
+                    "seconds": payload.get("seconds"),
+                    "status": payload.get("http_status"),
+                }
+            )
+            rj = payload.get("response_json") if isinstance(payload.get("response_json"), dict) else None
+            if rj is not None:
+                st.markdown("LLM-facing TOOL_RESULT (compact)")
+                if lazy_api:
+                    st.json(_api_response_summary(rj))
+                    if st.button("Load full TOOL_RESULT", key=f"tool_full_{seq}"):
+                        st.json(rj)
+                else:
+                    if show_full_tool_default:
+                        st.json(rj)
+                    else:
+                        st.json(_api_response_summary(rj))
+            rj2 = payload.get("api_response_json_summary") if isinstance(payload.get("api_response_json_summary"), dict) else None
+            if rj2 is not None:
+                st.markdown("Raw API response summary (debug)")
+                st.json(rj2)
+            rt = payload.get("response_text")
+            if isinstance(rt, str) and rt.strip():
+                st.code(rt, language="")
+            return
+
+        st.json(ev)
+
+    if fast_live_view:
+        if not shown:
+            st.info("No events in the current window.")
+        else:
+            titles = [_event_title(ev) for ev in shown]
+            pick = st.selectbox("Event", options=list(range(len(shown))), format_func=lambda i: titles[int(i)], index=len(shown) - 1)
+            try:
+                ev0 = shown[int(pick)]
+            except Exception:
+                ev0 = shown[-1]
+            st.caption(_event_title(ev0))
+            _render_event_body(ev0, lazy_api=lazy_api, show_full_api_default=show_full_api_default, show_full_tool_default=show_full_tool_default)
+    else:
+        expanded_llm = False
+
+        for ev in reversed(shown):
+            t = str(ev.get("type") or "")
+            title = _event_title(ev)
+            expand = False
+            if auto_expand_latest_llm and (not expanded_llm) and t == "llm":
+                expand = True
+                expanded_llm = True
+            with st.expander(title, expanded=expand):
+                _render_event_body(ev, lazy_api=lazy_api, show_full_api_default=show_full_api_default, show_full_tool_default=show_full_tool_default)
 
 with tabs[3]:
     st.subheader("Issues / Errors")
     st.caption("Heuristic detector: flags anything that looks off even if the run continues (errors, retries, truncation signals, malformed LLM outputs, etc.).")
-    issues = _detect_issues(events, paths)
+
+    issues_cache = st.session_state.get("issues_cache")
+    if not isinstance(issues_cache, dict):
+        issues_cache = {}
+        st.session_state["issues_cache"] = issues_cache
+
+    last_seq0: Optional[int] = None
+    try:
+        if isinstance(events, list) and events and isinstance(events[-1], dict):
+            last_seq0 = int(events[-1].get("seq") or 0)
+    except Exception:
+        last_seq0 = None
+
+    def _mtime(p: Path) -> float:
+        try:
+            if p.exists() and p.is_file():
+                return float(p.stat().st_mtime)
+        except Exception:
+            return 0.0
+        return 0.0
+
+    cache_key = (
+        str(active_run_id),
+        int(last_seq0 or 0),
+        float(_mtime(paths.stderr_path)),
+        float(_mtime(paths.stdout_path)),
+    )
+    cached_ent = issues_cache.get(str(active_run_id))
+    if isinstance(cached_ent, dict) and cached_ent.get("key") == cache_key and isinstance(cached_ent.get("issues"), list):
+        issues = cached_ent.get("issues")
+    else:
+        issues = _detect_issues(events, paths)
+        issues_cache[str(active_run_id)] = {"key": cache_key, "issues": issues}
+        st.session_state["issues_cache"] = issues_cache
 
     if not issues:
         st.info("No issues detected in the current events/log tail.")
@@ -3483,36 +4134,205 @@ with tabs[4]:
 
 with tabs[5]:
     st.subheader("CSV files")
-    arts = _extract_files(events)
-    if not arts:
+
+    fast_csv_view = bool(st.checkbox("Fast CSV view (recommended)", value=True))
+
+    file_bytes_cache = st.session_state.get("file_bytes_cache")
+    if not isinstance(file_bytes_cache, dict):
+        file_bytes_cache = {}
+        st.session_state["file_bytes_cache"] = file_bytes_cache
+
+    files_cache = st.session_state.get("files_cache")
+    if not isinstance(files_cache, dict):
+        files_cache = {}
+        st.session_state["files_cache"] = files_cache
+
+    last_seq1: Optional[int] = None
+    try:
+        if isinstance(events, list) and events and isinstance(events[-1], dict):
+            last_seq1 = int(events[-1].get("seq") or 0)
+    except Exception:
+        last_seq1 = None
+
+    report_mtime = 0.0
+    files_mtime = 0.0
+    try:
+        if paths is not None and paths.report_path.exists():
+            report_mtime = float(paths.report_path.stat().st_mtime)
+    except Exception:
+        report_mtime = 0.0
+    try:
+        if paths is not None and paths.files_dir.exists():
+            files_mtime = float(paths.files_dir.stat().st_mtime)
+    except Exception:
+        files_mtime = 0.0
+
+    cached_files = files_cache.get(str(active_run_id))
+    if (
+        isinstance(cached_files, dict)
+        and cached_files.get("last_seq") == int(last_seq1 or 0)
+        and float(cached_files.get("report_mtime") or 0.0) == float(report_mtime)
+        and float(cached_files.get("files_mtime") or 0.0) == float(files_mtime)
+        and isinstance(cached_files.get("arts"), list)
+        and isinstance(cached_files.get("omics"), list)
+    ):
+        arts = cached_files.get("arts")
+        omics = cached_files.get("omics")
+    else:
+        arts = _extract_files(events)
+        if paths is not None:
+            arts = list(arts or []) + _scan_local_csv_files(paths.files_dir)
+        omics = _extract_omics_csv_refs(events, base_url=str(base_url))
+        omics = list(omics or []) + _extract_omics_csv_refs_from_report(report, base_url=str(base_url))
+        files_cache[str(active_run_id)] = {
+            "last_seq": int(last_seq1 or 0),
+            "report_mtime": float(report_mtime),
+            "files_mtime": float(files_mtime),
+            "arts": arts,
+            "omics": omics,
+        }
+        st.session_state["files_cache"] = files_cache
+
+    local_csv = [a for a in (arts or []) if isinstance(a, dict) and isinstance(a.get("path"), str) and str(a.get("path") or "").strip()]
+    local_csv = local_csv[-500:]
+    omics_csv = [a for a in (omics or []) if isinstance(a, dict) and isinstance(a.get("url"), str) and str(a.get("url") or "").strip()]
+    omics_csv = omics_csv[-800:]
+
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for a in local_csv:
+        p = str(a.get("path") or "").strip()
+        k = f"local::{p}"
+        if k in seen:
+            continue
+        seen.add(k)
+        ent = dict(a)
+        ent["source"] = "local"
+        ent["id"] = k
+        items.append(ent)
+    for a in omics_csv:
+        rid = str(a.get("omics_run_id") or "").strip()
+        name = str(a.get("name") or "").strip()
+        k = f"omics::{rid}::{name}"
+        if k in seen:
+            continue
+        seen.add(k)
+        ent = dict(a)
+        ent["id"] = k
+        items.append(ent)
+
+    if not items:
         st.info("No CSV files detected yet.")
     else:
-        for a in reversed(arts[-200:]):
-            p = a.get("path")
-            if not isinstance(p, str) or not p:
-                continue
-            ev_seq = a.get("event_seq")
-            path0 = a.get("path")
-            label = f"#{ev_seq} {path0}"
-            with st.expander(label, expanded=False):
-                st.write({"from_api": a.get("path"), "bytes": a.get("bytes"), "file": p})
-                prev = str(a.get("preview") or "")
-                if prev:
-                    st.code(prev, language="csv")
-                    rows = _csv_to_rows(prev)
-                    if rows:
-                        st.dataframe(rows, use_container_width=True)
-                if isinstance(p, str) and p:
-                    fp = Path(p)
-                    if fp.exists() and fp.is_file():
-                        data = fp.read_bytes()
-                        st.download_button(
-                            "Download CSV",
-                            data=data,
-                            file_name=fp.name,
-                            mime="text/csv",
-                            use_container_width=False,
-                        )
+        items = items[-1000:]
+
+        def _lab(i: int) -> str:
+            try:
+                a0 = items[int(i)]
+            except Exception:
+                a0 = items[-1]
+            src = str(a0.get("source") or "")
+            ev_seq = a0.get("event_seq")
+            if src == "omics":
+                rid = str(a0.get("omics_run_id") or "")
+                name = str(a0.get("name") or "")
+                return f"#{ev_seq} OMICS {rid} {name}"
+            p = str(a0.get("path") or "")
+            return f"#{ev_seq} LOCAL {p}"
+
+        pick = st.selectbox("File", options=list(range(len(items))), index=len(items) - 1, format_func=_lab) if fast_csv_view else None
+
+        def _render_one(a: Dict[str, Any]) -> None:
+            src = str(a.get("source") or "")
+            if src == "omics":
+                rid = str(a.get("omics_run_id") or "")
+                name = str(a.get("name") or "")
+                url = str(a.get("url") or "")
+                st.write({"source": "omics", "from_api": a.get("api_path"), "omics_run_id": rid, "name": name, "bytes": a.get("bytes"), "url": url})
+
+                k = f"omics::{rid}::{name}::{int(a.get('bytes') or 0)}"
+                cached = file_bytes_cache.get(k)
+                have = isinstance(cached, (bytes, bytearray))
+                if (not have) and st.button("Load for preview/download", key=f"load_omics_csv_{k}"):
+                    try:
+                        cached = _http_get_bytes(url)
+                        file_bytes_cache[k] = cached
+                        st.session_state["file_bytes_cache"] = file_bytes_cache
+                        have = True
+                    except Exception as e:
+                        st.warning(str(e))
+
+                if have:
+                    txt = bytes(cached).decode("utf-8", errors="replace")
+                    prev = "\n".join(txt.splitlines()[:80])
+                    if prev.strip():
+                        st.code(prev, language="csv")
+                        rows = _csv_to_rows(prev)
+                        if rows:
+                            st.dataframe(rows, use_container_width=True)
+                    try:
+                        fn = f"{rid}_{Path(name).name}"
+                    except Exception:
+                        fn = Path(name).name if name else "omics.csv"
+                    st.download_button("Download CSV", data=bytes(cached), file_name=fn, mime="text/csv", use_container_width=False)
+                return
+
+            p = str(a.get("path") or "")
+            st.write({"source": "local", "from_api": a.get("path"), "bytes": a.get("bytes"), "file": p})
+            prev = str(a.get("preview") or "")
+            if prev:
+                st.code(prev, language="csv")
+                rows = _csv_to_rows(prev)
+                if rows:
+                    st.dataframe(rows, use_container_width=True)
+
+            fp = Path(p)
+            if not (fp.exists() and fp.is_file()):
+                return
+            try:
+                st0 = fp.stat()
+                k = f"local::{str(fp)}::{int(st0.st_mtime)}::{int(st0.st_size)}"
+            except Exception:
+                k = f"local::{str(fp)}"
+            cached = file_bytes_cache.get(k)
+            have = isinstance(cached, (bytes, bytearray))
+            if (not have) and st.button("Load for preview/download", key=f"load_local_csv_{k}"):
+                try:
+                    cached = fp.read_bytes()
+                    file_bytes_cache[k] = cached
+                    st.session_state["file_bytes_cache"] = file_bytes_cache
+                    have = True
+                except Exception as e:
+                    st.warning(str(e))
+            if have:
+                if not prev:
+                    try:
+                        txt = bytes(cached).decode("utf-8", errors="replace")
+                        prev2 = "\n".join(txt.splitlines()[:80])
+                        if prev2.strip():
+                            st.code(prev2, language="csv")
+                            rows = _csv_to_rows(prev2)
+                            if rows:
+                                st.dataframe(rows, use_container_width=True)
+                    except Exception:
+                        pass
+                st.download_button("Download CSV", data=bytes(cached), file_name=fp.name, mime="text/csv", use_container_width=False)
+
+        if fast_csv_view:
+            try:
+                a = items[int(pick)]
+            except Exception:
+                a = items[-1]
+            _render_one(a)
+        else:
+            for a in reversed(items[-200:]):
+                ev_seq = a.get("event_seq")
+                if str(a.get("source") or "") == "omics":
+                    label = f"#{ev_seq} OMICS {a.get('omics_run_id')} {a.get('name')}"
+                else:
+                    label = f"#{ev_seq} LOCAL {a.get('path')}"
+                with st.expander(label, expanded=False):
+                    _render_one(a)
 
 with tabs[6]:
     st.subheader("Prompt (what the LLM is reading)")
@@ -3544,10 +4364,10 @@ with tabs[8]:
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("stdout")
-        st.code(_tail_text(paths.stdout_path), language="")
+        st.code(_tail_text_cached(paths.stdout_path), language="")
     with col2:
         st.markdown("stderr")
-        st.code(_tail_text(paths.stderr_path), language="")
+        st.code(_tail_text_cached(paths.stderr_path), language="")
 
 
 with tabs[9]:

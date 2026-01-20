@@ -1956,6 +1956,9 @@ def apply_layer_ops_inplace(
             if efficiency < 0:
                 efficiency = 0.0
 
+            consume_inputs = step.get("consume_inputs", True)
+            consume_inputs = bool(consume_inputs)
+
             def _resolve_layer_name(nm: str) -> str:
                 nm2 = str(nm or "").strip()
                 if not nm2:
@@ -2084,20 +2087,21 @@ def apply_layer_ops_inplace(
             
             # Calculate how much input to consume
             remaining_to_consume = output_amount.copy()
-            
-            for inp_name in inputs:
-                if inp_name not in layers:
-                    continue
-                if kinds.get(inp_name) not in ("counts", None):
-                    continue
-                inp_raw = np.nan_to_num(layers[inp_name].reshape(H, W), nan=0.0, posinf=0.0, neginf=0.0)
-                inp_arr = np.clip(np.rint(inp_raw), 0, None).astype(np.int64)
-                consume_from_this = np.minimum(inp_arr, remaining_to_consume)
-                new_inp = (inp_arr - consume_from_this).astype(np.float32)
-                layers[inp_name] = new_inp.ravel()
-                _env_update_layer(inp_name)
-                dirty_layers.add(inp_name)
-                remaining_to_consume -= consume_from_this
+
+            if consume_inputs:
+                for inp_name in inputs:
+                    if inp_name not in layers:
+                        continue
+                    if kinds.get(inp_name) not in ("counts", None):
+                        continue
+                    inp_raw = np.nan_to_num(layers[inp_name].reshape(H, W), nan=0.0, posinf=0.0, neginf=0.0)
+                    inp_arr = np.clip(np.rint(inp_raw), 0, None).astype(np.int64)
+                    consume_from_this = np.minimum(inp_arr, remaining_to_consume)
+                    new_inp = (inp_arr - consume_from_this).astype(np.float32)
+                    layers[inp_name] = new_inp.ravel()
+                    _env_update_layer(inp_name)
+                    dirty_layers.add(inp_name)
+                    remaining_to_consume -= consume_from_this
             
             # Distribute output to output layers
             output_per_layer = output_amount // max(1, len(outputs))

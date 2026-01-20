@@ -468,6 +468,7 @@
                 <div class="tabs">
                   <button class="tabBtn tabBtn--active" data-tab="measurements">Measurements</button>
                   <button class="tabBtn" data-tab="layerOps">Layer Ops</button>
+                  <button class="tabBtn" data-tab="pathwayMapping">Pathway Mapping</button>
                 </div>
 
                 <div class="toolsBody">
@@ -581,6 +582,47 @@
 
                       <div class="row row--inline">
                         <div id="opsSpecsTable" class="table"></div>
+                      </div>
+                    </section>
+                  </div>
+
+                  <div class="tabPanel" data-tab="pathwayMapping">
+                    <section class="panel">
+                      <div class="panel__title">Pathway Mapping</div>
+                      <div class="help">
+                        Visualize pathway topology as a neural-network graph and run a small interactive simulator to understand how inputs and enzyme levels shape outputs.
+                      </div>
+
+                      <div class="row">
+                        <label class="label">Pathway</label>
+                        <select id="pathwayMapSelect" class="input"></select>
+                      </div>
+                      <div class="row row--inline">
+                        <div id="pathwayMapMeta" class="meta"></div>
+                      </div>
+
+                      <div class="hr"></div>
+
+                      <div class="pathwayMapLayout">
+                        <div class="pathwayMapLayout__left">
+                          <div class="panel__title" style="font-size: 12px;">Simulator</div>
+                          <div id="pathwayMapSim" class="pathwayMapSim"></div>
+                          <div class="row row--inline">
+                            <div id="pathwayMapSimOut" class="meta"></div>
+                          </div>
+
+                          <div class="hr"></div>
+
+                          <div class="panel__title" style="font-size: 12px;">Importance</div>
+                          <div id="pathwayMapImportance" class="pathwayMapImportance"></div>
+                        </div>
+
+                        <div class="pathwayMapLayout__right">
+                          <div class="panel__title" style="font-size: 12px;">Graph</div>
+                          <div class="pathwayMapViz">
+                            <svg id="pathwayMapSvg" class="pathwayMapSvg" viewBox="0 0 1000 520" preserveAspectRatio="xMidYMid meet"></svg>
+                          </div>
+                        </div>
                       </div>
                     </section>
                   </div>
@@ -1150,6 +1192,24 @@
                 <div id="pathwayInputsContainer" class="pathwayForm__multiSelect">
                   <div class="pathwayForm__selectedItems" id="pathwayInputsSelected"></div>
                   <div id="pathwayInputsDropdown"></div>
+                  <details class="details">
+                    <summary class="details__summary">Bulk add/remove</summary>
+                    <div class="meta" style="margin: 8px 0; line-height: 1.4;">
+                      Use wildcards (e.g., <code>protein_*_importer</code>, <code>rna_*</code>) then add/remove visible layers.
+                    </div>
+                    <div class="row row--inlineFlex" style="margin: 6px 0;">
+                      <input id="pathwayInputsFilter" class="input input--tiny" placeholder="Search layers… (use * as wildcard)" style="flex: 1;" />
+                    </div>
+                    <div class="row row--inline" style="margin: 6px 0;">
+                      <div class="two">
+                        <button id="pathwayInputsSelectAll" class="btn btn--secondary btn--full" type="button">Add all visible</button>
+                        <button id="pathwayInputsClearVisible" class="btn btn--secondary btn--full" type="button">Remove all visible</button>
+                      </div>
+                    </div>
+                    <div class="row row--inline" style="margin: 6px 0;">
+                      <div id="pathwayInputsList" class="targetsList"></div>
+                    </div>
+                  </details>
                 </div>
                 <div class="help">Layers that will be consumed by this pathway</div>
               </div>
@@ -1159,6 +1219,24 @@
                 <div id="pathwayOutputsContainer" class="pathwayForm__multiSelect">
                   <div class="pathwayForm__selectedItems" id="pathwayOutputsSelected"></div>
                   <div id="pathwayOutputsDropdown"></div>
+                  <details class="details">
+                    <summary class="details__summary">Bulk add/remove</summary>
+                    <div class="meta" style="margin: 8px 0; line-height: 1.4;">
+                      Use wildcards (e.g., <code>molecule_*</code>, <code>protein_*</code>) then add/remove visible layers.
+                    </div>
+                    <div class="row row--inlineFlex" style="margin: 6px 0;">
+                      <input id="pathwayOutputsFilter" class="input input--tiny" placeholder="Search layers… (use * as wildcard)" style="flex: 1;" />
+                    </div>
+                    <div class="row row--inline" style="margin: 6px 0;">
+                      <div class="two">
+                        <button id="pathwayOutputsSelectAll" class="btn btn--secondary btn--full" type="button">Add all visible</button>
+                        <button id="pathwayOutputsClearVisible" class="btn btn--secondary btn--full" type="button">Remove all visible</button>
+                      </div>
+                    </div>
+                    <div class="row row--inline" style="margin: 6px 0;">
+                      <div id="pathwayOutputsList" class="targetsList"></div>
+                    </div>
+                  </details>
                 </div>
                 <div class="help">Layers that will be produced by this pathway</div>
               </div>
@@ -1179,6 +1257,14 @@
                 <label class="label" for="pathwayEfficiency">Efficiency</label>
                 <input id="pathwayEfficiency" class="input" type="number" min="0" step="0.1" value="1.0" />
                 <div class="help">Multiplicative gain applied to output signal (higher = more production)</div>
+              </div>
+
+              <div class="pathwayForm__field">
+                <label class="checkbox">
+                  <input id="pathwayConsumeInputs" type="checkbox" checked />
+                  Consume input layers
+                </label>
+                <div class="help">If unchecked, inputs are used as read-only signals and will not be decremented</div>
               </div>
 
               <div class="pathwayForm__actions">

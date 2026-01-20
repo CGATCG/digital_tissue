@@ -182,17 +182,21 @@ def _openai_base_model_and_effort(model: str) -> tuple[str, Optional[str]]:
 
 
 _DISCUSS_ADVISOR_SYSTEM_PROMPT = (
-    "You are a strict scientific advisor helping another agent run efficient, reliable experiments in a biology simulator. "
+    "You are a deeply experienced scientific advisor helping a trainee solve problems with in their research. "
     "Your job is to give short, concrete, actionable advice.\n\n"
+    "These are the only experiments the trainee can run:\n"
+    " - In vivo Characterization studies (biomarkers, survival curves, timecourses; in vivo or cell culture)\n"
+    " - Bulk omics snapshots (transcript measurements, protein measurements, metabolite measurements)\n"
+    " - Spatial omics (spatial transcript or spatial protein measurements)\n"
+    " - Cell-culture perturbation screens (systematic protein up or down perturbations)\n"
+    " - Cell-culture perturbation experiments where one can increase or decrease a protein and see how it affects cells\n"
+    " - In vivo experiments can be done with perturbations and also do omics after a perturbation\n"
+    " - Any type of analysis on python"
+    " - For any experiment, the trainee can alter the age of the in vivo model or days in culture or number of replicates or add a perturbation"     
     "Guidelines:\n"
-    "- Favor power / sample size reasoning: recommend increasing replicates when uncertainty is high.\n"
-    "- Emphasize controls and matched comparisons (healthy vs disease; disease vs disease+treatment at the same ticks).\n"
-    "- Small molecular changes can have large phenotypic effects; do not dismiss small log2 fold-changes by default.\n"
-    "- Prefer cheap experiments first; escalate to expensive studies only after evidence.\n"
-    "- If a result is ambiguous, propose the minimum follow-up that disambiguates it.\n"
-    "- Be cautious about confounding and multiple comparisons; focus on effect size + consistency across replicates.\n\n"
+    "Reply with high level advice on how to solve the current problem the trainee is facing\n"
     "Output requirements:\n"
-    "- Return at most 6 bullet points.\n"
+    "- Return at most 3 bullet points.\n"
     "- Each bullet must be an imperative action (e.g., 'Run ...', 'Compare ...', 'Increase replicates to ...').\n"
     "- No long explanations, no markdown fences, no code."
 )
@@ -574,6 +578,97 @@ def _http_post_multipart_file(
 
 from apply_layer_ops import _decode_float32_b64, _encode_float32_b64, apply_layer_ops_inplace
 from output_calc import _ExprEval
+
+
+def _pathway_compute_topology(step: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(step, dict):
+        raise ValueError("step must be a dict")
+
+    pathway_name = str(step.get("pathway_name", step.get("name", "")) or "").strip()
+    if not pathway_name:
+        raise ValueError("missing pathway_name")
+
+    inputs_raw = step.get("inputs", [])
+    if isinstance(inputs_raw, str):
+        inputs = [s.strip() for s in inputs_raw.split(",") if s.strip()]
+    elif isinstance(inputs_raw, list):
+        inputs = [str(x).strip() for x in inputs_raw if x]
+    else:
+        raise ValueError("inputs must be a list or comma-separated string")
+
+    outputs_raw = step.get("outputs", [])
+    if isinstance(outputs_raw, str):
+        outputs = [s.strip() for s in outputs_raw.split(",") if s.strip()]
+    elif isinstance(outputs_raw, list):
+        outputs = [str(x).strip() for x in outputs_raw if x]
+    else:
+        raise ValueError("outputs must be a list or comma-separated string")
+
+    num_enzymes = int(step.get("num_enzymes", 3))
+    if num_enzymes < 1:
+        num_enzymes = 1
+
+    topo_seed = sum(ord(c) * (idx + 1) for idx, c in enumerate(pathway_name))
+    topo_rng = np.random.default_rng(topo_seed)
+
+    enzyme_connections: list[list[Dict[str, Any]]] = []
+    enzyme_norm_weights: list[float] = []
+
+    for e in range(num_enzymes):
+        sources: list[tuple[str, int]] = []
+
+        for inp_idx in range(len(inputs)):
+            if float(topo_rng.random()) < (0.4 + 0.3 * (e == 0)):
+                sources.append(("input", int(inp_idx)))
+
+        for prev_e in range(e):
+            prob = 0.6 if prev_e == e - 1 else 0.25
+            if float(topo_rng.random()) < float(prob):
+                sources.append(("enzyme", int(prev_e)))
+
+        if not sources:
+            if e == 0:
+                sources.append(("input", 0))
+            else:
+                sources.append(("enzyme", int(e - 1)))
+
+        n_conn = len(sources)
+        norm_w = (1.0 / float(np.sqrt(float(n_conn)))) if n_conn > 1 else 1.0
+        enzyme_norm_weights.append(float(norm_w))
+
+        enzyme_connections.append(
+            [
+                {
+                    "source_type": st,
+                    "source_idx": int(si),
+                }
+                for (st, si) in sources
+            ]
+        )
+
+    output_connections: list[int] = []
+    for e in range(num_enzymes):
+        prob = 0.3 + 0.5 * (float(e) / float(max(1, num_enzymes - 1)))
+        if float(topo_rng.random()) < float(prob) or e == num_enzymes - 1:
+            output_connections.append(int(e))
+
+    if not output_connections:
+        output_connections.append(int(num_enzymes - 1))
+
+    out_n = len(output_connections)
+    output_norm_weight = (1.0 / float(np.sqrt(float(out_n)))) if out_n > 1 else 1.0
+
+    return {
+        "ok": True,
+        "pathway_name": pathway_name,
+        "inputs": inputs,
+        "outputs": outputs,
+        "num_enzymes": int(num_enzymes),
+        "enzyme_connections": enzyme_connections,
+        "output_connections": output_connections,
+        "enzyme_norm_weights": enzyme_norm_weights,
+        "output_norm_weight": float(output_norm_weight),
+    }
 
 
 _LOG = logging.getLogger("digital_tissue.runtime")
@@ -10706,13 +10801,19 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     med_s = float(0.0)
                 delta_med = float(med_s) - float(med_h)
                 extra_days = float(med_s) - float(med_s0)
-                win = bool(abs(float(delta_med)) <= 0.5)
                 lifespan_recovery_pct = None
                 try:
                     if float(med_h) > 0.0:
                         lifespan_recovery_pct = float(med_s) / float(med_h) * 100.0
                 except Exception:
                     lifespan_recovery_pct = None
+
+                win = False
+                try:
+                    if lifespan_recovery_pct is not None and float(lifespan_recovery_pct) >= 90.0:
+                        win = True
+                except Exception:
+                    win = False
 
                 files_text: Dict[str, Any] = {}
 
@@ -12288,6 +12389,15 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         {"value": "spread", "label": "Spread (non-zero ticks)"},
                     ],
                 })
+                return
+
+            if self.path == "/api/pathway/topology":
+                body = self._read_json_body()
+                step = body.get("step")
+                if not isinstance(step, dict):
+                    raise ValueError("missing step")
+                out = _pathway_compute_topology(step)
+                self._send_json(200, out)
                 return
 
             if self.path == "/api/runtime/reset":

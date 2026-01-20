@@ -130,11 +130,27 @@ const ui = {
   pathwayNumEnzymes: $("pathwayNumEnzymes"),
   pathwayInputsDropdown: $("pathwayInputsDropdown"),
   pathwayInputsSelected: $("pathwayInputsSelected"),
+  pathwayInputsFilter: $("pathwayInputsFilter"),
+  pathwayInputsSelectAll: $("pathwayInputsSelectAll"),
+  pathwayInputsClearVisible: $("pathwayInputsClearVisible"),
+  pathwayInputsList: $("pathwayInputsList"),
   pathwayOutputsDropdown: $("pathwayOutputsDropdown"),
   pathwayOutputsSelected: $("pathwayOutputsSelected"),
+  pathwayOutputsFilter: $("pathwayOutputsFilter"),
+  pathwayOutputsSelectAll: $("pathwayOutputsSelectAll"),
+  pathwayOutputsClearVisible: $("pathwayOutputsClearVisible"),
+  pathwayOutputsList: $("pathwayOutputsList"),
   pathwayCellLayer: $("pathwayCellLayer"),
   pathwayCellValue: $("pathwayCellValue"),
   pathwayEfficiency: $("pathwayEfficiency"),
+  pathwayConsumeInputs: $("pathwayConsumeInputs"),
+
+  pathwayMapSelect: $("pathwayMapSelect"),
+  pathwayMapMeta: $("pathwayMapMeta"),
+  pathwayMapSim: $("pathwayMapSim"),
+  pathwayMapSimOut: $("pathwayMapSimOut"),
+  pathwayMapImportance: $("pathwayMapImportance"),
+  pathwayMapSvg: $("pathwayMapSvg"),
 
   rtIntervalMs: $("rtIntervalMs"),
   rtStartStopBtn: $("rtStartStopBtn"),
@@ -4239,9 +4255,13 @@ function _openPathwayModal() {
   if (ui.pathwayNumEnzymes) ui.pathwayNumEnzymes.value = "3";
   if (ui.pathwayCellValue) ui.pathwayCellValue.value = "1";
   if (ui.pathwayEfficiency) ui.pathwayEfficiency.value = "1.0";
+  if (ui.pathwayConsumeInputs) ui.pathwayConsumeInputs.checked = true;
+  if (ui.pathwayInputsFilter) ui.pathwayInputsFilter.value = "";
+  if (ui.pathwayOutputsFilter) ui.pathwayOutputsFilter.value = "";
   
   _populatePathwayLayerDropdowns();
   _updatePathwaySelectedItems();
+  _renderPathwayBulkLists();
   
   ui.pathwayModal.classList.add("modal--open");
   ui.pathwayModal.setAttribute("aria-hidden", "false");
@@ -4333,6 +4353,758 @@ function _updatePathwaySelectedItems() {
       ui.pathwayOutputsSelected.appendChild(item);
     });
   }
+
+  _renderPathwayBulkLists();
+}
+
+
+function _pathwayGetVisibleLayers(kind) {
+  if (!state || !Array.isArray(state.layers)) return [];
+
+  const q = String((kind === "input" ? ui.pathwayInputsFilter?.value : ui.pathwayOutputsFilter?.value) || "").trim();
+
+  let filteredLayers = [];
+  if (q) {
+    const pattern = q.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    const regex = new RegExp(pattern, "i");
+    filteredLayers = state.layers.filter((l) => regex.test(String(l.name)));
+  } else {
+    filteredLayers = [...state.layers];
+  }
+
+  const selected = new Set(kind === "input" ? pathwayModalInputs : pathwayModalOutputs);
+  const filteredLayerNames = new Set(filteredLayers.map((l) => l.name));
+  const missingSelectedLayers = state.layers.filter((l) => selected.has(l.name) && !filteredLayerNames.has(l.name));
+
+  const layers = [...filteredLayers, ...missingSelectedLayers];
+  layers.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  return layers;
+}
+
+
+function _renderPathwayBulkList(kind) {
+  const listEl = kind === "input" ? ui.pathwayInputsList : ui.pathwayOutputsList;
+  if (!listEl) return;
+  if (!state || !Array.isArray(state.layers)) return;
+
+  const layers = _pathwayGetVisibleLayers(kind);
+  const selected = new Set(kind === "input" ? pathwayModalInputs : pathwayModalOutputs);
+
+  listEl.innerHTML = "";
+  for (const l of layers) {
+    const row = document.createElement("div");
+    row.className = "targetsRow";
+
+    const left = document.createElement("div");
+    left.className = "targetsRow__left";
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = selected.has(l.name);
+    cb.addEventListener("change", () => {
+      const arr = kind === "input" ? pathwayModalInputs : pathwayModalOutputs;
+      const nm = String(l.name);
+      if (cb.checked) {
+        if (!arr.includes(nm)) arr.push(nm);
+      } else {
+        const idx = arr.indexOf(nm);
+        if (idx >= 0) arr.splice(idx, 1);
+      }
+      _updatePathwaySelectedItems();
+    });
+
+    const nm = document.createElement("div");
+    nm.className = "targetsRow__name";
+    nm.textContent = l.name;
+    nm.title = l.name;
+
+    left.appendChild(cb);
+    left.appendChild(nm);
+
+    const kindEl = document.createElement("div");
+    kindEl.className = "targetsRow__kind";
+    kindEl.textContent = l.kind;
+
+    row.appendChild(left);
+    row.appendChild(kindEl);
+    listEl.appendChild(row);
+  }
+}
+
+
+function _renderPathwayBulkLists() {
+  _renderPathwayBulkList("input");
+  _renderPathwayBulkList("output");
+}
+
+
+let pathwayMapSelectedOpIdx = -1;
+let pathwayMapTopo = null;
+let pathwayMapSimState = null;
+let pathwayMapSvgRefs = null;
+
+function _pathwayMapSteps() {
+  const out = [];
+  for (let i = 0; i < layerOps.length; i++) {
+    const s = layerOps[i];
+    if (!s || s.type !== "pathway") continue;
+    out.push({ idx: i, step: s });
+  }
+  return out;
+}
+
+function _pathwayMapSelectedStep() {
+  const steps = _pathwayMapSteps();
+  const hit = steps.find((x) => x.idx === pathwayMapSelectedOpIdx) || null;
+  return hit ? hit.step : null;
+}
+
+function _pathwayMapSyncSelect() {
+  if (!ui.pathwayMapSelect) return;
+
+  const steps = _pathwayMapSteps();
+  const prev = ui.pathwayMapSelect.value;
+  ui.pathwayMapSelect.innerHTML = "";
+
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = steps.length ? "(select a pathway)" : "(no pathways found)";
+  ui.pathwayMapSelect.appendChild(opt0);
+
+  for (const { idx, step } of steps) {
+    const opt = document.createElement("option");
+    opt.value = String(idx);
+    const nm = String(step.pathway_name || step.name || "pathway").trim() || "pathway";
+    const nIn = Array.isArray(step.inputs) ? step.inputs.length : 0;
+    const nOut = Array.isArray(step.outputs) ? step.outputs.length : 0;
+    const nE = Math.max(1, Math.floor(Number(step.num_enzymes ?? 3) || 3));
+    opt.textContent = `#${idx + 1} ${nm} (${nIn} in → ${nOut} out, ${nE} enzymes)`;
+    ui.pathwayMapSelect.appendChild(opt);
+  }
+
+  if (prev && steps.some((x) => String(x.idx) === String(prev))) {
+    ui.pathwayMapSelect.value = prev;
+    pathwayMapSelectedOpIdx = Math.floor(Number(prev));
+  } else if (steps.length) {
+    ui.pathwayMapSelect.value = String(steps[0].idx);
+    pathwayMapSelectedOpIdx = steps[0].idx;
+  } else {
+    ui.pathwayMapSelect.value = "";
+    pathwayMapSelectedOpIdx = -1;
+  }
+}
+
+async function _pathwayMapLoadSelected() {
+  if (!ui.pathwayMapSelect) return;
+  const v = String(ui.pathwayMapSelect.value || "").trim();
+  if (!v) {
+    pathwayMapSelectedOpIdx = -1;
+    pathwayMapTopo = null;
+    pathwayMapSimState = null;
+    _pathwayMapRenderAll();
+    return;
+  }
+
+  pathwayMapSelectedOpIdx = Math.floor(Number(v));
+  const step = _pathwayMapSelectedStep();
+  if (!step) {
+    pathwayMapTopo = null;
+    pathwayMapSimState = null;
+    _pathwayMapRenderAll();
+    return;
+  }
+
+  const nm = String(step.pathway_name || step.name || "").trim();
+  const inputs = Array.isArray(step.inputs) ? step.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const outputs = Array.isArray(step.outputs) ? step.outputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const numEnzymes = Math.max(1, Math.floor(Number(step.num_enzymes ?? 3) || 3));
+  const efficiency = Number(step.efficiency ?? 1.0);
+  const consumeInputs = step.consume_inputs !== false;
+
+  if (ui.pathwayMapMeta) {
+    ui.pathwayMapMeta.textContent = `${nm || "(unnamed)"} | inputs=${inputs.length} outputs=${outputs.length} enzymes=${numEnzymes} | consume_inputs=${consumeInputs ? 1 : 0}`;
+  }
+
+  try {
+    const topo = await _rtPostJson("/api/pathway/topology", {
+      step: {
+        pathway_name: nm,
+        inputs,
+        outputs,
+        num_enzymes: numEnzymes,
+      },
+    });
+    if (!topo || topo.ok !== true) throw new Error("pathway topology request failed");
+    pathwayMapTopo = topo;
+  } catch (e) {
+    pathwayMapTopo = null;
+    if (ui.pathwayMapMeta) ui.pathwayMapMeta.textContent = `Pathway Mapping error: ${String(e?.message || e)}`;
+  }
+
+  pathwayMapSimState = {
+    inputs: new Map(inputs.map((x) => [x, 10])),
+    proteins: new Map(Array.from({ length: numEnzymes }, (_, i) => [`protein_${nm}_enzyme_${i + 1}`, 0])),
+    efficiency: Number.isFinite(efficiency) ? efficiency : 1.0,
+  };
+
+  _pathwayMapRenderAll();
+}
+
+function _svgEl(tag) {
+  return document.createElementNS("http://www.w3.org/2000/svg", tag);
+}
+
+function _pathwayMapSimCompute() {
+  const topo = pathwayMapTopo;
+  const step = _pathwayMapSelectedStep();
+  if (!topo || topo.ok !== true || !step || !pathwayMapSimState) return null;
+
+  const inputs = Array.isArray(topo.inputs) ? topo.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const outputs = Array.isArray(topo.outputs) ? topo.outputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const numEnzymes = Math.max(1, Math.floor(Number(topo.num_enzymes ?? 1) || 1));
+
+  const enzymeConnections = Array.isArray(topo.enzyme_connections) ? topo.enzyme_connections : [];
+  const outputConnections = Array.isArray(topo.output_connections) ? topo.output_connections : [];
+
+  const inputSignals = inputs.map((nm) => Number(pathwayMapSimState.inputs.get(nm) ?? 0));
+  const enzymeOutputs = [];
+  const enzymeInputs = [];
+  const enzymeFactors = [];
+
+  for (let e = 0; e < numEnzymes; e++) {
+    const srcs = Array.isArray(enzymeConnections[e]) ? enzymeConnections[e] : [];
+    let acc = 0;
+    for (const src of srcs) {
+      const st = String(src?.source_type || "");
+      const si = Math.floor(Number(src?.source_idx ?? -1));
+      if (st === "input") {
+        acc += inputSignals[si] ?? 0;
+      } else if (st === "enzyme") {
+        acc += enzymeOutputs[si] ?? 0;
+      }
+    }
+
+    const numConn = Math.max(0, srcs.length);
+    if (numConn > 1) acc = acc / Math.sqrt(numConn);
+
+    const pName = `protein_${String(step.pathway_name || step.name || "").trim()}_enzyme_${e + 1}`;
+    const p = Number(pathwayMapSimState.proteins.get(pName) ?? 0);
+    const ef = (p + 1.0) / (p + 2.0 + 1e-9);
+    const out = acc * ef;
+    enzymeInputs.push(acc);
+    enzymeFactors.push(ef);
+    enzymeOutputs.push(out);
+  }
+
+  let finalAcc = 0;
+  for (const eIdx of outputConnections) {
+    finalAcc += enzymeOutputs[Math.floor(Number(eIdx))] ?? 0;
+  }
+  const outConnN = Math.max(0, outputConnections.length);
+  if (outConnN > 1) finalAcc = finalAcc / Math.sqrt(outConnN);
+
+  const eff = Number(pathwayMapSimState.efficiency ?? 1.0);
+  const finalSignal = Math.max(0, finalAcc * (Number.isFinite(eff) ? eff : 1.0));
+  const intAmount = Math.max(0, Math.floor(finalSignal));
+
+  const nOut = Math.max(1, outputs.length);
+  const base = Math.floor(intAmount / nOut);
+  const rem = intAmount % nOut;
+  const outCounts = outputs.map((_, idx) => base + (idx === 0 ? rem : 0));
+  const outContinuous = outputs.map(() => finalSignal / nOut);
+
+  return {
+    inputs,
+    outputs,
+    inputSignals,
+    enzymeInputs,
+    enzymeOutputs,
+    enzymeFactors,
+    outputConnections,
+    finalSignal,
+    intAmount,
+    outCounts,
+    outContinuous,
+  };
+}
+
+function _pathwayMapComputeImportance(sim) {
+  const topo = pathwayMapTopo;
+  const step = _pathwayMapSelectedStep();
+  if (!sim || !topo || topo.ok !== true || !step || !pathwayMapSimState) return null;
+
+  const inputs = Array.isArray(topo.inputs) ? topo.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const numEnzymes = Math.max(1, Math.floor(Number(topo.num_enzymes ?? 1) || 1));
+  const enzymeConnections = Array.isArray(topo.enzyme_connections) ? topo.enzyme_connections : [];
+  const enzymeNormWeights = Array.isArray(topo.enzyme_norm_weights) ? topo.enzyme_norm_weights : [];
+  const outputConnections = Array.isArray(topo.output_connections) ? topo.output_connections : [];
+  const outNorm = Number.isFinite(Number(topo.output_norm_weight)) ? Number(topo.output_norm_weight) : (outputConnections.length > 1 ? 1 / Math.sqrt(Math.max(1, outputConnections.length)) : 1);
+
+  const eff = Number(pathwayMapSimState.efficiency ?? 1.0);
+  const gFinalAcc = Number.isFinite(eff) ? eff : 1.0;
+
+  const gOut = Array(numEnzymes).fill(0);
+  for (const eIdx0 of outputConnections) {
+    const eIdx = Math.floor(Number(eIdx0));
+    if (eIdx < 0 || eIdx >= numEnzymes) continue;
+    gOut[eIdx] += gFinalAcc * outNorm;
+  }
+
+  const gInputs = Array(inputs.length).fill(0);
+  const gProteins = Array(numEnzymes).fill(0);
+
+  const nm = String(step.pathway_name || step.name || "").trim();
+
+  for (let e = numEnzymes - 1; e >= 0; e--) {
+    const srcs = Array.isArray(enzymeConnections[e]) ? enzymeConnections[e] : [];
+    const norm = Number(enzymeNormWeights[e] ?? (srcs.length > 1 ? 1 / Math.sqrt(Math.max(1, srcs.length)) : 1));
+
+    const acc = Number(sim.enzymeInputs[e] ?? 0);
+    const ef = Number(sim.enzymeFactors[e] ?? 0);
+    const gAcc = gOut[e] * ef;
+    const gEf = gOut[e] * acc;
+
+    for (const src of srcs) {
+      const st = String(src?.source_type || "");
+      const si = Math.floor(Number(src?.source_idx ?? -1));
+      if (st === "input") {
+        if (si < 0 || si >= gInputs.length) continue;
+        gInputs[si] += gAcc * norm;
+      } else if (st === "enzyme") {
+        if (si < 0 || si >= numEnzymes) continue;
+        gOut[si] += gAcc * norm;
+      }
+    }
+
+    const pName = `protein_${nm}_enzyme_${e + 1}`;
+    const p = Number(pathwayMapSimState.proteins.get(pName) ?? 0);
+    const denom = p + 2.0 + 1e-9;
+    const dEfDp = 1.0 / (denom * denom);
+    gProteins[e] += gEf * dEfDp;
+  }
+
+  const INPUT_RANGE = 200;
+  const PROTEIN_RANGE = 200;
+  const inputScore = gInputs.map((g) => Math.abs(Number(g) || 0) * INPUT_RANGE);
+  const proteinScore = gProteins.map((g) => Math.abs(Number(g) || 0) * PROTEIN_RANGE);
+
+  return {
+    inputs,
+    numEnzymes,
+    gInputs,
+    gProteins,
+    inputScore,
+    proteinScore,
+  };
+}
+
+function _pathwayMapRenderImportance(sim, imp) {
+  if (!ui.pathwayMapImportance) return;
+  ui.pathwayMapImportance.innerHTML = "";
+
+  if (!sim || !imp) {
+    const t = document.createElement("div");
+    t.className = "meta";
+    t.textContent = "Adjust sliders to see sensitivities.";
+    ui.pathwayMapImportance.appendChild(t);
+    return;
+  }
+
+  const maxScore = Math.max(1e-9, ...imp.inputScore, ...imp.proteinScore);
+  const mkGroup = (title) => {
+    const h = document.createElement("div");
+    h.className = "pathwayMapImpGroupTitle";
+    h.textContent = title;
+    ui.pathwayMapImportance.appendChild(h);
+  };
+
+  const mkRow = (name, score, grad) => {
+    const wrap = document.createElement("div");
+    wrap.className = "pathwayMapImpRow";
+
+    const left = document.createElement("div");
+    const nm = document.createElement("div");
+    nm.className = "pathwayMapImpName";
+    nm.textContent = name;
+    const bar = document.createElement("div");
+    bar.className = "pathwayMapImpBar";
+    const fill = document.createElement("div");
+    fill.className = "pathwayMapImpBarFill";
+    const pct = 100 * Math.max(0, Math.min(1, (Number(score) || 0) / maxScore));
+    fill.style.width = `${pct.toFixed(2)}%`;
+    bar.appendChild(fill);
+    left.appendChild(nm);
+    left.appendChild(bar);
+
+    const right = document.createElement("div");
+    right.className = "pathwayMapImpVal";
+    const g = Number(grad) || 0;
+    right.textContent = `dOut/dx≈${g.toFixed(4)}`;
+
+    wrap.appendChild(left);
+    wrap.appendChild(right);
+    return wrap;
+  };
+
+  const TOPK = 10;
+
+  mkGroup("Inputs (local importance)");
+  const inpRows = imp.inputs
+    .map((nm, i) => ({ name: nm, score: imp.inputScore[i] ?? 0, grad: imp.gInputs[i] ?? 0 }))
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, TOPK);
+  for (const r of inpRows) ui.pathwayMapImportance.appendChild(mkRow(r.name, r.score, r.grad));
+
+  mkGroup("Enzyme proteins (local importance)");
+  const enzRows = Array.from({ length: imp.numEnzymes }, (_, e) => ({
+    name: `enzyme_${e + 1}`,
+    score: imp.proteinScore[e] ?? 0,
+    grad: imp.gProteins[e] ?? 0,
+  }))
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, TOPK);
+  for (const r of enzRows) ui.pathwayMapImportance.appendChild(mkRow(r.name, r.score, r.grad));
+}
+
+function _pathwayMapApplyGraphImportance(imp) {
+  if (!pathwayMapSvgRefs || !pathwayMapSvgRefs.nodes || !imp) return;
+  const maxScore = Math.max(1e-9, ...imp.inputScore, ...imp.proteinScore);
+
+  const setStroke = (id, score, baseRgb) => {
+    const el = pathwayMapSvgRefs.nodes.get(id);
+    if (!el) return;
+    const t = Math.max(0, Math.min(1, (Number(score) || 0) / maxScore));
+    const sw = 1 + 5 * t;
+    const a = 0.18 + 0.78 * t;
+    el.setAttribute("stroke-width", String(sw.toFixed(2)));
+    el.setAttribute("stroke", `rgba(${baseRgb},${a.toFixed(3)})`);
+  };
+
+  for (let i = 0; i < imp.inputs.length; i++) setStroke(`in:${i}`, imp.inputScore[i], "10,132,255");
+  for (let e = 0; e < imp.numEnzymes; e++) setStroke(`enz:${e}`, imp.proteinScore[e], "50,215,75");
+}
+
+function _pathwayMapRefresh() {
+  const sim = _pathwayMapSimCompute();
+  const imp = _pathwayMapComputeImportance(sim);
+  if (ui.pathwayMapSimOut) {
+    if (!sim) {
+      ui.pathwayMapSimOut.textContent = "";
+    } else {
+      const outLines = [];
+      outLines.push(`final_signal≈${sim.finalSignal.toFixed(3)}  | floor=${sim.intAmount}`);
+      if (sim.outputs.length) {
+        const show = sim.outputs
+          .slice(0, 8)
+          .map((o, i) => `${o}: ${sim.outCounts[i]} (≈${sim.outContinuous[i].toFixed(3)})`)
+          .join(" | ");
+        outLines.push(show);
+      }
+      ui.pathwayMapSimOut.textContent = outLines.join("\n");
+    }
+  }
+  _pathwayMapApplyGraphValues(sim);
+  _pathwayMapApplyGraphImportance(imp);
+  _pathwayMapRenderImportance(sim, imp);
+}
+
+function _pathwayMapRenderSimulator() {
+  if (!ui.pathwayMapSim || !ui.pathwayMapSimOut) return;
+  ui.pathwayMapSim.innerHTML = "";
+  ui.pathwayMapSimOut.textContent = "";
+
+  const step = _pathwayMapSelectedStep();
+  const topo = pathwayMapTopo;
+  if (!step || !topo || topo.ok !== true || !pathwayMapSimState) {
+    ui.pathwayMapSimOut.textContent = "Pick a pathway.";
+    return;
+  }
+
+  const mkSliderRow = (label, get, set, min, max, step, fmt) => {
+    const wrap = document.createElement("div");
+    wrap.className = "pathwayMapSimRow";
+    const left = document.createElement("div");
+    const lab = document.createElement("div");
+    lab.className = "meta";
+    lab.textContent = label;
+    const inp = document.createElement("input");
+    inp.className = "input";
+    inp.type = "range";
+    inp.min = String(min);
+    inp.max = String(max);
+    inp.step = String(step);
+    inp.value = String(get());
+    inp.addEventListener("input", () => {
+      set(Number(inp.value));
+      _pathwayMapRefresh();
+    });
+    left.appendChild(lab);
+    left.appendChild(inp);
+
+    const right = document.createElement("div");
+    right.className = "meta";
+    right.textContent = fmt(get());
+    inp.addEventListener("input", () => {
+      right.textContent = fmt(get());
+    });
+
+    wrap.appendChild(left);
+    wrap.appendChild(right);
+    return wrap;
+  };
+
+  const nm = String(step.pathway_name || step.name || "").trim();
+  const inputs = Array.isArray(topo.inputs) ? topo.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+
+  const hdrIn = document.createElement("div");
+  hdrIn.className = "meta";
+  hdrIn.textContent = "Inputs";
+  ui.pathwayMapSim.appendChild(hdrIn);
+
+  for (const inName of inputs) {
+    ui.pathwayMapSim.appendChild(
+      mkSliderRow(
+        inName,
+        () => Number(pathwayMapSimState.inputs.get(inName) ?? 0),
+        (v) => pathwayMapSimState.inputs.set(inName, Math.max(0, v)),
+        0,
+        200,
+        1,
+        (v) => String(Math.floor(v))
+      )
+    );
+  }
+
+  const hdrE = document.createElement("div");
+  hdrE.className = "meta";
+  hdrE.textContent = "Enzyme proteins";
+  ui.pathwayMapSim.appendChild(hdrE);
+
+  const nE = Math.max(1, Math.floor(Number(topo.num_enzymes ?? 1) || 1));
+  for (let e = 0; e < nE; e++) {
+    const pName = `protein_${nm}_enzyme_${e + 1}`;
+    ui.pathwayMapSim.appendChild(
+      mkSliderRow(
+        pName,
+        () => Number(pathwayMapSimState.proteins.get(pName) ?? 0),
+        (v) => pathwayMapSimState.proteins.set(pName, Math.max(0, v)),
+        0,
+        200,
+        1,
+        (v) => {
+          const ef = (v + 1.0) / (v + 2.0 + 1e-9);
+          return `${Math.floor(v)} (factor=${ef.toFixed(3)})`;
+        }
+      )
+    );
+  }
+
+  const hdrG = document.createElement("div");
+  hdrG.className = "meta";
+  hdrG.textContent = "Global";
+  ui.pathwayMapSim.appendChild(hdrG);
+  ui.pathwayMapSim.appendChild(
+    mkSliderRow(
+      "efficiency",
+      () => Number(pathwayMapSimState.efficiency ?? 1.0),
+      (v) => (pathwayMapSimState.efficiency = Math.max(0, v)),
+      0,
+      5,
+      0.05,
+      (v) => String(Number(v).toFixed(2))
+    )
+  );
+
+  _pathwayMapRefresh();
+}
+
+function _pathwayMapRenderGraph() {
+  if (!ui.pathwayMapSvg) return;
+  ui.pathwayMapSvg.innerHTML = "";
+  pathwayMapSvgRefs = { nodes: new Map(), edges: [] };
+
+  const topo = pathwayMapTopo;
+  const step = _pathwayMapSelectedStep();
+  if (!topo || topo.ok !== true || !step) {
+    const t = _svgEl("text");
+    t.setAttribute("x", "24");
+    t.setAttribute("y", "40");
+    t.setAttribute("fill", "rgba(255,255,255,.7)");
+    t.setAttribute("font-size", "16");
+    t.textContent = "Select a pathway";
+    ui.pathwayMapSvg.appendChild(t);
+    return;
+  }
+
+  const inputs = Array.isArray(topo.inputs) ? topo.inputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const outputs = Array.isArray(topo.outputs) ? topo.outputs.map((s) => String(s || "").trim()).filter((s) => s) : [];
+  const numEnzymes = Math.max(1, Math.floor(Number(topo.num_enzymes ?? 1) || 1));
+  const enzymeConnections = Array.isArray(topo.enzyme_connections) ? topo.enzyme_connections : [];
+  const outputConnections = Array.isArray(topo.output_connections) ? topo.output_connections : [];
+  const enzymeNormWeights = Array.isArray(topo.enzyme_norm_weights) ? topo.enzyme_norm_weights : [];
+  const outputNormWeight = Number(topo.output_norm_weight ?? 1.0);
+
+  const w = 1000;
+  const h = 520;
+  const padY = 40;
+
+  const xInputs = 90;
+  const xEnz = 390;
+  const xOutAgg = 720;
+  const xOut = 930;
+
+  const yList = (n, top, bottom) => {
+    const nn = Math.max(1, n);
+    if (nn === 1) return [(top + bottom) / 2];
+    const ys = [];
+    for (let i = 0; i < nn; i++) ys.push(top + (i / (nn - 1)) * (bottom - top));
+    return ys;
+  };
+
+  const yInputs = yList(inputs.length, padY, h - padY);
+  const yEnz = yList(numEnzymes, padY, h - padY);
+  const yOut = yList(outputs.length, padY, h - padY);
+  const yAgg = h / 2;
+
+  const addNode = (id, x, y, label, kind) => {
+    const g = _svgEl("g");
+    const c = _svgEl("circle");
+    c.setAttribute("cx", String(x));
+    c.setAttribute("cy", String(y));
+    c.setAttribute("r", kind === "agg" ? "20" : kind === "enzyme" ? "18" : "16");
+    c.setAttribute("fill", "rgba(255,255,255,.08)");
+    c.setAttribute("stroke", "rgba(255,255,255,.22)");
+    c.setAttribute("stroke-width", "1");
+    const title = _svgEl("title");
+    title.textContent = label;
+    c.appendChild(title);
+
+    const tx = _svgEl("text");
+    tx.setAttribute("x", String(x));
+    tx.setAttribute("y", String(y + 34));
+    tx.setAttribute("fill", "rgba(255,255,255,.78)");
+    tx.setAttribute("font-size", "11");
+    tx.setAttribute("text-anchor", "middle");
+    tx.textContent = label.length > 20 ? label.slice(0, 17) + "…" : label;
+
+    g.appendChild(c);
+    g.appendChild(tx);
+    ui.pathwayMapSvg.appendChild(g);
+    pathwayMapSvgRefs.nodes.set(id, c);
+  };
+
+  const addEdge = (x1, y1, x2, y2, label, wgt, color) => {
+    const p = _svgEl("path");
+    const mx = (x1 + x2) / 2;
+    const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+    p.setAttribute("d", d);
+    p.setAttribute("fill", "none");
+    p.setAttribute("stroke", color || "rgba(10,132,255,.35)");
+    const sw = 1.5 + 2.5 * Math.min(1, Math.max(0, Number(wgt) || 0));
+    p.setAttribute("stroke-width", String(sw));
+    p.setAttribute("stroke-linecap", "round");
+    const tt = _svgEl("title");
+    tt.textContent = label;
+    p.appendChild(tt);
+    ui.pathwayMapSvg.appendChild(p);
+    pathwayMapSvgRefs.edges.push(p);
+  };
+
+  for (let i = 0; i < inputs.length; i++) addNode(`in:${i}`, xInputs, yInputs[i], inputs[i], "input");
+  for (let e = 0; e < numEnzymes; e++) {
+    const nm = `enzyme_${e + 1}`;
+    addNode(`enz:${e}`, xEnz, yEnz[e], nm, "enzyme");
+  }
+  addNode("agg", xOutAgg, yAgg, "output", "agg");
+  for (let i = 0; i < outputs.length; i++) addNode(`out:${i}`, xOut, yOut[i], outputs[i], "output");
+
+  for (let e = 0; e < numEnzymes; e++) {
+    const srcs = Array.isArray(enzymeConnections[e]) ? enzymeConnections[e] : [];
+    const norm = Number(enzymeNormWeights[e] ?? (srcs.length > 1 ? 1 / Math.sqrt(Math.max(1, srcs.length)) : 1));
+    for (const src of srcs) {
+      const st = String(src?.source_type || "");
+      const si = Math.floor(Number(src?.source_idx ?? -1));
+      if (st === "input") {
+        if (si < 0 || si >= inputs.length) continue;
+        addEdge(
+          xInputs + 18,
+          yInputs[si],
+          xEnz - 18,
+          yEnz[e],
+          `${inputs[si]} → enzyme_${e + 1} (w=${norm.toFixed(3)})`,
+          norm,
+          "rgba(10,132,255,.42)"
+        );
+      } else if (st === "enzyme") {
+        if (si < 0 || si >= numEnzymes) continue;
+        addEdge(
+          xEnz + 18,
+          yEnz[si],
+          xEnz - 18,
+          yEnz[e],
+          `enzyme_${si + 1} → enzyme_${e + 1} (w=${norm.toFixed(3)})`,
+          norm,
+          "rgba(50,215,75,.30)"
+        );
+      }
+    }
+  }
+
+  const outNorm = Number.isFinite(outputNormWeight) ? outputNormWeight : 1;
+  for (const eIdx0 of outputConnections) {
+    const eIdx = Math.floor(Number(eIdx0));
+    if (eIdx < 0 || eIdx >= numEnzymes) continue;
+    addEdge(
+      xEnz + 18,
+      yEnz[eIdx],
+      xOutAgg - 22,
+      yAgg,
+      `enzyme_${eIdx + 1} → output (w=${outNorm.toFixed(3)})`,
+      outNorm,
+      "rgba(255,193,7,.32)"
+    );
+  }
+
+  const nOut = Math.max(1, outputs.length);
+  for (let i = 0; i < outputs.length; i++) {
+    addEdge(
+      xOutAgg + 22,
+      yAgg,
+      xOut - 18,
+      yOut[i],
+      `output → ${outputs[i]} (share≈${(1 / nOut).toFixed(3)})`,
+      1 / nOut,
+      "rgba(239,68,68,.32)"
+    );
+  }
+}
+
+function _pathwayMapApplyGraphValues(sim) {
+  if (!pathwayMapSvgRefs || !pathwayMapSvgRefs.nodes || !sim) return;
+  const vals = [];
+  for (const v of sim.inputSignals) vals.push(v);
+  for (const v of sim.enzymeOutputs) vals.push(v);
+  vals.push(sim.finalSignal);
+  const mx = Math.max(1e-9, ...vals.map((v) => (Number.isFinite(v) ? v : 0)));
+
+  const setFill = (id, v, baseRgb) => {
+    const el = pathwayMapSvgRefs.nodes.get(id);
+    if (!el) return;
+    const t = Math.max(0, Math.min(1, (Number(v) || 0) / mx));
+    const a = 0.10 + 0.70 * t;
+    el.setAttribute("fill", `rgba(${baseRgb},${a.toFixed(3)})`);
+  };
+
+  for (let i = 0; i < sim.inputs.length; i++) setFill(`in:${i}`, sim.inputSignals[i], "10,132,255");
+  for (let e = 0; e < sim.enzymeOutputs.length; e++) setFill(`enz:${e}`, sim.enzymeOutputs[e], "50,215,75");
+  setFill("agg", sim.finalSignal, "255,193,7");
+  for (let i = 0; i < sim.outputs.length; i++) setFill(`out:${i}`, sim.outContinuous[i], "239,68,68");
+}
+
+function _pathwayMapRenderAll() {
+  _pathwayMapRenderSimulator();
+  _pathwayMapRenderGraph();
+  _pathwayMapRefresh();
 }
 
 const palette = [
@@ -5026,6 +5798,7 @@ function buildLayerOpsConfigJson() {
             cell_layer: String(x.cell_layer ?? "cell"),
             cell_value: Number(x.cell_value ?? 1),
             efficiency: Number(x.efficiency ?? 1.0),
+            consume_inputs: x.consume_inputs !== false,
             seed: seed,
           };
         }
@@ -5170,6 +5943,7 @@ function _parseLayerOpsConfigObject(o) {
             cell_layer: String(x.cell_layer ?? "cell"),
             cell_value: Number(x.cell_value ?? 1),
             efficiency: Number(x.efficiency ?? 1.0),
+            consume_inputs: x.consume_inputs !== false,
             seed: x.seed == null ? null : Math.floor(Number(x.seed)),
           };
         }
@@ -7038,6 +7812,7 @@ function renderLayerOpsTable() {
           cell_layer: layerList.some((l) => l?.name === "cell") ? "cell" : defaultLayer,
           cell_value: 1,
           efficiency: 1.0,
+          consume_inputs: true,
           seed: 0,
         };
       }
@@ -7949,6 +8724,22 @@ function renderLayerOpsTable() {
       });
       form.appendChild(mkField("Efficiency", efficiency));
 
+      const consumeWrap = document.createElement("label");
+      consumeWrap.className = "checkbox";
+      const consumeCb = document.createElement("input");
+      consumeCb.type = "checkbox";
+      consumeCb.checked = layerOps[i].consume_inputs !== false;
+      consumeCb.addEventListener("change", () => {
+        layerOps[i].consume_inputs = consumeCb.checked;
+        saveFunctionsCfg();
+        markDirty();
+        saveToLocalStorage();
+        updateStatus();
+      });
+      consumeWrap.appendChild(consumeCb);
+      consumeWrap.appendChild(document.createTextNode(" Consume inputs"));
+      form.appendChild(mkField("Mode", consumeWrap));
+
       const seed = document.createElement("input");
       seed.className = "input input--tiny";
       seed.type = "number";
@@ -8149,6 +8940,7 @@ function renderLayerOpsTable() {
                     cell_layer: baseStep.cell_layer,
                     cell_value: baseStep.cell_value,
                     efficiency: baseStep.efficiency,
+                    consume_inputs: baseStep.consume_inputs,
                     seed: baseStep.seed,
                   }
             : {
@@ -8282,6 +9074,14 @@ function renderLayerOpsTable() {
   wrap.appendChild(t);
   ui.opsSpecsTable.innerHTML = "";
   ui.opsSpecsTable.appendChild(wrap);
+
+  _pathwayMapSyncSelect();
+  const pmPanel = document.querySelector(
+    '.screenPanel[data-screen="functions"] .tabPanel[data-tab="pathwayMapping"]'
+  );
+  if (pmPanel && pmPanel.classList.contains("tabPanel--active")) {
+    void _pathwayMapLoadSelected();
+  }
 }
 
 let layersFilterText = "";
@@ -11394,8 +12194,18 @@ for (const screenPanel of document.querySelectorAll(".screenPanel")) {
   for (const b of btns) {
     b.addEventListener("click", () => {
       setActiveTab(screenPanel, b.dataset.tab);
+      if (screenPanel.dataset.screen === "functions" && b.dataset.tab === "pathwayMapping") {
+        _pathwayMapSyncSelect();
+        void _pathwayMapLoadSelected();
+      }
     });
   }
+}
+
+if (ui.pathwayMapSelect) {
+  ui.pathwayMapSelect.addEventListener("change", () => {
+    void _pathwayMapLoadSelected();
+  });
 }
 
 if (ui.inspectMode) {
@@ -12108,6 +12918,53 @@ if (ui.pathwayOutputsSelected) {
   });
 }
 
+if (ui.pathwayInputsFilter) {
+  ui.pathwayInputsFilter.addEventListener("input", () => _renderPathwayBulkList("input"));
+  ui.pathwayInputsFilter.addEventListener("change", () => _renderPathwayBulkList("input"));
+}
+if (ui.pathwayOutputsFilter) {
+  ui.pathwayOutputsFilter.addEventListener("input", () => _renderPathwayBulkList("output"));
+  ui.pathwayOutputsFilter.addEventListener("change", () => _renderPathwayBulkList("output"));
+}
+
+if (ui.pathwayInputsSelectAll) {
+  ui.pathwayInputsSelectAll.addEventListener("click", () => {
+    const layers = _pathwayGetVisibleLayers("input");
+    for (const l of layers) {
+      const nm = String(l.name);
+      if (!pathwayModalInputs.includes(nm)) pathwayModalInputs.push(nm);
+    }
+    _updatePathwaySelectedItems();
+  });
+}
+if (ui.pathwayInputsClearVisible) {
+  ui.pathwayInputsClearVisible.addEventListener("click", () => {
+    const layers = _pathwayGetVisibleLayers("input");
+    const toRemove = new Set(layers.map((l) => String(l.name)));
+    pathwayModalInputs = pathwayModalInputs.filter((nm) => !toRemove.has(String(nm)));
+    _updatePathwaySelectedItems();
+  });
+}
+
+if (ui.pathwayOutputsSelectAll) {
+  ui.pathwayOutputsSelectAll.addEventListener("click", () => {
+    const layers = _pathwayGetVisibleLayers("output");
+    for (const l of layers) {
+      const nm = String(l.name);
+      if (!pathwayModalOutputs.includes(nm)) pathwayModalOutputs.push(nm);
+    }
+    _updatePathwaySelectedItems();
+  });
+}
+if (ui.pathwayOutputsClearVisible) {
+  ui.pathwayOutputsClearVisible.addEventListener("click", () => {
+    const layers = _pathwayGetVisibleLayers("output");
+    const toRemove = new Set(layers.map((l) => String(l.name)));
+    pathwayModalOutputs = pathwayModalOutputs.filter((nm) => !toRemove.has(String(nm)));
+    _updatePathwaySelectedItems();
+  });
+}
+
 if (ui.pathwayModalCreate) {
   ui.pathwayModalCreate.addEventListener("click", () => {
     const pathwayName = ui.pathwayName?.value?.trim() || "";
@@ -12133,6 +12990,7 @@ if (ui.pathwayModalCreate) {
     const cellLayer = pathwayCellLayerSearchable?.input?.value?.trim() || "cell";
     const cellValue = parseInt(ui.pathwayCellValue?.value) || 1;
     const efficiency = parseFloat(ui.pathwayEfficiency?.value) || 1.0;
+    const consumeInputs = ui.pathwayConsumeInputs ? !!ui.pathwayConsumeInputs.checked : true;
     
     const resolveMolName = (nm) => {
       const s = String(nm || "").trim();
@@ -12224,6 +13082,7 @@ if (ui.pathwayModalCreate) {
       cell_layer: cellLayer,
       cell_value: cellValue,
       efficiency: efficiency,
+      consume_inputs: consumeInputs,
       seed: 0,
     });
     
