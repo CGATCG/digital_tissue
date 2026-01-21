@@ -847,7 +847,7 @@
         "type": "op",
         "name": "reduce damage",
         "group": "cancer",
-        "enabled": true,
+        "enabled": false,
         "expr": "where(cancer==1, damage*0.7, damage)",
         "target": "damage"
       },
@@ -855,7 +855,7 @@
         "type": "op",
         "name": "increase MGF",
         "group": "cancer",
-        "enabled": true,
+        "enabled": false,
         "expr": "where(cancer==1, mature_growth_factor*1.3, mature_growth_factor)",
         "target": "mature_growth_factor"
       },

@@ -2690,9 +2690,41 @@ _bootstrap_active_suite_id()
 
 st.title("LLM Benchmark Monitor")
 
+proc0 = st.session_state.get("proc")
+proc0_alive = False
+try:
+    if proc0 is not None and getattr(proc0, "poll")() is None:
+        proc0_alive = True
+except Exception:
+    proc0_alive = False
+
+suite_proc0 = st.session_state.get("suite_proc")
+suite_proc0_alive = False
+try:
+    if suite_proc0 is not None and getattr(suite_proc0, "poll")() is None:
+        suite_proc0_alive = True
+except Exception:
+    suite_proc0_alive = False
+
 running_runs_global = _running_runs()
 running_suites_global = _running_suites()
-ui_locked_global = bool(running_runs_global or running_suites_global)
+ui_locked_global = bool(running_runs_global or running_suites_global or proc0_alive or suite_proc0_alive)
+
+try:
+    prev_suite_id0 = str(st.session_state.get("_prev_active_suite_id") or "").strip()
+    cur_suite_id0 = str(st.session_state.get("active_suite_id") or "").strip()
+    if cur_suite_id0 != prev_suite_id0:
+        st.session_state["_prev_active_suite_id"] = str(cur_suite_id0)
+        if cur_suite_id0:
+            st.session_state["active_run_id"] = ""
+            try:
+                p = _active_run_id_path()
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+except Exception:
+    pass
 
 if ui_locked_global:
     try:
@@ -2706,6 +2738,45 @@ if ui_locked_global:
             if ss0 and str(st.session_state.get("active_suite_id") or "").strip() != ss0:
                 st.session_state["active_suite_id"] = ss0
                 _write_active_suite_id(ss0)
+    except Exception:
+        pass
+
+active_run_id0 = str(st.session_state.get("active_run_id") or "").strip()
+active_suite_id0 = str(st.session_state.get("active_suite_id") or "").strip()
+suite_running0 = bool(running_suites_global or suite_proc0_alive)
+if active_suite_id0 and suite_running0:
+    cand = ""
+    try:
+        if running_runs_global:
+            cand = str(running_runs_global[0])
+        else:
+            cand = str(_read_active_run_id() or "").strip()
+    except Exception:
+        cand = ""
+
+    if cand:
+        try:
+            if not _paths_for_run(str(cand)).run_dir.exists():
+                cand = ""
+        except Exception:
+            cand = ""
+
+    if str(cand or "").strip() != active_run_id0:
+        st.session_state["active_run_id"] = str(cand or "").strip()
+        if str(cand or "").strip():
+            _write_active_run_id(str(cand))
+        else:
+            try:
+                p = _active_run_id_path()
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+if ui_locked_global:
+    try:
+        st.session_state["run_choice"] = str(st.session_state.get("active_run_id") or "").strip()
+        st.session_state["suite_choice"] = str(st.session_state.get("active_suite_id") or "").strip()
     except Exception:
         pass
 
@@ -2968,21 +3039,27 @@ with st.sidebar:
         active_run_id = str(st.session_state.get("active_run_id") or "").strip()
         any_running = bool(running_set)
         options = [""] + runs
+        if active_run_id and active_run_id not in options:
+            st.session_state["active_run_id"] = ""
+            active_run_id = ""
         idx = 0
         try:
             if active_run_id and active_run_id in options:
                 idx = int(options.index(active_run_id))
         except Exception:
             idx = 0
+
         sel_run = st.selectbox(
             "Select run",
             options=options,
             index=int(idx),
             format_func=lambda x: (str(x) + (" (running)" if str(x) in running_set else "")) if str(x) else "",
+            key="run_choice",
             disabled=ui_locked_global,
         )
         selected_run_id = str(sel_run or "").strip()
-        st.session_state["active_run_id"] = str(selected_run_id)
+        if not ui_locked_global:
+            st.session_state["active_run_id"] = str(selected_run_id)
         if selected_run_id:
             _write_active_run_id(str(selected_run_id))
         else:
@@ -3005,7 +3082,11 @@ with st.sidebar:
         selected_has_run = bool(selected_run_id)
         col_a, col_b, col_c = st.columns(3)
         start_clicked = col_a.button("Start new", use_container_width=True, disabled=bool(ui_locked_global or selected_has_run))
-        stop_clicked = col_b.button("Stop", use_container_width=True, disabled=bool((not any_running) or bool(running_suites_global)))
+        stop_clicked = col_b.button(
+            "Stop",
+            use_container_width=True,
+            disabled=bool((not any_running) or bool(running_suites_global) or bool(suite_proc0_alive)),
+        )
         resume_clicked = col_c.button(
             "Resume",
             use_container_width=True,
@@ -3016,9 +3097,16 @@ with st.sidebar:
         st.header("Suite")
         suites = _list_suites()
         suite_running_set = set(_running_suites())
+        suite_proc = st.session_state.get("suite_proc")
+        suite_proc_alive = False
+        try:
+            if suite_proc is not None and getattr(suite_proc, "poll")() is None:
+                suite_proc_alive = True
+        except Exception:
+            suite_proc_alive = False
         active_suite_id = str(st.session_state.get("active_suite_id") or "").strip()
-        any_suite_running = bool(suite_running_set)
-        selected_suite_running = bool(active_suite_id and active_suite_id in suite_running_set)
+        any_suite_running = bool(suite_running_set) or bool(suite_proc_alive)
+        selected_suite_running = bool(active_suite_id and (active_suite_id in suite_running_set or suite_proc_alive))
 
         suite_options = [""] + suites
         suite_idx = 0
@@ -3028,18 +3116,40 @@ with st.sidebar:
         except Exception:
             suite_idx = 0
 
+        if active_suite_id and active_suite_id not in suite_options:
+            st.session_state["active_suite_id"] = ""
+            active_suite_id = ""
+
         sel_suite = st.selectbox(
             "Select suite",
             options=suite_options,
             index=int(suite_idx),
             format_func=lambda x: (str(x) + (" (running)" if str(x) in suite_running_set else "")) if str(x) else "",
+            key="suite_choice",
             disabled=ui_locked_global,
         )
-        if sel_suite:
-            st.session_state["active_suite_id"] = str(sel_suite)
-            _write_active_suite_id(str(sel_suite))
-            active_suite_id = str(sel_suite)
-            selected_suite_running = bool(active_suite_id and active_suite_id in suite_running_set)
+        selected_suite_id = str(sel_suite or "").strip()
+        if not ui_locked_global:
+            st.session_state["active_suite_id"] = str(selected_suite_id)
+            if selected_suite_id:
+                st.session_state["active_run_id"] = ""
+                try:
+                    p = _active_run_id_path()
+                    if p.exists() and p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+
+        active_suite_id = str(st.session_state.get("active_suite_id") or "").strip()
+        if active_suite_id:
+            _write_active_suite_id(str(active_suite_id))
+        else:
+            try:
+                p = _active_suite_id_path()
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
 
         any_running_now = bool(set(_running_runs()))
         running_runs_now = _running_runs()
@@ -3121,8 +3231,16 @@ if stop_clicked:
     st.session_state["proc"] = None
 
 if stop_suite_clicked:
-    if active_suite_id:
-        sp = _paths_for_suite(active_suite_id)
+    sid0 = str(active_suite_id or "").strip()
+    if not sid0:
+        try:
+            rs = _running_suites()
+            sid0 = str(rs[0]) if rs else ""
+        except Exception:
+            sid0 = ""
+
+    if sid0:
+        sp = _paths_for_suite(sid0)
         _stop_suite(sp)
     running = _running_runs()
     if running:
@@ -3400,6 +3518,14 @@ if start_suite_clicked:
         env = dict(os.environ)
         st.session_state["suite_proc"] = _start_suite(sp, cmd=cmd, cwd=_repo_root(), env=env)
         suite_proc = st.session_state.get("suite_proc")
+        st.session_state["active_run_id"] = ""
+        try:
+            p = _active_run_id_path()
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception:
+            pass
+        st.rerun()
 
 if resume_suite_clicked:
     active_suite_id = str(st.session_state.get("active_suite_id") or "").strip()
@@ -3444,6 +3570,18 @@ if resume_suite_clicked:
             env = dict(os.environ)
             st.session_state["suite_proc"] = _start_suite(sp, cmd=cmd, cwd=_repo_root(), env=env)
             suite_proc = st.session_state.get("suite_proc")
+            st.session_state["active_run_id"] = ""
+            try:
+                p = _active_run_id_path()
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+            st.rerun()
+
+
+active_run_id = str(st.session_state.get("active_run_id") or "").strip()
+active_suite_id = str(st.session_state.get("active_suite_id") or "").strip()
 
 
 if (not active_run_id) and (not active_suite_id):
@@ -3464,12 +3602,6 @@ if (not active_run_id) and active_suite_id:
     cols0[2].metric("Suite dir", str(sp.suite_dir))
     running = _running_runs()
     cols0[3].metric("Running run", str(running[0]) if running else "—")
-
-    if running:
-        if st.button("Attach to running run", use_container_width=True, disabled=ui_locked_global):
-            st.session_state["active_run_id"] = str(running[0])
-            _write_active_run_id(str(running[0]))
-            st.rerun()
 
     st.subheader("Suite outputs")
     if sp.aggregate_csv_path.exists():

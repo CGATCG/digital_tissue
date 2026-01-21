@@ -1541,10 +1541,10 @@ _COST_MODEL_CENTS = {
 }
 
 _TESTS_CANCER_MODELS = {
-    "healthy": "healthy.json",
-    "cancer": "cancer.json",
-    "cell_culture_healthy": "cell_culture_healthy.json",
-    "cell_culture_cancer": "cell_culture_cancer.json",
+    "healthy": "healthy_organism.json",
+    "cancer": "cancer_organism.json",
+    "cell_culture_healthy": "healthy_cell_culture.json",
+    "cell_culture_cancer": "cancer_cell_culture.json",
 }
 
 _TESTS_HEREDITARY_DISEASE_MODELS = {
@@ -1555,8 +1555,8 @@ _TESTS_HEREDITARY_DISEASE_MODELS = {
 }
 
 _TESTS_AGING_MODELS = {
-    "healthy": "healthy.json",
-    "cell_culture": "cell_culture.json",
+    "healthy": "healthy_organism.json",
+    "cell_culture": "healthy_cell_culture.json",
 }
 
 def _tests_cancer_model_list() -> list[Dict[str, Any]]:
