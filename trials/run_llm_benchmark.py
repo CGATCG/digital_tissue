@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+from datetime import datetime, timezone
 import platform
 import re
 import secrets
@@ -51,6 +52,47 @@ _BENCH_PROVIDER = ""
 _BENCH_MODEL = ""
 _BENCH_PROMPT_TEXT = ""
 _BENCH_PROMPT_FILE = ""
+_BENCH_STEP: Optional[int] = None
+_BENCH_MAX_STEPS: Optional[int] = None
+
+
+def _llm_step_budget_enabled() -> bool:
+    v = str(os.environ.get("DT_LLM_STEP_BUDGET") or "").strip().lower()
+    if not v:
+        return True
+    return v in ("1", "true", "yes")
+
+
+def _llm_step_budget_text(*, step: Optional[int], max_steps: Optional[int]) -> str:
+    if not _llm_step_budget_enabled():
+        return ""
+    if step is None or max_steps is None:
+        return ""
+    try:
+        cur = int(step) + 1
+        tot = int(max_steps)
+    except Exception:
+        return ""
+    if tot <= 0:
+        return ""
+    cur = max(1, min(cur, tot))
+    remaining = max(0, tot - cur)
+    return (
+        f"STEP_BUDGET: This is step {cur} of {tot} ({remaining} remaining). "
+        "Plan accordingly so you can finish within the remaining steps."
+    )
+
+
+def _llm_messages_with_step_budget(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    txt = _llm_step_budget_text(step=_BENCH_STEP, max_steps=_BENCH_MAX_STEPS)
+    if not txt:
+        return messages
+    msgs: List[Dict[str, str]] = []
+    for m in (messages or []):
+        if isinstance(m, dict):
+            msgs.append(dict(m))
+    msgs.append({"role": "user", "content": str(txt)})
+    return msgs
 
 
 def _repo_root() -> Path:
@@ -88,36 +130,20 @@ _ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 _ANTHROPIC_ACTION_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ["call_api", "final"]},
+        "action": {"type": "string", "enum": ["call_api"]},
         "method": {"type": "string"},
         "path": {"type": "string"},
         "query": {"type": "object"},
         "body": {"type": "object"},
         "last_result_summary": {"type": "string"},
         "next_step_rationale": {"type": "string"},
-        "win": {"type": "boolean"},
-        "summary": {"type": "string"},
-        "key_findings": {"type": "array", "items": {"type": "string"}},
-        "proposed_interventions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "layer": {"type": "string"},
-                    "direction": {"type": "string"},
-                    "dose": {"type": "number"},
-                },
-                "required": ["layer", "direction", "dose"],
-                "additionalProperties": True,
-            },
-        },
     },
     "required": ["action"],
     "additionalProperties": True,
 }
 
 
-_ANTHROPIC_INPUT_TPM_LIMIT = 30_000
+_ANTHROPIC_INPUT_TPM_LIMIT = 450_000
 _ANTHROPIC_TPM_WINDOW_S = 60.0
 _ANTHROPIC_TPM_SAFETY_FRAC = 0.95
 _ANTHROPIC_TPM_USAGE: List[Tuple[float, int]] = []
@@ -469,6 +495,10 @@ def _openai_base_model_and_effort(model: str) -> Tuple[str, Optional[str]]:
         return "", None
     if m == "gpt-5.2":
         return "gpt-5.2", "medium"
+    if m == "gpt-5.2-none":
+        return "gpt-5.2", "none"
+    if m == "gpt-5.2-low":
+        return "gpt-5.2", "low"
     if m == "gpt-5.2-medium":
         return "gpt-5.2", "medium"
     if m == "gpt-5.2-high":
@@ -478,22 +508,27 @@ def _openai_base_model_and_effort(model: str) -> Tuple[str, Optional[str]]:
     return m, None
 
 
+def _xai_canonical_model(model: str) -> str:
+    m = str(model or "").strip()
+    if not m:
+        return ""
+    if m == "grok-4-1-fast":
+        return "grok-4-1-fast-reasoning"
+    return str(m)
+
+
 _PROMPT = r"""
 You are an autonomous agent being evaluated in a benchmark.
 
 You are playing a biology strategy game (a scientific puzzle).
 
 # 1) Story & biology (what’s being simulated)
-You are studying a novel organism with an unknown gut disease. Your job is to discover an effective treatment.
+You are studying a novel organism with an unknown internal disease. Your job is to discover an effective treatment.
 
 Important: you are NOT told what the disease is.
 - You must do your own R&D: form hypotheses, design experiments, and infer mechanisms from data.
 - This organism is NOT human and is poorly studied.
 - Molecular feature names are intentionally masked (e.g., “protein_7”), so you must reason from data, not from known biology.
-
-We know two key facts:
-- Healthy individuals can live up to ~300 days.
-- Diseased individuals have a median lifespan of ~150 days.
 
 In the simulator, time is measured in ticks (roughly days). Some endpoints report age_days, which is the same as ticks.
 
@@ -508,12 +543,11 @@ The claim_cure response includes:
 - lifespan_recovery_pct ("Lifespan Recovery"): treated_disease_median_tick / healthy_median_tick * 100
 - score: (extra_days / game.money_spent_usd) * 10000
 
-This means you should increase lifespan while keeping total money_spent in mind. You are allowed to run claim_cure even if you are not close to a "win" yet; early attempts are expected.
+Score is computed from lifespan improvement and money_spent. Use the returned fields (extra_days, lifespan_recovery_pct, score, win) as ground truth.
 
-Win is a ceiling condition (treatment reaches >=90% of healthy lifespan):
+Win is a ceiling condition computed server-side:
 - win: boolean
 - delta_median_ticks: treated_disease_median_tick - healthy_median_tick
-- win if lifespan_recovery_pct >= 90.0
 
 If win=true, the run will stop automatically (the disease cannot be improved beyond matching healthy controls).
 
@@ -531,24 +565,20 @@ A) Characterization
 - Note: death channels end with "_death" and are 0/1. For a replicate timecourse, the death time is the first day where any "*_death" becomes 1; later rows may be empty.
 
 B) Bulk omics (snapshots)
-- You can perform bulk transcriptomics, proteomics or metabolomics froms samples in cell culture or from the organisms gut.
-- It allows you to see the levels of RNA, protein or metabolites in cell culture or in vivo at a given timepoint with out without an intervention.
+- You can perform bulk transcriptomics, proteomics or metabolomics from samples in cell culture or from the organism.
+- It allows you to see the levels of RNA, protein or metabolites in cell culture or in vivo at a given timepoint with or without an intervention.
 - Purpose: identify signatures of diseased vs healthy or intervention vs control.
-- Use it to gain knowledge about how disease and healthy are different or how your intervention is affecting the organism or cells.
 - Output: CSV(s) (samples x features) plus metadata CSV describing samples/replicates/age_days.
 
 C) Spatial omics
-- You can perform spatial transcriptomics or spatial proteomics.
-- It provides a lot more detailed information than characterization experiments.
-- Identify where RNA or protein is localized in the tissue and how it changes between two conditions.
-- You can run it with or without an intervention to better understand how the intervention works.
+- You can perform spatial RNA or spatial protein.
+- Identify where features are localized in the tissue and how they change between two conditions.
+- You can run it with or without an intervention.
 - You can run it in cell culture or in vivo.
-- You can run disease or healthy.
-- Use it to gain knowledge about how disease and healthy are different.
 
 D) Protein perturbation screen (in vitro only)
 - Purpose: rapidly discover how altering protein activity changes cellular behavior.
-- Interpretation: do NOT treat higher confluency / n_cells / births_per_tick in cell_culture_disease as inherently “good” unless you have evidence that is good to solve the disease.
+- Interpretation: in vitro readouts like confluency / n_cells / births_per_tick are context-dependent. Do not assume “higher is better”; interpret them relative to controls and the stated objective.
 - This is an experiment in cells in culture, you cannot use it to derive specific outcomes for the in vivo study, it is just a cheaper way to do experiments to understand how cells behave under different perturbations
 
 E) Final validation (claim_cure)
@@ -560,26 +590,22 @@ An intervention is a list of protein-target perturbations. Each perturbation is 
 - direction: "up" or "down"
 - dose: a dose of 1 up increases protein activity by 10%, 10 up increases protein activity by 100%, etc. 10 down decreases activity by 100%, etc. each dose equals 10% change in activity. Dose has to be a positive integer.
 
-# 6) Recommended scientific loop
-1) Study the disease to have an idea of what is wrong.
-2) Generate hypotheses.
-3) Propose a small, interpretable experiments to test your hypotheses.
-4) Validate cheaply, then validate for real.
-5) Iterate.
+# 6) General guidance
+Use any experimental and analytic strategy you deem appropriate. The environment provides tools and costs but does not prescribe a particular workflow.
 
 # 7) Data handling: inventory + analysis (omics)
 Omics outputs are saved as files on the server. Prefer inventory + analysis over tiny inline previews.
 
 Inventory:
-GET /api/omics/inventory?player_id=...
+GET /api/omics/inventory
 
 To perform an analysis:
 1) Choose the file_id(s) for the data you want to analyze (typically counts matrices).
 2) Include the matching metadata file_id(s) shown in the mapping above. (For spatial: include BOTH run metadata and per-replicate cell_metadata when present.)
 3) Think of the instructions for the analysis you want to run. IMPORTANT: /api/omics/analyze is stateless (it has no memory of prior steps or goals), so your instructions must include the necessary context: what the selected files are, which groups/conditions to compare, and what question to answer.
-4) If you need more samples to run the analysis run more samples before asking for the analysis. For example if you asked for an experiment with cell_culture_disease, you might want to run the same experiment with cell_culture_healthy to get a control to compare to.
+4) If you need more samples to run the analysis, run more experiments before asking for analysis.
 5) Call POST /api/omics/analyze with JSON like:
-{"player_id":"<player_id>","file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}
+{"file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}
 
 6) You can use /api/omics/analyze to run any type of analysis on any type of file or metadata. or even just things you tell it. It is a coding agent that will run python to analyze anything in the way you tell it to.
 
@@ -588,19 +614,18 @@ You can ONLY interact with the world by calling these HTTP APIs.
 Base URL is provided by the harness.
 
 General rules (read this once and follow it every time):
-- You must pass player_id for any endpoint that takes it.
+- player_id is managed automatically by the harness/backstage for the duration of a run; omit it.
 - Use GET /api/tests/disease/models to learn valid model keys (e.g. healthy, disease, cell_culture_healthy, cell_culture_disease).
 - ticks is the study duration (roughly “days”). If you request too many ticks and the organism/culture dies earlier, the API can return an error telling you the death tick; reduce ticks or change the intervention.
 - replicates is the number of independent repeats (different random seeds). Cost scales roughly linearly with replicates.
 - interventions is a list of perturbations; an empty list means a baseline/control run.
 
 Cost model (you MUST manage budget):
-- Money spent is tracked server-side per player_id (see GET /api/game/state).
+- Money spent is tracked server-side per run (see GET /api/game/state).
 - Before running expensive studies, you can request a quote (exact price) with:
   - POST /api/tests/disease/estimate_cost
     body: {
-      "player_id":"...",
-      "experiment":"bulk_omics|spatial_tx|characterization|protein_screen|claim_cure",
+      "experiment":"bulk_omics|spatial_omics|characterization|protein_screen|claim_cure",
       "model":"...",
       "ticks":<int>,
       "replicates":<int>,
@@ -611,22 +636,22 @@ Cost model (you MUST manage budget):
   - Notes:
     - model is required for all experiments except claim_cure.
     - omics_set is required for bulk_omics.
-    - gene_set is required for spatial_tx.
+    - gene_set is required for spatial_omics.
     - claim_cure ignores ticks (it always uses a long study).
 - Rough unit cost per sample (in vivo). In vitro (cell_culture_*) is ~4x cheaper.
   - Bulk RNA (omics_set="rna/Bulk RNAseq"): ~$200 + $0.50*ticks + $20*(#interventions)
   - Bulk proteomics (omics_set="protein/Bulk Proteomics"): ~$800 + $0.50*ticks + $20*(#interventions)
   - Bulk metabolomics (omics_set="metabolite/targeted_metabolomics"): ~$500 + $0.50*ticks + $20*(#interventions)
-  - Spatial omics (spatial_tx): ~$2500 + $1.00*ticks + $40*(#interventions)
+  - Spatial omics (spatial_omics): ~$2500 + $1.00*ticks + $40*(#interventions)
   - Characterization: ~$3000 + $2.50*ticks + $80*(#interventions)
   - Protein screen (in vitro only): ~$7500 + $3.00*ticks + $80*(#interventions), but it runs many samples internally (roughly replicates*(#proteins+2)), so total cost can be very large.
   - claim_cure: very expensive; unit cost per sample is ~$10000 + $5.00*ticks + $100*(#interventions) with ticks fixed at ~400, and total samples = 2*replicates (healthy control + treated disease).
 
 Game / housekeeping:
 - GET /api/health
-- GET /api/game/state?player_id=...
+- GET /api/game/state
   - Use this to track money_spent and verify your budget is not exhausted.
-- POST /api/game/reset   body: {"player_id":"..."}
+- POST /api/game/reset   body: {}
   - Use sparingly; it resets your player state/budget.
 
 Discovery helpers (learn what you can target + what panels exist):
@@ -639,7 +664,7 @@ Discovery helpers (learn what you can target + what panels exist):
     - rna/Bulk RNAseq (104 RNA features)
     - protein/Bulk Proteomics (107 protein features)
     - metabolite/targeted_metabolomics (12 metabolites/toxins)
-- GET /api/spatial_tx/gene_sets
+- GET /api/spatial_omics/type
   - Returns available spatial panels (gene_set strings). Current panels include:
     - spatial transcriptomics (104 RNA features)
     - spatial proteomics (107 protein features)
@@ -648,7 +673,7 @@ Core experiments (what to call, what you get back, and how to use it):
 
 A) Characterization (biomarkers + timecourses)
 - POST /api/tests/disease/characterization
-  body: {"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"interventions":[...]}
+  body: {"model":"...","ticks":<int>,"replicates":<int>,"interventions":[...]}
 - What it is:
   - A general phenotype readout. In vivo: blood biomarkers + survival/lifespan-related signals. In vitro: cellular biomarkers.
 - What you use it for:
@@ -659,7 +684,7 @@ A) Characterization (biomarkers + timecourses)
 
 B) Bulk omics (snapshots: samples x features)
 - POST /api/tests/disease/bulk_omics
-  body: {"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"omics_set":"...","interventions":[...]}
+  body: {"model":"...","ticks":<int>,"replicates":<int>,"omics_set":"...","interventions":[...]}
 - How to choose omics_set:
   - RNA panel ("rna/Bulk RNAseq"): transcript abundance-like signals.
   - Protein panel ("protein/Bulk Proteomics"): protein abundance-like signals.
@@ -667,19 +692,17 @@ B) Bulk omics (snapshots: samples x features)
 - What it returns:
   - A counts/abundance matrix (one row per replicate sample) and a metadata table describing each row (model, replicate, sample_id, study duration, assay).
   - Large arrays are usually omitted from TOOL_RESULT; use the omics inventory message to retrieve saved CSV files.
-- How to use it well:
-  - Run matched comparisons at the same ticks:
-    - healthy vs disease (no interventions) to learn disease signatures.
-    - disease vs disease+intervention to learn intervention effects.
-  - Then use /api/omics/analyze on the saved files to rank features, compute fold-changes, and summarize patterns.
+- Interpretation notes:
+  - Use comparisons and controls appropriate to your question.
+  - Use /api/omics/analyze on saved files to compute summaries (e.g., fold-changes, feature rankings).
 
 C) Spatial omics (maps: per-spot features + coordinates)
-- POST /api/tests/disease/spatial_tx
-  body: {"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"gene_set":"...","interventions":[...]}
-- Spatial transcriptomics vs spatial proteomics (IMPORTANT):
+- POST /api/tests/disease/spatial_omics
+  body: {"model":"...","ticks":<int>,"replicates":<int>,"gene_set":"...","interventions":[...]}
+- Spatial RNA vs spatial protein:
   - This endpoint supports both. You choose the modality by choosing gene_set:
-    - gene_set="spatial transcriptomics" => RNA-like spatial panel
-    - gene_set="spatial proteomics" => protein-like spatial panel
+    - gene_set="spatial_rna" => RNA-like spatial panel
+    - gene_set="spatial_protein" => protein-like spatial panel
   - The returned metadata includes an assay label indicating which modality was run.
 - What it returns (conceptually):
   - A set of spatial “spots/cells”, each with:
@@ -701,20 +724,16 @@ C) Spatial omics (maps: per-spot features + coordinates)
 
 D) Protein perturbation screen (in vitro only; many targets)
 - POST /api/tests/disease/protein_screen   (in vitro models only)
-  body: {"player_id":"...","model":"cell_culture_*","ticks":<int>,"replicates":<int>,"direction":"up|down","dose":<int>,"interventions":[...]}
+  body: {"model":"cell_culture_*","ticks":<int>,"replicates":<int>,"direction":"up|down","dose":<int>,"interventions":[...]}
 - What it is:
   - A systematic screen that perturbs many masked proteins and measures cell phenotypes.
-- What you use it for:
-  - Rapidly generate candidate targets. Then validate the best candidates with in vivo characterization/bulk/spatial before attempting claim_cure.
+
 
 Win check (final validation):
 - POST /api/tests/disease/claim_cure
-  body: {"player_id":"...","replicates":<int>,"interventions":[...]}
+  body: {"replicates":<int>,"interventions":[...]}
 - What it does:
-  - Runs a head-to-head survival test. For disease challenges: healthy controls vs treated-disease. For aging: baseline healthy vs treated healthy.
-- What to do with the result:
-  - For disease challenges: use win (based on lifespan_recovery_pct) to decide whether you are allowed to output action="final".
-  - For aging: there is no win condition. Optimize score_lifedays_per_usd (and extra_days) and you may output action="final" at any time, but win must be false.
+  - Runs a head-to-head survival test used for scoring and win.
 
 # 9) Output format (BENCHMARK CRITICAL)
 You MUST respond with EXACTLY ONE JSON object per turn. No prose.
@@ -732,25 +751,15 @@ Choose ONE action:
   "next_step_rationale": "brief reason why you are making this API call and what you expect to learn"
 }
 
-2) Finish
-{
-  "action": "final",
-  "win": true|false,
-  "summary": "one paragraph summary of what you did",
-  "key_findings": ["...", "..."],
-  "proposed_interventions": [{"layer":"protein_1","direction":"up|down","dose":1.0}, ...]
-}
-
-Rules for finishing:
-- For challenges with win condition (cancer, hereditary_disease): only output action="final" if win=true (based on a recent claim_cure result), OR you have reached the step limit.
-- For aging: you may output action="final" at any time, but win must be false.
-- Your win field must match the last observed claim_cure win result. Do not guess.
-
 Tool execution semantics:
 - When you emit a call_api action, the harness will execute it and return a TOOL_RESULT message containing http_status and response_json/response_text.
 - Use those results; do NOT invent data.
 
-Now begin. Your budget is 5 million dollars but you can go into debt if needed so don't stop at 5 million. First, write a brief strategy for how you will solve the task (put it in next_step_rationale of your first JSON). Then your first API calls should usually be /api/health and /api/game/state.
+Stopping rules:
+- You cannot end the run explicitly.
+- The harness stops automatically when a claim_cure result reports win=true, or when the step limit is reached.
+
+Now begin. Budget is 5 million dollars; you may go into debt if needed.
 """.strip()
 
 _BENCH_PROMPT_TEXT = _PROMPT
@@ -867,6 +876,74 @@ def call_local_api(
         return ApiResult(http_status=0, response_json=None, response_text=str(e), seconds=time.time() - t0)
 
 
+def _is_safe_retry_request(method: str, path: str) -> bool:
+    m = str(method or "").strip().upper()
+    p = str(path or "").strip()
+    if m == "GET":
+        return True
+    if p == "/api/discuss" or p.startswith("/api/omics/"):
+        return True
+    if p.endswith("/estimate_cost"):
+        return True
+    return False
+
+
+def call_local_api_retrying(
+    *,
+    base_url: str,
+    method: str,
+    path: str,
+    query: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 900.0,
+    max_attempts: int = 3,
+) -> ApiResult:
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        timeout_eff = float(timeout_s)
+        try:
+            p0 = str(path or "").strip()
+            if p0 == "/api/discuss" or p0.startswith("/api/omics/"):
+                timeout_eff = min(float(timeout_eff), 900.0)
+        except Exception:
+            timeout_eff = float(timeout_s)
+
+        res = call_local_api(
+            base_url=base_url,
+            method=method,
+            path=path,
+            query=query,
+            body=body,
+            timeout_s=timeout_eff,
+        )
+        st = int(getattr(res, "http_status", 0) or 0)
+        if attempt >= (attempts - 1):
+            return res
+        if not _is_safe_retry_request(method=str(method), path=str(path)):
+            return res
+        if not (st == 0 or st == 429 or st == 503 or st >= 500):
+            return res
+
+        retry_after_s = None
+        try:
+            if isinstance(res.response_json, dict):
+                ra = res.response_json.get("retry_after_s")
+                if ra is not None:
+                    retry_after_s = float(ra)
+        except Exception:
+            retry_after_s = None
+
+        sleep_s = float(1.0 + 2.0 * float(attempt))
+        if retry_after_s is not None:
+            sleep_s = max(float(sleep_s), float(retry_after_s))
+        sleep_s = min(60.0, max(0.25, float(sleep_s)))
+        try:
+            time.sleep(float(sleep_s))
+        except Exception:
+            pass
+    return res
+
+
 def llm_generate(
     *,
     provider: str,
@@ -881,6 +958,7 @@ def llm_generate(
     if prov == "grok":
         prov = "xai"
     attempts = _llm_retry_attempts()
+    messages = _llm_messages_with_step_budget(list(messages or []))
     if prov in ("openai", "openai_compat"):
         from openai import OpenAI
 
@@ -1095,8 +1173,9 @@ def llm_generate(
         base_url = str(os.environ.get("XAI_BASE_URL") or "").strip() or "https://api.x.ai/v1"
 
         client = OpenAI(api_key=api_key, base_url=str(base_url))
+        model_call = _xai_canonical_model(str(model))
         req = {
-            "model": str(model),
+            "model": str(model_call),
             "messages": [{"role": str(m.get("role") or "user"), "content": str(m.get("content") or "")} for m in (messages or [])],
             "temperature": float(temperature),
             "timeout": float(timeout_s),
@@ -1167,6 +1246,285 @@ def _write_json_file(path: str, obj: Dict[str, Any]) -> None:
         f.write(json.dumps(obj, indent=2, ensure_ascii=False))
         f.write("\n")
     os.replace(tmp, p)
+
+
+def _write_json_any_file(path: str, obj: Any) -> None:
+    p = str(path or "").strip()
+    if not p:
+        return
+    out_dir = os.path.dirname(os.path.abspath(p))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=2, ensure_ascii=False))
+        f.write("\n")
+    os.replace(tmp, p)
+
+
+def _parse_first_json(text: str) -> Optional[Dict[str, Any]]:
+    s = str(text or "")
+    i0 = s.find("{")
+    if i0 < 0:
+        return None
+    i1 = s.rfind("}")
+    if i1 < 0 or i1 <= i0:
+        return None
+    try:
+        obj = json.loads(s[i0 : i1 + 1])
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _issues_from_text(*, text: str, source: str, max_items: int = 200) -> List[Dict[str, Any]]:
+    s = str(text or "")
+    if not s.strip():
+        return []
+    out: List[Dict[str, Any]] = []
+    pats: List[Tuple[str, str, str]] = [
+        (r"\btraceback\b", "error", "traceback"),
+        (r"\b(exception|assertionerror|runtimeerror|valueerror|typeerror|keyerror)\b", "error", "exception"),
+        (r"\b(llm_call_failed|http\s+\d{3})\b", "error", "llm_or_http_error"),
+        (r"\b(429|rate\s*limit|quota|retry[-\s]?after|retrydelay)\b", "warn", "rate_limit_or_retry"),
+        (r"\b(max[_\s]?tokens|max[_\s]?output[_\s]?tokens|stop_reason\s*[:=]\s*max_tokens)\b", "warn", "possible_truncation"),
+        (r"\b(timeout|timed\s*out)\b", "warn", "timeout"),
+    ]
+    for ln in s.splitlines():
+        if len(out) >= int(max_items):
+            break
+        line = str(ln or "")
+        if not line.strip():
+            continue
+        hit: Optional[Tuple[str, str]] = None
+        for pat, sev, kind in pats:
+            try:
+                if re.search(pat, line, flags=re.IGNORECASE):
+                    hit = (sev, kind)
+                    break
+            except Exception:
+                continue
+        if hit is None:
+            continue
+        sev, kind = hit
+        out.append(
+            {
+                "severity": str(sev),
+                "kind": str(kind),
+                "source": str(source),
+                "seq": None,
+                "ts": None,
+                "summary": line[:3200],
+                "details": line,
+            }
+        )
+    return out
+
+
+def _detect_issues_from_events_path(*, events_path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        if not (events_path.exists() and events_path.is_file()):
+            return []
+        with events_path.open("r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                s = str(ln or "").strip()
+                if not s:
+                    continue
+                try:
+                    ev = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                t = str(ev.get("type") or "")
+                seq = ev.get("seq")
+                ts = ev.get("ts")
+
+                if t == "llm_error":
+                    msg = str(ev.get("error") or "")
+                    out.append({"severity": "error", "kind": "llm_error", "source": "events", "seq": seq, "ts": ts, "summary": (msg[:3200] if msg else "llm_error"), "details": ev})
+                    continue
+
+                if t == "player_id_mismatch":
+                    details = ev.get("details") if isinstance(ev.get("details"), dict) else {}
+                    found = details.get("found")
+                    exp = details.get("expected")
+                    out.append({"severity": "warn", "kind": "player_id_mismatch", "source": "events", "seq": seq, "ts": ts, "summary": f"player_id mismatch (found={found} expected={exp})", "details": ev})
+                    continue
+
+                if t == "final_rejected":
+                    out.append({"severity": "warn", "kind": "final_rejected", "source": "events", "seq": seq, "ts": ts, "summary": "Final action was rejected (format/validation issue)", "details": ev})
+                    continue
+
+                if t == "llm":
+                    txt = str(ev.get("text") or "")
+                    obj = _parse_first_json(txt)
+                    if obj is None:
+                        out.append({"severity": "warn", "kind": "llm_malformed_output", "source": "events", "seq": seq, "ts": ts, "summary": "LLM output did not parse as JSON object", "details": txt[:12000]})
+                    else:
+                        act = str(obj.get("action") or "").strip().lower()
+                        if act and act not in ("call_api",):
+                            out.append({"severity": "warn", "kind": "llm_unexpected_action", "source": "events", "seq": seq, "ts": ts, "summary": f"Unexpected action='{act}'", "details": obj})
+                    continue
+
+                if t == "api":
+                    status = ev.get("http_status")
+                    path = str(ev.get("path") or "")
+                    method = str(ev.get("method") or "")
+                    seconds = ev.get("seconds")
+                    try:
+                        st_i = int(status)
+                    except Exception:
+                        st_i = None
+                    if st_i == 0:
+                        out.append({"severity": "warn", "kind": "api_unreachable", "source": "events", "seq": seq, "ts": ts, "summary": f"API {method} {path} failed (http_status=0)", "details": ev})
+                    if st_i is not None and st_i >= 400:
+                        sev = "error" if st_i >= 500 else "warn"
+                        kind = "api_rate_limited" if st_i == 429 else "api_http_error"
+                        out.append({"severity": sev, "kind": kind, "source": "events", "seq": seq, "ts": ts, "summary": f"API {method} {path} -> HTTP {st_i}", "details": ev})
+                    try:
+                        if seconds is not None and float(seconds) >= 120.0:
+                            out.append({"severity": "warn", "kind": "api_slow", "source": "events", "seq": seq, "ts": ts, "summary": f"Slow API call: {method} {path} ({float(seconds):.1f}s)", "details": ev})
+                    except Exception:
+                        pass
+                    continue
+
+                if t == "tool_result":
+                    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                    status = payload.get("http_status")
+                    path = str(ev.get("path") or payload.get("path") or "")
+                    try:
+                        st_i = int(status)
+                    except Exception:
+                        st_i = None
+                    if st_i == 0:
+                        out.append({"severity": "warn", "kind": "tool_unreachable", "source": "events", "seq": seq, "ts": ts, "summary": f"Tool result failed for {path} (http_status=0)", "details": ev})
+                    if st_i is not None and st_i >= 400:
+                        sev = "error" if st_i >= 500 else "warn"
+                        kind = "tool_rate_limited" if st_i == 429 else "tool_http_error"
+                        out.append({"severity": sev, "kind": kind, "source": "events", "seq": seq, "ts": ts, "summary": f"Tool result issue for {path} (HTTP {st_i})", "details": ev})
+                    continue
+    except Exception:
+        return out
+
+    def _sort_key(x: Dict[str, Any]) -> Tuple[int, float]:
+        seq0 = x.get("seq")
+        try:
+            s0 = int(seq0)
+        except Exception:
+            s0 = -1
+        ts0 = x.get("ts")
+        try:
+            t0 = float(ts0)
+        except Exception:
+            t0 = 0.0
+        return (s0, t0)
+
+    out.sort(key=_sort_key)
+    return out
+
+
+def _story_markdown_from_events_path(*, events_path: Path, max_steps: int = 300) -> str:
+    try:
+        if not (events_path.exists() and events_path.is_file()):
+            return ""
+    except Exception:
+        return ""
+
+    steps: List[Dict[str, Any]] = []
+    llm_errors: List[Dict[str, Any]] = []
+    final_rejected: List[Dict[str, Any]] = []
+    end_ev: Optional[Dict[str, Any]] = None
+
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                s = str(ln or "").strip()
+                if not s:
+                    continue
+                try:
+                    ev = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                t = str(ev.get("type") or "")
+                if t == "llm":
+                    try:
+                        step_i = int(ev.get("step") or 0)
+                    except Exception:
+                        step_i = 0
+                    if step_i > int(max_steps):
+                        continue
+                    lrs = ev.get("last_result_summary")
+                    nsr = ev.get("next_step_rationale")
+                    if not (isinstance(lrs, str) and lrs.strip()) and not (isinstance(nsr, str) and nsr.strip()):
+                        continue
+                    steps.append({"step": step_i, "seq": ev.get("seq"), "ts": ev.get("ts"), "last_result_summary": lrs, "next_step_rationale": nsr})
+                elif t == "llm_error":
+                    llm_errors.append({"seq": ev.get("seq"), "ts": ev.get("ts"), "error": ev.get("error")})
+                elif t == "final_rejected":
+                    final_rejected.append({"seq": ev.get("seq"), "ts": ev.get("ts"), "payload": ev.get("payload")})
+                elif t == "end":
+                    end_ev = ev
+    except Exception:
+        return ""
+
+    steps.sort(key=lambda x: int(x.get("step") or 0))
+
+    lines: List[str] = []
+    lines.append("# Run story")
+    lines.append("")
+
+    if steps:
+        for stp in steps:
+            lines.append(f"## Step {int(stp.get('step') or 0)}")
+            lines.append("")
+            lrs = stp.get("last_result_summary")
+            nsr = stp.get("next_step_rationale")
+            if isinstance(lrs, str) and lrs.strip():
+                lines.append("### Last result summary")
+                lines.append("")
+                lines.append(str(lrs).strip())
+                lines.append("")
+            if isinstance(nsr, str) and nsr.strip():
+                lines.append("### Next step rationale")
+                lines.append("")
+                lines.append(str(nsr).strip())
+                lines.append("")
+
+    if llm_errors:
+        lines.append("## LLM errors")
+        lines.append("")
+        for e in llm_errors[-50:]:
+            lines.append(f"- seq={e.get('seq')} {str(e.get('error') or '')[:6000]}")
+        lines.append("")
+
+    if final_rejected:
+        lines.append("## Final rejected")
+        lines.append("")
+        for e in final_rejected[-50:]:
+            lines.append(f"- seq={e.get('seq')} payload={json.dumps(e.get('payload'), ensure_ascii=False)[:4000]}")
+        lines.append("")
+
+    if isinstance(end_ev, dict):
+        lines.append("## End")
+        lines.append("")
+        try:
+            end_compact = dict(end_ev)
+            end_compact.pop("type", None)
+            end_compact.pop("ts", None)
+            end_compact.pop("seq", None)
+            lines.append("```json")
+            lines.append(json.dumps(end_compact, ensure_ascii=False, indent=2)[:12000])
+            lines.append("```")
+        except Exception:
+            pass
+        lines.append("")
+
+    out = "\n".join(lines).strip() + "\n"
+    return out if out.strip() else ""
 
 
 def _human_mode_dir(*, state_out: Optional[str], events_out: Optional[str], files_dir: Optional[str]) -> Optional[Path]:
@@ -1396,7 +1754,7 @@ def _measurement_timecourse_stats(
 
 def _is_in_vitro_model_key(model_key: Any) -> bool:
     s = str(model_key or "").strip()
-    return bool(s.startswith("cell_culture_"))
+    return bool(s == "cell_culture" or s.startswith("cell_culture_") or s.endswith("_cell_culture"))
 
 
 def _safe_file_filename(name: str) -> str:
@@ -1475,7 +1833,37 @@ def _write_event_line(fp: Optional[Any], event: Dict[str, Any]) -> None:
     if fp is None:
         return
     try:
-        fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+        ev = event
+        if not isinstance(ev, dict):
+            ev = {}
+
+        ts_s: Optional[float] = None
+        try:
+            v = ev.get("ts")
+            if v is not None:
+                ts_s = float(v)
+        except Exception:
+            ts_s = None
+        if ts_s is None:
+            ts_s = float(time.time())
+            try:
+                if "ts" not in ev:
+                    ev["ts"] = float(ts_s)
+            except Exception:
+                pass
+
+        try:
+            if "ts_ms" not in ev:
+                ev["ts_ms"] = int(round(float(ts_s) * 1000.0))
+        except Exception:
+            pass
+        try:
+            if "iso" not in ev:
+                ev["iso"] = datetime.fromtimestamp(float(ts_s), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            pass
+
+        fp.write(json.dumps(ev, ensure_ascii=False) + "\n")
         fp.flush()
     except Exception:
         pass
@@ -1543,6 +1931,25 @@ def _messages_to_summary_text(messages: List[Dict[str, str]], *, max_chars: int)
     return txt
 
 
+def _is_context_summary_message(m: Dict[str, str]) -> bool:
+    if not isinstance(m, dict):
+        return False
+    if str(m.get("role") or "") != "user":
+        return False
+    c = str(m.get("content") or "")
+    return c.lstrip().startswith("CONTEXT_SUMMARY_ENTRY:")
+
+
+def _extract_context_summary_text(content: str) -> str:
+    s = str(content or "")
+    while True:
+        s2 = s.lstrip()
+        if not s2.startswith("CONTEXT_SUMMARY_ENTRY:"):
+            break
+        s = s2[len("CONTEXT_SUMMARY_ENTRY:") :]
+    return str(s).strip()
+
+
 def _maybe_prune_messages_with_summary(
     *,
     messages: List[Dict[str, str]],
@@ -1598,10 +2005,74 @@ def _maybe_prune_messages_with_summary(
 
     msgs = list(messages or [])
     pin = list(pinned or [])
+    pin_len0 = int(len(pin))
     pin_ids = {id(x) for x in pin}
     msgs = [m for m in msgs if isinstance(m, dict)]
     if not msgs:
         return [], str(notebook or "")
+
+    summary_msg: Optional[Dict[str, str]] = None
+    rolling_summary = ""
+    summary_msgs: List[Dict[str, str]] = []
+    summary_texts: List[str] = []
+    for m in msgs:
+        if id(m) in pin_ids:
+            continue
+        if _is_context_summary_message(m):
+            summary_msgs.append(m)
+            summary_texts.append(_extract_context_summary_text(str(m.get("content") or "")))
+    if summary_msgs:
+        summary_msg = summary_msgs[-1]
+        try:
+            summary_msg["role"] = "user"
+        except Exception:
+            pass
+
+        if len(summary_texts) == 1:
+            rolling_summary = str(summary_texts[0] or "").strip()
+        else:
+            summaries_txt = "\n\n---\n\n".join([str(x or "").strip() for x in summary_texts if str(x or "").strip()])
+            summary_prompt0 = (
+                "Consolidate the following context summaries into ONE coherent rolling summary. Preserve all distinct facts, "
+                "decisions, hypotheses, experiment results (keep numbers), constraints/rules, and open questions. "
+                "Keep continuity and avoid duplication. Return plain text only.\n\n" + summaries_txt
+            )
+            merged = ""
+            try:
+                merged = llm_generate(
+                    provider=str(provider),
+                    model=str(model),
+                    messages=[
+                        _msg("system", "You maintain a rolling memory summary for continuity."),
+                        _msg("user", summary_prompt0),
+                    ],
+                    temperature=0.0,
+                    max_tokens=int(summary_out_tokens),
+                    timeout_s=float(llm_timeout_s),
+                    dump_path=None,
+                )
+            except Exception:
+                merged = ""
+            merged = str(merged or "").strip()
+            if merged:
+                rolling_summary = merged
+            else:
+                rolling_summary = "\n\n".join([str(x or "").strip() for x in summary_texts if str(x or "").strip()]).strip()
+
+        rm_ids0 = {id(x) for x in summary_msgs}
+        msgs = [m for m in msgs if id(m) not in rm_ids0]
+
+        if rolling_summary:
+            try:
+                summary_msg["content"] = "CONTEXT_SUMMARY_ENTRY: " + str(rolling_summary)
+            except Exception:
+                pass
+            try:
+                msgs.insert(int(pin_len0), summary_msg)
+            except Exception:
+                msgs.append(summary_msg)
+            pin.append(summary_msg)
+            pin_ids.add(id(summary_msg))
 
     est = _estimate_prompt_tokens(msgs)
     reserve = int(max(0, int(max_tokens_per_call)) + 1500)
@@ -1638,12 +2109,24 @@ def _maybe_prune_messages_with_summary(
             break
 
         chunk_txt = _messages_to_summary_text(chunk, max_chars=int(chunk_max_chars))
-        summary_prompt = (
-            "Summarize the following earlier conversation history into a compact context that preserves key facts, "
-            "decisions, hypotheses, experiment results (include numbers if present), constraints/rules, and open questions. "
-            "Be concise but do not omit critical details. Return plain text.\n\n"
-            + chunk_txt
-        )
+        prev_summary = str(rolling_summary or "").strip()
+        if prev_summary:
+            summary_prompt = (
+                "You maintain a single rolling context summary for an LLM agent. Update the existing summary by incorporating "
+                "the NEW EVENTS below. Preserve continuity and avoid duplication. Preserve key facts, decisions, hypotheses, "
+                "experiment results (include numbers), constraints/rules, and open questions. Return plain text only.\n\n"
+                "EXISTING SUMMARY:\n"
+                + prev_summary
+                + "\n\nNEW EVENTS:\n"
+                + chunk_txt
+            )
+        else:
+            summary_prompt = (
+                "Summarize the following earlier conversation history into a compact context that preserves key facts, "
+                "decisions, hypotheses, experiment results (include numbers if present), constraints/rules, and open questions. "
+                "Be concise but do not omit critical details. Return plain text.\n\n"
+                + chunk_txt
+            )
 
         summary_txt = ""
         try:
@@ -1661,9 +2144,22 @@ def _maybe_prune_messages_with_summary(
 
         summary_txt = str(summary_txt or "").strip()
         if summary_txt:
+            rolling_summary = str(summary_txt)
             nb_line = f"step={int(step)} context_summary={_llm_sanitize_text(summary_txt)[:240]}"
             notebook = _notebook_append(str(notebook or ""), nb_line)
-            msgs.append(_msg("user", "CONTEXT_SUMMARY_ENTRY: " + summary_txt))
+            if summary_msg is None:
+                summary_msg = _msg("user", "CONTEXT_SUMMARY_ENTRY: " + summary_txt)
+                try:
+                    msgs.insert(int(pin_len0), summary_msg)
+                except Exception:
+                    msgs.append(summary_msg)
+                pin.append(summary_msg)
+                pin_ids.add(id(summary_msg))
+            else:
+                try:
+                    summary_msg["content"] = "CONTEXT_SUMMARY_ENTRY: " + summary_txt
+                except Exception:
+                    pass
 
         rm_ids = {id(x) for x in chunk}
         kept: List[Dict[str, str]] = []
@@ -1764,17 +2260,6 @@ def _action_has_required_fields(action: Dict[str, Any]) -> bool:
         if not isinstance(action.get("next_step_rationale"), str):
             return False
         return True
-    if act == "final":
-        if not isinstance(action.get("win"), bool):
-            return False
-        if not isinstance(action.get("summary"), str) or not str(action.get("summary") or "").strip():
-            return False
-        kf = action.get("key_findings")
-        if not isinstance(kf, list) or any((not isinstance(x, str)) for x in kf):
-            return False
-        if not isinstance(action.get("proposed_interventions"), list):
-            return False
-        return True
     return False
 
 
@@ -1796,10 +2281,10 @@ def _repair_action_json_with_llm(
         "Your previous assistant message was malformed or incomplete JSON. "
         "Return exactly one valid JSON object matching the Action schema. "
         "Do not use markdown fences. Do not add extra text.\n\n"
-        "If action=call_api, you must include: action, method, path, query (object), body (object), "
-        "last_result_summary (string), next_step_rationale (string).\n"
-        "If action=final, you must include: action, win (boolean), summary (string), key_findings (array of strings), "
-        "proposed_interventions (array).\n\n"
+
+        "You must output action=call_api and include: action, method, path, query (object), body (object), "
+        "last_result_summary (string), next_step_rationale (string).\n\n"
+
         "Malformed message to fix:\n"
         + bad0
     )
@@ -1891,7 +2376,7 @@ def _llm_tool_result_compact(
         advice = llm_json.get("advice")
         if isinstance(advice, str) and advice.strip():
             out2["advice"] = str(advice).strip()[:4000]
-        out2["note"] = "Advisor returned concise scientific guidance. Use it to decide the next cheapest disambiguating experiments or next intervention to try."
+        out2["note"] = "Advisor returned concise scientific guidance. This endpoint is optional."
         return out2
 
     if path == "/api/bulk_omics/sets":
@@ -1905,15 +2390,16 @@ def _llm_tool_result_compact(
             "note": "Use one of these omics_set strings when calling POST /api/tests/disease/bulk_omics.",
         }
 
-    if path == "/api/spatial_tx/gene_sets":
-        gs0 = llm_json.get("gene_sets")
+    if path in ("/api/spatial_tx/gene_sets", "/api/spatial_omics/type"):
+        gs0 = llm_json.get("types") if path == "/api/spatial_omics/type" else llm_json.get("gene_sets")
         gs_out: List[str] = []
         if isinstance(gs0, list):
             gs_out = [str(x) for x in gs0 if str(x).strip()]
+        key = "types" if path == "/api/spatial_omics/type" else "gene_sets"
         return {
             "ok": bool(llm_json.get("ok") is True),
-            "gene_sets": gs_out,
-            "note": "Use one of these gene_set strings when calling POST /api/tests/disease/spatial_tx.",
+            str(key): gs_out,
+            "note": "Use one of these type strings as gene_set when calling POST /api/tests/disease/spatial_omics.",
         }
 
     if path in ("/api/tests/cancer/models", "/api/tests/hereditary_disease/models", "/api/tests/aging/models"):
@@ -1921,13 +2407,18 @@ def _llm_tool_result_compact(
         models: Dict[str, str] = {}
 
         desc = {
-            "healthy": "This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is a healthy organism, the baseline.",
-            "cell_culture_healthy": "Gut-derived cells from a healthy organism. Use this as a selectivity reference to check whether an intervention is harming healthy cells (e.g., lower confluency/n_cells or higher deaths/damage).",
-            "cell_culture": "Gut-derived cells from a healthy organism. Use this for fast in-vitro screening and toxicity checks.",
-            "cancer": "This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is an organism in the early stages of developing the disease and will eventually develop it.",
-            "cell_culture_cancer": "Gut-derived cells from an organism with the disease (a fast in-vitro proxy). In screens, prefer interventions that selectively reduce growth/viability in this disease-like culture (lower confluency/n_cells/births, higher deaths/damage) compared to cell_culture_healthy.",
-            "disease": "This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is an organism in the early stages of developing the disease and will eventually develop it.",
-            "cell_culture_disease": "Gut-derived cells from an organism with the disease (a fast in-vitro proxy). In screens, prefer interventions that selectively reduce growth/viability in this disease-like culture (lower confluency/n_cells/births, higher deaths/damage) compared to cell_culture_healthy.",
+            "healthy_organism": "Whole organism (healthy baseline).",
+            "healthy_cell_culture": "Cell culture derived from a healthy organism.",
+            "cell_culture": "Cell culture derived from a healthy organism.",
+            "cancer_organism": "Whole organism (diseased condition).",
+            "cancer_cell_culture": "Cell culture derived from a diseased organism.",
+
+            "healthy": "Whole organism (healthy baseline).",
+            "cell_culture_healthy": "Cell culture derived from a healthy organism.",
+            "cancer": "Whole organism (diseased condition).",
+            "cell_culture_cancer": "Cell culture derived from a diseased organism.",
+            "disease": "Whole organism (diseased condition).",
+            "cell_culture_disease": "Cell culture derived from a diseased organism.",
         }
 
         if isinstance(models0, list):
@@ -2025,6 +2516,14 @@ def _llm_tool_result_compact(
             for ent in dsets0[:40]:
                 if not isinstance(ent, dict):
                     continue
+
+                file_ids0 = ent.get("file_ids")
+                data_ids0 = ent.get("data_file_ids")
+                meta_ids0 = ent.get("metadata_file_ids")
+                file_ids_n = int(len(file_ids0)) if isinstance(file_ids0, list) else None
+                data_file_ids_n = int(len(data_ids0)) if isinstance(data_ids0, list) else None
+                metadata_file_ids_n = int(len(meta_ids0)) if isinstance(meta_ids0, list) else None
+
                 dsets_out.append(
                     {
                         "display_name": ent.get("display_name"),
@@ -2036,6 +2535,9 @@ def _llm_tool_result_compact(
                         "replicates": ent.get("replicates"),
                         "omics_set": ent.get("omics_set"),
                         "gene_set": ent.get("gene_set"),
+                        "file_ids_n": file_ids_n,
+                        "data_file_ids_n": data_file_ids_n,
+                        "metadata_file_ids_n": metadata_file_ids_n,
                     }
                 )
             if dsets_out:
@@ -2043,7 +2545,7 @@ def _llm_tool_result_compact(
             if len(dsets0) > 40:
                 inv_out["more_datasets"] = int(len(dsets0) - 40)
 
-        inv_out["note"] = "Use file_id with GET /api/omics/file (query: player_id, file_id). Then run POST /api/omics/analyze with file_ids + instructions."
+        inv_out["note"] = "Use file_id with GET /api/omics/file (query: player_id, file_id). For older datasets, use run_id with GET /api/omics/run to see file_ids, then analyze via POST /api/omics/analyze with file_ids + instructions."
         return inv_out
 
     if path in ("/api/tests/cancer/estimate_cost", "/api/tests/hereditary_disease/estimate_cost", "/api/tests/aging/estimate_cost"):
@@ -2070,9 +2572,31 @@ def _llm_tool_result_compact(
         if "run_id" in llm_json:
             out["run_id"] = llm_json.get("run_id")
 
+        diag0 = llm_json.get("analysis_diagnostics")
+        if isinstance(diag0, dict):
+            hits0 = diag0.get("error_hits")
+            hits_out: List[Dict[str, Any]] = []
+            if isinstance(hits0, list):
+                for ent in hits0[:6]:
+                    if not isinstance(ent, dict):
+                        continue
+                    txt0 = ent.get("text")
+                    if isinstance(txt0, str) and len(txt0) > 800:
+                        txt0 = txt0[:800]
+                    hits_out.append({"kind": ent.get("kind"), "text": txt0})
+            out["analysis_diagnostics"] = {
+                "ok": bool(diag0.get("ok") is True),
+                "has_code_execution_errors": bool(diag0.get("has_code_execution_errors") is True),
+                "error_hit_count": diag0.get("error_hit_count"),
+                "error_hits": hits_out,
+            }
+
         ot = llm_json.get("output_text")
         if isinstance(ot, str) and ot.strip():
-            out["output_text"] = ot
+            ot2 = str(ot)
+            out["output_text_chars"] = int(len(ot2))
+            out["output_text"] = ot2
+            out["output_text_truncated"] = False
 
         used = llm_json.get("files")
         if isinstance(used, list) and used:
@@ -2103,7 +2627,7 @@ def _llm_tool_result_compact(
             if isinstance(resp_dump, dict):
                 out["response"] = resp_dump
 
-        out["note"] = "Analysis response from code interpreter. output_text contains the full text answer."
+        out["note"] = "Analysis response from code interpreter."
         return out
 
     if path in ("/api/tests/cancer/bulk_omics", "/api/tests/hereditary_disease/bulk_omics", "/api/tests/aging/bulk_omics"):
@@ -2214,14 +2738,34 @@ def _llm_tool_result_compact(
     return out
 
 
-_CANCER_WORD_RE = re.compile(r"cancer", re.IGNORECASE)
-_CANCEROUS_WORD_RE = re.compile(r"cancerous", re.IGNORECASE)
+_CANCER_WORD_RE = re.compile(r"\bcancer\b", re.IGNORECASE)
+_CANCEROUS_WORD_RE = re.compile(r"\bcancerous\b", re.IGNORECASE)
 
 
 def _llm_sanitize_text(s: str) -> str:
     t = str(s or "")
     if not t:
         return ""
+    t = t.replace("SAFETY_CHECK_TYPE_BIO", "SAFETY_CHECK")
+    t = t.replace("hereditary_disease", "disease")
+    t = t.replace("tests/hereditary_disease", "tests/disease")
+    t = t.replace("tests_hereditary_disease", "tests_disease")
+    t = t.replace("/hereditary_disease", "/disease")
+    t = re.sub(r"\baging\b", "disease", t, flags=re.IGNORECASE)
+    t = t.replace("spatial transcriptomics", "spatial_rna")
+    t = t.replace("spatial proteomics", "spatial_protein")
+    t = t.replace("Spatial transcriptomics", "Spatial RNA")
+    t = t.replace("Spatial proteomics", "Spatial protein")
+    t = t.replace("tests_cancer_", "tests_disease_")
+    t = t.replace("tests_hereditary_disease_", "tests_disease_")
+    t = t.replace("tests_aging_", "tests_disease_")
+    t = t.replace("healthy_organism", "healthy")
+    t = t.replace("cancer_organism", "disease")
+    t = t.replace("healthy_cell_culture", "cell_culture_healthy")
+    t = t.replace("cancer_cell_culture", "cell_culture_disease")
+    t = t.replace("cell_culture_cancer", "cell_culture_disease")
+    t = t.replace("/api/spatial_tx/gene_sets", "/api/spatial_omics/type")
+    t = t.replace("/api/tests/cancer/spatial_tx", "/api/tests/disease/spatial_omics")
     t = t.replace("/api/tests/cancer/", "/api/tests/disease/")
     t = t.replace("/api/tests/cancer", "/api/tests/disease")
     t = t.replace("/api/tests/hereditary_disease/", "/api/tests/disease/")
@@ -2277,10 +2821,32 @@ def _llm_body_to_server(server_path: str, body: Any) -> Optional[Dict[str, Any]]
     return out
 
 
+def _llm_query_to_server(server_path: str, query: Any) -> Optional[Dict[str, Any]]:
+    if query is None:
+        out: Dict[str, Any] = {}
+    else:
+        if not isinstance(query, dict):
+            return None
+        out = dict(query)
+
+    pid = str(out.get("player_id") or "").strip()
+    if not pid:
+        pid2 = str(_BENCH_PLAYER_ID or "").strip()
+        if pid2:
+            out["player_id"] = pid2
+
+    if server_path.startswith("/api/tests/") and ("model" in out):
+        out["model"] = _llm_model_key_to_server(out.get("model"))
+
+    return out if out else None
+
+
 def _server_path_to_llm(path: str) -> str:
     p = str(path or "").strip()
     if not p:
         return p
+    if p.endswith("/spatial_tx"):
+        return _llm_sanitize_text(p[: -len("/spatial_tx")] + "/spatial_omics")
     if p.startswith("/api/tests/cancer/"):
         return "/api/tests/disease/" + p[len("/api/tests/cancer/") :]
     if p.startswith("/api/tests/hereditary_disease/"):
@@ -2301,15 +2867,39 @@ def _llm_model_key_to_server(model_key: Any) -> str:
     if not s:
         return ""
     if _normalize_challenge(_BENCH_CHALLENGE) == "cancer":
+        if s == "healthy":
+            return "healthy_organism"
+        if s == "cancer" or s == "disease":
+            return "cancer_organism"
+        if s == "cell_culture_healthy":
+            return "healthy_cell_culture"
+        if s == "cell_culture_cancer" or s == "cell_culture_disease":
+            return "cancer_cell_culture"
         if s == "disease":
-            return "cancer"
+            return "cancer_organism"
         if s == "cell_culture_disease":
-            return "cell_culture_cancer"
+            return "cancer_cell_culture"
     return s
 
 
 def _llm_model_key_to_llm(model_key: Any) -> str:
-    return _llm_sanitize_text(str(model_key or "").strip())
+    s = str(model_key or "").strip()
+    if not s:
+        return ""
+    if _normalize_challenge(_BENCH_CHALLENGE) == "cancer":
+        if s == "healthy_organism":
+            return "healthy"
+        if s == "cancer_organism":
+            return "disease"
+        if s == "healthy_cell_culture":
+            return "cell_culture_healthy"
+        if s == "cancer_cell_culture":
+            return "cell_culture_disease"
+        if s == "cancer":
+            return "disease"
+        if s == "cell_culture_cancer":
+            return "cell_culture_disease"
+    return _llm_sanitize_text(s)
 
 
 def _llm_translate_response_obj(obj: Any) -> Any:
@@ -2356,16 +2946,19 @@ def _is_experiment_path(path: str) -> bool:
     return p in (
         "/api/tests/cancer/bulk_omics",
         "/api/tests/cancer/spatial_tx",
+        "/api/tests/cancer/spatial_omics",
         "/api/tests/cancer/characterization",
         "/api/tests/cancer/protein_screen",
         "/api/tests/cancer/claim_cure",
         "/api/tests/hereditary_disease/bulk_omics",
         "/api/tests/hereditary_disease/spatial_tx",
+        "/api/tests/hereditary_disease/spatial_omics",
         "/api/tests/hereditary_disease/characterization",
         "/api/tests/hereditary_disease/protein_screen",
         "/api/tests/hereditary_disease/claim_cure",
         "/api/tests/aging/bulk_omics",
         "/api/tests/aging/spatial_tx",
+        "/api/tests/aging/spatial_omics",
         "/api/tests/aging/characterization",
         "/api/tests/aging/protein_screen",
         "/api/tests/aging/claim_cure",
@@ -2402,9 +2995,14 @@ def run_benchmark(
         if isinstance(loaded_state, dict) and loaded_state.get("ok") is True:
             resumed = True
 
+    ch = _normalize_challenge(challenge)
+
     prompt_text = _PROMPT
     prompt_file_used = ""
     pf_arg = str(prompt_file or "").strip()
+    if (not pf_arg) and (not resumed):
+        if str(ch) == "aging":
+            pf_arg = "aging.txt"
     if resumed and isinstance(loaded_state, dict):
         st_pf = loaded_state.get("prompt_file")
         if isinstance(st_pf, str) and st_pf.strip():
@@ -2434,7 +3032,6 @@ def run_benchmark(
     global _BENCH_PROMPT_FILE
     _BENCH_PROMPT_FILE = str(prompt_file_used or "")
 
-    ch = _normalize_challenge(challenge)
     global _BENCH_CHALLENGE
     _BENCH_CHALLENGE = str(ch)
 
@@ -2574,11 +3171,11 @@ def run_benchmark(
 
         if not messages:
             messages.append(_msg("system", prompt_text))
-            messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
+            messages.append(_msg("user", f"Harness info: base_url={base_url}"))
             notebook_msg = _msg("user", "LAB_NOTEBOOK:")
             messages.append(notebook_msg)
             if notebook.strip():
-                messages.append(_msg("user", "LAB_NOTEBOOK_SNAPSHOT:\n" + notebook))
+                messages.append(_msg("user", notebook.strip()))
         else:
             if len(messages) >= 3 and str(messages[2].get("role")) == "user" and str(messages[2].get("content") or "").startswith("LAB_NOTEBOOK:"):
                 notebook_msg = messages[2]
@@ -2598,7 +3195,7 @@ def run_benchmark(
                     "user",
                     "HUMAN_EXECUTOR_MODE: You are an API executor in human-in-the-loop mode. "
                     "The human provides directives in messages starting with 'HUMAN_DIRECTIVE:'. "
-                    "Your job is to translate the latest directive into exactly one valid Action JSON object (call_api or final) "
+                    "Your job is to translate the latest directive into exactly one valid Action JSON object (call_api) "
                     "matching the schema in the system prompt. Do not add extra strategy beyond the directive. "
                     "If the directive is ambiguous, make one low-cost clarifying API call (e.g., GET /api/game/state or GET /api/tests/disease/proteins).",
                 )
@@ -2613,7 +3210,7 @@ def run_benchmark(
         metrics = BenchMetrics(start_ts=time.time())
         # Use a system message for OpenAI-compatible providers.
         messages.append(_msg("system", prompt_text))
-        messages.append(_msg("user", f"Harness info: base_url={base_url} player_id={player_id}"))
+        messages.append(_msg("user", f"Harness info: base_url={base_url}"))
 
         notebook_msg = _msg("user", "LAB_NOTEBOOK:")
         messages.append(notebook_msg)
@@ -2623,7 +3220,7 @@ def run_benchmark(
                 "user",
                 "HUMAN_EXECUTOR_MODE: You are an API executor in human-in-the-loop mode. "
                 "The human provides directives in messages starting with 'HUMAN_DIRECTIVE:'. "
-                "Your job is to translate the latest directive into exactly one valid Action JSON object (call_api or final) "
+                "Your job is to translate the latest directive into exactly one valid Action JSON object (call_api) "
                 "matching the schema in the system prompt. Do not add extra strategy beyond the directive. "
                 "If the directive is ambiguous, make one low-cost clarifying API call (e.g., GET /api/game/state or GET /api/tests/disease/proteins).",
             )
@@ -2721,6 +3318,10 @@ def run_benchmark(
         )
 
     for step in range(int(step_start), int(max_steps)):
+        global _BENCH_STEP
+        global _BENCH_MAX_STEPS
+        _BENCH_STEP = int(step)
+        _BENCH_MAX_STEPS = int(max_steps)
         dump_path: Optional[str] = None
         try:
             if isinstance(llm_payload_dir, Path):
@@ -2730,6 +3331,23 @@ def run_benchmark(
 
         used_provider = str(provider)
         used_model = str(model)
+
+        if int(step) == (int(max_steps) - 1):
+            note = (
+                "FINAL_STEP_NOTICE: This is your last move. You must make exactly one final best-guess attempt by calling "
+                "POST /api/tests/disease/claim_cure. Do not call any other endpoints."
+            )
+            try:
+                already = any(
+                    isinstance(m, dict)
+                    and str(m.get("role") or "") == "user"
+                    and str(m.get("content") or "").startswith("FINAL_STEP_NOTICE:")
+                    for m in (messages or [])
+                )
+            except Exception:
+                already = False
+            if not already:
+                messages.append(_msg("user", note))
         human_in = None
         if human_mode and isinstance(human_dir, Path):
             seq += 1
@@ -2895,144 +3513,11 @@ def run_benchmark(
             continue
 
         act = str(action.get("action") or "").strip().lower()
-        if act == "final":
-            if not isinstance(action.get("win"), bool):
-                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: missing win (boolean).\"}"))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
-                continue
-
-            if not isinstance(action.get("summary"), str) or not str(action.get("summary") or "").strip():
-                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: missing summary (string).\"}"))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
-                continue
-
-            kf = action.get("key_findings")
-            if not isinstance(kf, list) or any((not isinstance(x, str)) for x in kf):
-                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: key_findings must be an array of strings.\"}"))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
-                continue
-
-            pis = action.get("proposed_interventions")
-            if not isinstance(pis, list):
-                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_INVALID: proposed_interventions must be an array.\"}"))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
-                continue
-            bad_pi = False
-            for it in pis:
-                if not isinstance(it, dict):
-                    bad_pi = True
-                    break
-                if not isinstance(it.get("layer"), str) or not isinstance(it.get("direction"), str):
-                    bad_pi = True
-                    break
-                try:
-                    float(it.get("dose"))
-                except Exception:
-                    bad_pi = True
-                    break
-            if bad_pi:
-                messages.append(
-                    _msg(
-                        "user",
-                        "TOOL_RESULT: {\"error\": \"FINAL_INVALID: proposed_interventions items must include layer (string), direction (string), and dose (number).\"}",
-                    )
-                )
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
-                continue
-
-            proposed_win = bool(action.get("win") is True)
-            if str(ch) == "aging":
-                if proposed_win:
-                    msg = (
-                        "TOOL_RESULT: {\"error\": "
-                        "\"FINAL_INVALID: aging challenge has no win condition, so final.win must be false.\"}"
-                    )
-                    messages.append(_msg("user", msg))
-                    transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                    seq += 1
-                    _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final_rejected", "step": int(step), "payload": action})
-                    continue
-
-                transcript.append({"type": "final", "payload": action})
-                seq += 1
-                _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final", "payload": action})
-                break
-
-            if bool(metrics.win) and (not proposed_win):
-                msg = (
-                    "TOOL_RESULT: {\"error\": "
-                    "\"FINAL_INVALID: claim_cure indicated win=true, so final.win must be true as well.\"}"
-                )
-                messages.append(_msg("user", msg))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(
-                    events_fp,
-                    {
-                        "seq": seq,
-                        "ts": time.time(),
-                        "type": "final_rejected",
-                        "step": int(step),
-                        "payload": action,
-                    },
-                )
-                continue
-            if (not bool(metrics.win)) and proposed_win:
-                msg = (
-                    "TOOL_RESULT: {\"error\": "
-                    "\"FINAL_INVALID: you cannot claim win=true unless claim_cure returned win=true.\"}"
-                )
-                messages.append(_msg("user", msg))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(
-                    events_fp,
-                    {
-                        "seq": seq,
-                        "ts": time.time(),
-                        "type": "final_rejected",
-                        "step": int(step),
-                        "payload": action,
-                    },
-                )
-                continue
-            if (not bool(metrics.win)) and (int(step) < int(max_steps) - 1):
-                msg = (
-                    "TOOL_RESULT: {\"error\": "
-                    "\"FINAL_NOT_ALLOWED_YET: win=false. Continue using call_api to gather more evidence and try additional interventions.\"}"
-                )
-                messages.append(_msg("user", msg))
-                transcript.append({"type": "final_rejected", "step": int(step), "payload": action})
-                seq += 1
-                _write_event_line(
-                    events_fp,
-                    {
-                        "seq": seq,
-                        "ts": time.time(),
-                        "type": "final_rejected",
-                        "step": int(step),
-                        "payload": action,
-                    },
-                )
-                continue
-
-            transcript.append({"type": "final", "payload": action})
-            seq += 1
-            _write_event_line(events_fp, {"seq": seq, "ts": time.time(), "type": "final", "payload": action})
-            break
-
         if act != "call_api":
-            messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"Unknown action. Use call_api or final.\"}"))
+            if act == "final":
+                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"FINAL_ACTION_NOT_SUPPORTED: do not output action=final. The harness stops automatically on win=true or step limit. Use call_api.\"}"))
+            else:
+                messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"Unknown action. Use call_api.\"}"))
             continue
 
         lrs = action.get("last_result_summary")
@@ -3055,6 +3540,10 @@ def run_benchmark(
         query = action.get("query") if isinstance(action.get("query"), dict) else None
         body = action.get("body") if isinstance(action.get("body"), dict) else None
 
+        if llm_path == "/api/game/state" and method != "GET":
+            messages.append(_msg("user", "TOOL_RESULT: {\"error\": \"/api/game/state must be called with method=GET.\"}"))
+            continue
+
         if llm_path in ("/api/tests/disease/protein_layers", "/api/tests/cancer/protein_layers"):
             messages.append(
                 _msg(
@@ -3067,9 +3556,19 @@ def run_benchmark(
 
         server_path = _llm_path_to_server(llm_path)
         body = _llm_body_to_server(server_path, body)
-        if isinstance(query, dict) and "model" in query:
-            query = dict(query)
-            query["model"] = _llm_model_key_to_server(query.get("model"))
+        query = _llm_query_to_server(server_path, query)
+
+        if method == "POST":
+            if isinstance(query, dict) and query:
+                if body is None:
+                    body = {}
+                try:
+                    for k, v in query.items():
+                        if k not in body:
+                            body[k] = v
+                except Exception:
+                    pass
+            query = None
 
         expected_pid = str(player_id or "").strip()
         pid_mismatch: Optional[Dict[str, Any]] = None
@@ -3134,14 +3633,16 @@ def run_benchmark(
         metrics.api_calls += 1
         if _is_experiment_path(server_path):
             metrics.experiment_calls += 1
-        res = call_local_api(
+        res = call_local_api_retrying(
             base_url=base_url,
             method=method,
             path=server_path,
             query=query,
             body=body,
             timeout_s=api_timeout_s,
+            max_attempts=3,
         )
+
 
         # Track experiments and win if claim_cure was called.
         if res.response_json and isinstance(res.response_json, dict):
@@ -3232,27 +3733,24 @@ def run_benchmark(
             },
         )
 
-        llm_json = _llm_response_json(server_path, res.response_json)
-        if isinstance(llm_json, dict):
-            if server_path in ("/api/tests/cancer/bulk_omics", "/api/tests/hereditary_disease/bulk_omics", "/api/tests/aging/bulk_omics"):
-                llm_json.pop("matrix_noisy_csv", None)
-                llm_json.pop("metadata_csv", None)
-            if server_path in ("/api/tests/cancer/spatial_tx", "/api/tests/hereditary_disease/spatial_tx", "/api/tests/aging/spatial_tx"):
-                llm_json.pop("matrix_noisy_csv", None)
-                llm_json.pop("metadata_csv", None)
-
-        compact = _llm_tool_result_compact(server_path, llm_json if isinstance(llm_json, dict) else None, omics_state=omics_state)
-        try:
-            nb_line = f"step={int(step)} path={_server_path_to_llm(server_path)} result={json.dumps(compact, ensure_ascii=False)[:700]}"
-        except Exception:
-            nb_line = f"step={int(step)} path={_server_path_to_llm(server_path)}"
-        notebook = _notebook_append(notebook, nb_line)
         messages.append(_msg("user", "LAB_NOTEBOOK_ENTRY: " + nb_line))
+
+        compact = resp_summary
+        if compact is None:
+            compact = res.response_json
+
+        llm_compact = None
+        try:
+            llm_compact = _llm_tool_result_compact(str(server_path), res.response_json if isinstance(res.response_json, dict) else None, omics_state=omics_state)
+        except Exception:
+            llm_compact = None
+        if not llm_compact:
+            llm_compact = compact
 
         tool_payload = {
             "http_status": res.http_status,
             "seconds": res.seconds,
-            "response_json": compact,
+            "response_json": llm_compact,
         }
         if res.response_json is None:
             tool_payload["response_text"] = _llm_sanitize_text(res.response_text[:400])
@@ -3323,7 +3821,15 @@ def run_benchmark(
             }
             _write_json_file(str(state_out), state_obj)
 
-        if server_path in ("/api/tests/cancer/claim_cure", "/api/tests/hereditary_disease/claim_cure") and metrics.win:
+        if (
+            server_path
+            in (
+                "/api/tests/cancer/claim_cure",
+                "/api/tests/hereditary_disease/claim_cure",
+                "/api/tests/aging/claim_cure",
+            )
+            and metrics.win
+        ):
             transcript.append({"type": "auto_stop", "reason": "win_true"})
             break
 
@@ -3379,11 +3885,10 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://127.0.0.1:8000", help="Runtime server base URL.")
     ap.add_argument(
         "--provider",
-        required=True,
         choices=["openai", "anthropic", "claude", "human", "xai", "gemini"],
         help="LLM provider. Use 'human' for human-in-the-loop mode.",
     )
-    ap.add_argument("--model", required=True, help="Model name (provider-specific).")
+    ap.add_argument("--model", default="", help="Model name (provider-specific).")
     ap.add_argument("--executor-provider", default="", help="When --provider=human, use this LLM provider to translate directives into Action JSON.")
     ap.add_argument("--executor-model", default="", help="When --provider=human, use this model for the executor LLM (defaults to --model).")
     ap.add_argument("--human-poll", type=float, default=0.5, help="When --provider=human, poll interval (seconds) while waiting for human input.")
@@ -3408,8 +3913,20 @@ def main() -> int:
 
     args = ap.parse_args()
 
+    if (not args.print_prompt) and (not str(args.provider or "").strip()):
+        ap.error("the following arguments are required: --provider")
+    if (not args.print_prompt) and (not str(args.model or "").strip()):
+        ap.error("the following arguments are required: --model")
+
     if args.print_prompt:
-        p_txt, _ = _read_prompt_text(str(args.prompt_file or "").strip())
+        pf0 = str(args.prompt_file or "").strip()
+        if not pf0:
+            try:
+                if _normalize_challenge(getattr(args, "challenge", "")) == "aging":
+                    pf0 = "aging.txt"
+            except Exception:
+                pf0 = ""
+        p_txt, _ = _read_prompt_text(str(pf0))
         sys.stdout.write(str(p_txt) + "\n")
         return 0
 
@@ -3547,6 +4064,56 @@ def main() -> int:
         "transcript": transcript,
     }
 
+    had_error_issue = False
+
+    try:
+        evp = str(args.events_out or "").strip()
+        if evp:
+            run_dir = Path(str(evp)).resolve().parent
+            issues_path = run_dir / "issues.json"
+            story_path = run_dir / "story.md"
+            stdout_path = run_dir / "stdout.log"
+            stderr_path = run_dir / "stderr.log"
+            issues: List[Dict[str, Any]] = []
+            issues.extend(_detect_issues_from_events_path(events_path=Path(str(evp)).resolve()))
+            try:
+                if stderr_path.exists() and stderr_path.is_file():
+                    issues.extend(_issues_from_text(text=stderr_path.read_text(encoding="utf-8", errors="replace"), source="runner_stderr", max_items=200))
+            except Exception:
+                pass
+            try:
+                if stdout_path.exists() and stdout_path.is_file():
+                    issues.extend(_issues_from_text(text=stdout_path.read_text(encoding="utf-8", errors="replace"), source="runner_stdout", max_items=200))
+            except Exception:
+                pass
+
+            seen = set()
+            deduped: List[Dict[str, Any]] = []
+            for it in issues:
+                if not isinstance(it, dict):
+                    continue
+                k = (str(it.get("severity") or ""), str(it.get("kind") or ""), str(it.get("source") or ""), str(it.get("seq") or ""), str(it.get("summary") or ""))
+                if k in seen:
+                    continue
+                seen.add(k)
+                deduped.append(it)
+            try:
+                had_error_issue = any(str((it or {}).get("severity") or "").strip().lower() == "error" for it in list(deduped))
+            except Exception:
+                had_error_issue = False
+            _write_json_any_file(str(issues_path), deduped)
+
+            try:
+                story_txt = _story_markdown_from_events_path(events_path=Path(str(evp)).resolve())
+                if story_txt.strip():
+                    story_path.write_text(story_txt, encoding="utf-8")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    report["ok"] = bool(report.get("ok") is True and (not had_error_issue))
+
     raw = json.dumps(report, indent=2)
     if args.out:
         out_dir = os.path.dirname(os.path.abspath(str(args.out)))
@@ -3554,6 +4121,7 @@ def main() -> int:
             os.makedirs(out_dir, exist_ok=True)
         with open(str(args.out), "w", encoding="utf-8") as f:
             f.write(raw)
+
     sys.stdout.write(raw + "\n")
     return 0
 

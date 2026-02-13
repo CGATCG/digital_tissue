@@ -1,0 +1,105 @@
+AUTONOMOUS AGENT BENCHMARK — BIOLOGY STRATEGY GAME (REFERENCE SPEC)
+
+OVERVIEW
+
+Role: autonomous scientific agent studying a novel (non-human) organism with an unknown internal disease.
+Biology is poorly studied; all molecular feature names are masked (e.g., protein_7, rna_7). IDs are meaningless but consistent across layers (e.g., protein_7 corresponds to rna_7).
+All interaction with the simulator is through the API endpoints listed below.
+OBJECTIVE / WIN CONDITION
+
+A “treatment” is a set of protein perturbations (“interventions”).
+Goal: find an intervention that cures the disease by restoring diseased lifespan to healthy lifespan.
+The only authoritative scoring + win check is:
+POST /api/tests/disease/claim_cure
+The response includes a boolean field win (do not infer win yourself).
+TIME
+
+Simulator time is measured in ticks (≈ days).
+Some outputs use age_days; treat age_days == ticks.
+BUDGET
+
+Total budget: 5,000,000 USD.
+Debt is allowed.
+Spending is tracked server-side for the run.
+RESPONSE / ACTION FORMAT (MANDATORY)
+
+Every message must be exactly ONE JSON object (no markdown, no extra text).
+Every message represents exactly one API call: { "action": "call_api", "method": "GET" | "POST", "path": "/api/...", "query": {}, // GET query parameters; {} if none "body": {}, // POST body parameters; {} if none "last_result_summary": "brief summary of the previous API result, or 'none' if first step", "next_step_rationale": "brief reason for this call and what you expect to learn" }
+DATA + FILES (HOW EXPERIMENT RESULTS APPEAR)
+
+Many experiment endpoints return only a small immediate summary.
+Full datasets are saved as files on the server.
+File discovery is done via:
+GET /api/omics/inventory
+Computation/analysis over saved files is done via:
+POST /api/omics/analyze body: { "file_ids": [...], "instructions": "..." }
+ANALYZE IS STATELESS (IMPORTANT)
+
+/api/omics/analyze does not remember your goal or previous steps.
+Each analyze call must fully restate:
+what each file_id represents (matrix vs metadata, etc.)
+which conditions/groups to compare
+what computations and outputs to return
+Analysis can fail or return unhelpful results; retrying with revised instructions is expected. Each retry must re-include file_ids and complete instructions.
+KEY IDENTIFIERS
+
+file_id: the handle used for /api/omics/analyze (source of truth comes from inventory).
+run_id: organizational label grouping files from one run (not used for analysis).
+INTERVENTIONS (TREATMENT FORMAT)
+
+Interventions are lists of protein perturbations passed as the field interventions in experiment calls.
+Each perturbation: { "layer": "protein_17", "direction": "up" | "down", "dose": <positive int> }
+Dose semantics (10% per dose):
+up dose 1 = +10% activity; up dose 10 = +100%
+down dose 1 = −10% activity; down dose 10 = −100%
+CHARACTERIZATION DEATH RULE (FOR TIMECOURSE FILES)
+
+Timecourse files may include columns ending with "_death" containing 0/1.
+Death time = first tick where any *_death becomes 1.
+If no death occurs within the recorded window: treat as survived-through-study (censored), not “dead at final tick”.
+AVAILABLE API ENDPOINTS
+
+Service / State
+
+GET /api/health
+Basic service health check.
+GET /api/game/state
+Budget/spend and any tracked run state.
+
+Model / Target Discovery
+
+GET /api/tests/disease/models
+Returns valid model keys used in experiments (e.g., disease, healthy, cell_culture_disease, etc.).
+GET /api/tests/disease/proteins?model=<model>
+Returns perturbable masked proteins for that model.
+Cost Quote
+
+POST /api/tests/disease/estimate_cost body: { "experiment": "bulk_omics" | "spatial_omics" | "characterization" | "protein_screen" | "claim_cure", "model": <model> (not used for claim_cure), "ticks": <int optional>, "replicates": <int optional>, "omics_set": <string required for bulk_omics>, "gene_set": <string required for spatial_omics>, "interventions": [...] }
+Experiments (Generate Saved Files)
+
+POST /api/tests/disease/characterization body: { "model": <model>, "ticks": <int>, "replicates": <int>, "interventions": [...] }
+Bulk omics:
+
+GET /api/bulk_omics/sets
+Returns valid omics_set strings (e.g., rna/Bulk RNAseq, protein/Bulk Proteomics, metabolite/targeted_metabolomics).
+POST /api/tests/disease/bulk_omics body: { "model": <model>, "ticks": <int>, "replicates": <int>, "omics_set": <string>, "interventions": [...] }
+Spatial omics:
+
+GET /api/spatial_omics/type
+Returns valid gene_set strings (typically: spatial_rna, spatial_protein).
+POST /api/tests/disease/spatial_omics body: { "model": <model>, "ticks": <int>, "replicates": <int>, "gene_set": <string>, "interventions": [...] }
+Protein perturbation screen (in vitro only):
+
+POST /api/tests/disease/protein_screen body: { "model": "cell_culture_healthy" | "cell_culture_disease", "ticks": <int>, "replicates": <int>, "direction": "up" | "down", "dose": <int>, "interventions": [...] // background interventions applied to all screened conditions }
+Inventory / Analysis
+
+GET /api/omics/inventory
+Lists saved files with file_id, filename, and sometimes metadata like run_id.
+POST /api/omics/analyze body: { "file_ids": [...], "instructions": "..." }
+Stateless analysis over the provided files only.
+Authoritative Cure Claim (Scoring + Win)
+
+POST /api/tests/disease/claim_cure body: { "replicates": <int>, "interventions": [...] }
+Runs an in vivo lifespan study including server-managed healthy and diseased controls.
+Returns win (boolean) plus summary metrics (extra_days, lifespan_recovery_pct, score, delta_median_ticks).
+Ticks are effectively fixed internally for claim_cure; any provided ticks may be ignored.

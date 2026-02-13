@@ -119,8 +119,8 @@ def _run_steps(base_url: str) -> None:
 
     gene_set = ""
     try:
-        gs = _http_get_json(base_url, "/api/spatial_tx/gene_sets", timeout_s=10.0)
-        cand = gs.get("gene_sets") if isinstance(gs, dict) else None
+        gs = _http_get_json(base_url, "/api/spatial_omics/type", timeout_s=10.0)
+        cand = gs.get("types") if isinstance(gs, dict) else None
         if isinstance(cand, list):
             for nm in cand:
                 if isinstance(nm, str) and nm.strip():
@@ -177,7 +177,13 @@ def _run_steps(base_url: str) -> None:
     genes = out.get("genes")
     _assert(isinstance(genes, list) and len(genes) >= 1, "genes list")
 
-    _assert(out.get("gene_set") == gene_set, "gene_set")
+    out_gs = str(out.get("gene_set") or "")
+    if gene_set == "spatial_rna":
+        _assert(out_gs in ("spatial_rna", "spatial transcriptomics"), "gene_set")
+    elif gene_set == "spatial_protein":
+        _assert(out_gs in ("spatial_protein", "spatial proteomics"), "gene_set")
+    else:
+        _assert(out_gs == gene_set, "gene_set")
 
     matrix_csv = out.get("matrix_csv")
     truth_csv = out.get("matrix_truth_csv")

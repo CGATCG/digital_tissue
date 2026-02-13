@@ -1,6 +1,8 @@
 import concurrent.futures
 import base64
+import contextlib
 import copy
+import csv
 import faulthandler
 import gzip
 import hashlib
@@ -40,11 +42,328 @@ except Exception:
 _ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 
 
-_ANTHROPIC_INPUT_TPM_LIMIT = 30_000
+class RateLimitError(Exception):
+    def __init__(self, message: str, *, retry_after_s: Optional[float] = None, provider: str = "", model: str = "") -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+        self.provider = provider
+        self.model = model
+
+
+class TemporaryUnavailableError(Exception):
+    def __init__(self, message: str, *, provider: str = "", model: str = "") -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+
+
+def _scheduler_enabled() -> bool:
+    v = str(os.environ.get("DT_RESOURCE_SCHEDULER") or "").strip().lower()
+    if not v:
+        return False
+    return v in ("1", "true", "yes", "on")
+
+
+def _mem_available_gb() -> float:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = [p for p in line.split() if p]
+                if len(parts) >= 2:
+                    kb = float(parts[1])
+                    return float(kb) / (1024.0 * 1024.0)
+    except Exception:
+        return float("inf")
+    return float("inf")
+
+
+class _ResourceScheduler:
+    def __init__(self) -> None:
+        cpu0 = os.cpu_count() or 1
+        try:
+            cpu0 = int(os.environ.get("DT_RESOURCE_SCHEDULER_CPU"))
+        except Exception:
+            cpu0 = int(cpu0)
+        self.cpu_total = max(1, int(cpu0))
+        try:
+            self.mem_reserve_gb = float(os.environ.get("DT_RESOURCE_SCHEDULER_MEM_RESERVE_GB"))
+        except Exception:
+            self.mem_reserve_gb = 8.0
+        self._cv = threading.Condition()
+        self._cpu_used = 0
+        self._mem_used_gb = 0.0
+
+    def _can_acquire(self, *, cpu: int, mem_gb: float) -> bool:
+        if int(cpu) <= 0:
+            cpu = 0
+        if float(mem_gb) <= 0:
+            mem_gb = 0.0
+        if int(self._cpu_used) + int(cpu) > int(self.cpu_total):
+            return False
+        avail_gb = float(_mem_available_gb())
+        if not (avail_gb == float("inf")):
+            if float(avail_gb) - float(self.mem_reserve_gb) - float(self._mem_used_gb) < float(mem_gb):
+                return False
+        return True
+
+    @contextlib.contextmanager
+    def acquire(self, *, cpu: int, mem_gb: float) -> Any:
+        if not _scheduler_enabled():
+            yield
+            return
+        cpu_req = max(0, int(cpu))
+        mem_req = max(0.0, float(mem_gb))
+        if cpu_req > int(self.cpu_total):
+            cpu_req = int(self.cpu_total)
+        with self._cv:
+            while not self._can_acquire(cpu=cpu_req, mem_gb=mem_req):
+                self._cv.wait(timeout=0.2)
+            self._cpu_used += int(cpu_req)
+            self._mem_used_gb += float(mem_req)
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._cpu_used = max(0, int(self._cpu_used) - int(cpu_req))
+                self._mem_used_gb = max(0.0, float(self._mem_used_gb) - float(mem_req))
+                self._cv.notify_all()
+
+
+_RESOURCE_SCHED = _ResourceScheduler()
+
+
+_GEMINI_DEBUG_LOCK = threading.Lock()
+
+
+def _gemini_debug_dir() -> Path:
+    try:
+        _ensure_dirs()
+    except Exception:
+        pass
+
+    base = _WORKSPACE_DIR / "llm_debug" / "gemini"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+
+def _gemini_debug_include_inline_data() -> bool:
+    return str(os.environ.get("DT_GEMINI_DEBUG_INCLUDE_INLINE_DATA") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _gemini_debug_hash_inline_data() -> bool:
+    return str(os.environ.get("DT_GEMINI_DEBUG_HASH_INLINE_DATA") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _gemini_debug_redact_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (headers or {}).items():
+        kk = str(k or "")
+        vv = v
+        if kk.strip().lower() in ("x-goog-api-key", "authorization"):
+            vv = "***"
+        out[kk] = vv
+    return out
+
+
+def _gemini_debug_inline_summary(inline: Dict[str, Any]) -> Dict[str, Any]:
+    mime = str(inline.get("mimeType") or "") if isinstance(inline, dict) else ""
+    data = inline.get("data") if isinstance(inline, dict) else None
+    b64_len = int(len(str(data))) if isinstance(data, str) else 0
+    approx_bytes = int((3 * b64_len) // 4) if b64_len > 0 else 0
+    out: Dict[str, Any] = {
+        "mimeType": mime,
+        "data_len_chars": int(b64_len),
+        "approx_decoded_bytes": int(approx_bytes),
+    }
+    if _gemini_debug_hash_inline_data() and isinstance(data, str) and data:
+        try:
+            out["data_sha256"] = str(_sha256_text(str(data)))
+        except Exception:
+            pass
+    return out
+
+
+def _gemini_debug_redact_payload(obj: Any) -> Any:
+    include_inline = _gemini_debug_include_inline_data()
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            kk = str(k or "")
+            if kk in ("api_key", "key", "x-goog-api-key", "authorization"):
+                out[kk] = "***"
+                continue
+            if kk == "inlineData" and isinstance(v, dict) and (not include_inline):
+                out[kk] = _gemini_debug_inline_summary(v)
+                continue
+            out[kk] = _gemini_debug_redact_payload(v)
+        return out
+    if isinstance(obj, list):
+        return [_gemini_debug_redact_payload(x) for x in obj]
+    return obj
+
+
+def _gemini_debug_payload_stats(payload: Any) -> Dict[str, Any]:
+    stats: Dict[str, Any] = {
+        "inline_parts": 0,
+        "inline_data_total_len_chars": 0,
+        "inline_data_total_approx_bytes": 0,
+    }
+
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            if "inlineData" in x and isinstance(x.get("inlineData"), dict):
+                inline = x.get("inlineData")
+                data = inline.get("data") if isinstance(inline, dict) else None
+                if isinstance(data, str):
+                    b64_len = int(len(data))
+                    stats["inline_parts"] = int(stats.get("inline_parts") or 0) + 1
+                    stats["inline_data_total_len_chars"] = int(stats.get("inline_data_total_len_chars") or 0) + b64_len
+                    stats["inline_data_total_approx_bytes"] = int(stats.get("inline_data_total_approx_bytes") or 0) + int((3 * b64_len) // 4)
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for it in x:
+                walk(it)
+
+    try:
+        walk(payload)
+    except Exception:
+        pass
+    return stats
+
+
+def _gemini_debug_write_snapshot(
+    *,
+    event: str,
+    provider: str,
+    model: str,
+    base_url: str,
+    url: str,
+    headers: Dict[str, Any],
+    payload: Dict[str, Any],
+    error: Optional[str],
+    attempt: Optional[int],
+    attempts: Optional[int],
+    sleep_budget_s: Optional[float],
+    cooldown_remaining_s: Optional[float],
+    path: str,
+    run_id: Optional[str] = None,
+    player_id: Optional[str] = None,
+) -> None:
+    try:
+        d = _gemini_debug_dir()
+        ts = int(time.time())
+        uid = uuid.uuid4().hex[:10]
+        p = d / f"gemini_{str(event or 'event')}_{ts}_{uid}.json"
+
+        payload_stats = _gemini_debug_payload_stats(payload)
+        payload_red = _gemini_debug_redact_payload(payload)
+
+        info: Dict[str, Any] = {
+            "ts": int(ts),
+            "event": str(event or ""),
+            "provider": str(provider or ""),
+            "model": str(model or ""),
+            "base_url": str(base_url or ""),
+            "url": str(url or ""),
+            "path": str(path or ""),
+            "run_id": str(run_id or "") if run_id is not None else None,
+            "player_id": str(player_id or "") if player_id is not None else None,
+            "attempt": int(attempt) if attempt is not None else None,
+            "attempts": int(attempts) if attempts is not None else None,
+            "sleep_budget_s": float(sleep_budget_s) if sleep_budget_s is not None else None,
+            "cooldown_remaining_s": float(cooldown_remaining_s) if cooldown_remaining_s is not None else None,
+            "error": str(error or "") if error else None,
+            "headers": _gemini_debug_redact_headers(headers),
+            "payload_stats": payload_stats,
+            "payload": payload_red,
+        }
+
+        raw = json.dumps(info, ensure_ascii=False).encode("utf-8")
+        with _GEMINI_DEBUG_LOCK:
+            _atomic_write_bytes(p, raw)
+    except Exception:
+        return
+
+
+_ANTHROPIC_INPUT_TPM_LIMIT = 450_000
 _ANTHROPIC_TPM_WINDOW_S = 60.0
 _ANTHROPIC_TPM_SAFETY_FRAC = 0.60
 _ANTHROPIC_TPM_USAGE: deque[tuple[float, int]] = deque()
 _ANTHROPIC_TPM_LOCK = threading.Lock()
+
+
+_GEMINI_COOLDOWN_UNTIL: Dict[str, float] = {}
+_GEMINI_COOLDOWN_LOCK = threading.Lock()
+
+
+def _http_status_from_error(msg: str) -> Optional[int]:
+    s = str(msg or "")
+    if not s.strip():
+        return None
+    try:
+        m = re.search(r"\bHTTP\s+([0-9]{3})\b", s, flags=re.IGNORECASE)
+        if not m:
+            return None
+        v = int(m.group(1))
+        if v < 100 or v > 999:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _is_rate_limited_error(msg: str) -> bool:
+    st = _http_status_from_error(msg)
+    if st == 429:
+        return True
+    s = str(msg or "").upper()
+    return bool(s and ("RESOURCE_EXHAUSTED" in s or "RATE LIMIT" in s or "QUOTA" in s))
+
+
+def _gemini_cooldown_key(*, base_url: str, model: str) -> str:
+    return str(base_url or "").strip() + "|" + str(model or "").strip()
+
+
+def _gemini_cooldown_remaining_s(*, base_url: str, model: str) -> float:
+    key = _gemini_cooldown_key(base_url=str(base_url), model=str(model))
+    now = float(time.time())
+    with _GEMINI_COOLDOWN_LOCK:
+        until = float(_GEMINI_COOLDOWN_UNTIL.get(key, 0.0) or 0.0)
+    rem = float(until - now)
+    return float(rem) if rem > 0.0 else 0.0
+
+
+def _gemini_set_cooldown(*, base_url: str, model: str, retry_after_s: Optional[float]) -> float:
+    wait_s = 60.0
+    try:
+        if retry_after_s is not None:
+            wait_s = float(retry_after_s)
+    except Exception:
+        wait_s = 60.0
+    wait_s = float(min(300.0, max(1.0, wait_s)))
+
+    key = _gemini_cooldown_key(base_url=str(base_url), model=str(model))
+    now = float(time.time())
+    until = float(now + wait_s)
+    with _GEMINI_COOLDOWN_LOCK:
+        prev = float(_GEMINI_COOLDOWN_UNTIL.get(key, 0.0) or 0.0)
+        _GEMINI_COOLDOWN_UNTIL[key] = float(max(prev, until))
+    return float(wait_s)
+
+
+def _gemini_retry_attempts() -> int:
+    attempts = 6
+    try:
+        attempts = int(os.environ.get("DT_GEMINI_RETRY_ATTEMPTS", str(attempts)) or attempts)
+    except Exception:
+        attempts = 6
+    return max(1, min(20, int(attempts)))
 
 
 def _approx_token_count_text(text: str) -> int:
@@ -137,6 +456,8 @@ def _should_retry_remote_http_error(msg: str) -> bool:
         return False
     if "HTTP 503" in s or "\"CODE\"" in s and "503" in s:
         return True
+    if "HTTP 529" in s or "OVERLOADED" in s or "OVERLOADED_ERROR" in s:
+        return True
     if "UNAVAILABLE" in s or "SERVICE UNAVAILABLE" in s:
         return True
     if "REQUEST TIMED OUT" in s or "TIMED OUT" in s or "TIMEOUT" in s:
@@ -167,11 +488,15 @@ def _retry_delay_seconds_from_error(msg: str) -> Optional[float]:
 
 
 def _openai_base_model_and_effort(model: str) -> tuple[str, Optional[str]]:
-    m = str(model or "").strip()
+    m = str(model or ":").strip()
     if not m:
         return "", None
     if m == "gpt-5.2":
         return "gpt-5.2", "medium"
+    if m == "gpt-5.2-none":
+        return "gpt-5.2", "none"
+    if m == "gpt-5.2-low":
+        return "gpt-5.2", "low"
     if m == "gpt-5.2-medium":
         return "gpt-5.2", "medium"
     if m == "gpt-5.2-high":
@@ -179,6 +504,15 @@ def _openai_base_model_and_effort(model: str) -> tuple[str, Optional[str]]:
     if m in ("gpt-5.2-extra-high", "gpt-5.2-xhigh"):
         return "gpt-5.2", "xhigh"
     return m, None
+
+
+def _xai_canonical_model(model: str) -> str:
+    m = str(model or "").strip()
+    if not m:
+        return ""
+    if m == "grok-4-1-fast":
+        return "grok-4-1-fast-reasoning"
+    return str(m)
 
 
 _DISCUSS_ADVISOR_SYSTEM_PROMPT = (
@@ -265,8 +599,9 @@ def _discuss_llm_generate(*, provider: str, model: str, system_prompt: str, user
         base_url = str(os.environ.get("XAI_BASE_URL") or "").strip() or "https://api.x.ai/v1"
 
         client = OpenAI(api_key=str(api_key), base_url=str(base_url))
+        model_call = _xai_canonical_model(str(model))
         req: Dict[str, Any] = {
-            "model": str(model),
+            "model": str(model_call),
             "input": [
                 {"role": "system", "content": str(system_prompt)},
                 {"role": "user", "content": str(user_prompt)},
@@ -300,31 +635,141 @@ def _discuss_llm_generate(*, provider: str, model: str, system_prompt: str, user
 
         resp_json: Dict[str, Any] = {}
         last_err: Optional[str] = None
-        for attempt in range(3):
+        rate_limited = False
+        sleep_budget_s = 300.0
+        try:
+            sleep_budget_s = float(os.environ.get("DT_GEMINI_RATE_LIMIT_SLEEP_BUDGET_S", str(sleep_budget_s)) or sleep_budget_s)
+        except Exception:
+            sleep_budget_s = 300.0
+        sleep_budget_s = max(0.0, min(1800.0, float(sleep_budget_s)))
+
+        attempts = int(max(3, _gemini_retry_attempts()))
+        for attempt in range(int(attempts)):
+            rem_s = _gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model))
+            if rem_s > 0.0:
+                if sleep_budget_s <= 0.0:
+                    rate_limited = True
+                    try:
+                        _gemini_debug_write_snapshot(
+                            event="cooldown_budget_exhausted",
+                            provider="gemini",
+                            model=str(model),
+                            base_url=str(base_url_g),
+                            url=str(url),
+                            headers=dict(headers),
+                            payload=dict(payload),
+                            error=None,
+                            attempt=int(attempt),
+                            attempts=int(attempts),
+                            sleep_budget_s=float(sleep_budget_s),
+                            cooldown_remaining_s=float(rem_s),
+                            path="/api/discuss",
+                        )
+                    except Exception:
+                        pass
+                    break
+                try:
+                    sleep_s = min(float(rem_s), float(sleep_budget_s))
+                    time.sleep(float(max(0.0, sleep_s)))
+                    sleep_budget_s -= float(sleep_s)
+                except Exception:
+                    pass
+                continue
+
             try:
                 t_s = float(timeout_s)
-                if attempt == 1:
-                    t_s = max(t_s, float(timeout_s) * 1.5)
-                if attempt == 2:
-                    t_s = max(t_s, float(timeout_s) * 2.0)
+                if attempt >= 1:
+                    t_s = max(t_s, float(timeout_s) * (1.5 + 0.25 * float(attempt)))
                 resp_json = _http_post_json(url=str(url), headers=headers, payload=payload, timeout_s=float(t_s))
                 last_err = None
                 break
             except Exception as e:
                 last_err = str(e)
-                if _should_retry_remote_http_error(last_err) and attempt < 2:
+                if _is_rate_limited_error(last_err):
+                    rate_limited = True
+                    hint_s = _retry_delay_seconds_from_error(last_err)
+                    wait_s = _gemini_set_cooldown(base_url=str(base_url_g), model=str(model), retry_after_s=hint_s)
+                    try:
+                        _gemini_debug_write_snapshot(
+                            event="rate_limited",
+                            provider="gemini",
+                            model=str(model),
+                            base_url=str(base_url_g),
+                            url=str(url),
+                            headers=dict(headers),
+                            payload=dict(payload),
+                            error=str(last_err),
+                            attempt=int(attempt),
+                            attempts=int(attempts),
+                            sleep_budget_s=float(sleep_budget_s),
+                            cooldown_remaining_s=float(wait_s),
+                            path="/api/discuss",
+                        )
+                    except Exception:
+                        pass
+                    if attempt >= (int(attempts) - 1) or sleep_budget_s <= 0.0:
+                        break
+                    try:
+                        sleep_s = min(float(wait_s), float(sleep_budget_s))
+                        time.sleep(float(max(0.0, sleep_s)))
+                        sleep_budget_s -= float(sleep_s)
+                    except Exception:
+                        pass
+                    continue
+                if _should_retry_remote_http_error(last_err) and attempt < (int(attempts) - 1):
                     try:
                         sleep_s = float(1.0 + (2.0 * float(attempt)))
                         hint_s = _retry_delay_seconds_from_error(last_err)
                         if hint_s is not None:
                             sleep_s = max(float(sleep_s), float(hint_s))
-                        sleep_s = min(120.0, max(0.0, float(sleep_s)))
+                        sleep_s = min(60.0, max(0.0, float(sleep_s)))
                         time.sleep(float(sleep_s))
                     except Exception:
                         pass
                     continue
                 raise
+
+        if rate_limited and last_err is None:
+            try:
+                _gemini_debug_write_snapshot(
+                    event="temporary_unavailable",
+                    provider="gemini",
+                    model=str(model),
+                    base_url=str(base_url_g),
+                    url=str(url),
+                    headers=dict(headers),
+                    payload=dict(payload),
+                    error=None,
+                    attempt=None,
+                    attempts=int(attempts),
+                    sleep_budget_s=float(sleep_budget_s),
+                    cooldown_remaining_s=_gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model)),
+                    path="/api/discuss",
+                )
+            except Exception:
+                pass
+            raise TemporaryUnavailableError("Gemini temporarily unavailable", provider="gemini", model=str(model))
         if last_err:
+            if rate_limited:
+                try:
+                    _gemini_debug_write_snapshot(
+                        event="temporary_unavailable",
+                        provider="gemini",
+                        model=str(model),
+                        base_url=str(base_url_g),
+                        url=str(url),
+                        headers=dict(headers),
+                        payload=dict(payload),
+                        error=str(last_err),
+                        attempt=None,
+                        attempts=int(attempts),
+                        sleep_budget_s=float(sleep_budget_s),
+                        cooldown_remaining_s=_gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model)),
+                        path="/api/discuss",
+                    )
+                except Exception:
+                    pass
+                raise TemporaryUnavailableError("Gemini temporarily unavailable", provider="gemini", model=str(model))
             raise ValueError(str(last_err))
 
         try:
@@ -509,6 +954,11 @@ def _anthropic_messages_code_execution(
             )
         except Exception as e:
             last_err = str(e)
+            if "HTTP 529" in last_err or "overloaded_error" in last_err.lower() or "overloaded" in last_err.lower():
+                if attempt < 2:
+                    time.sleep(float(0.8 * (2**attempt)))
+                    continue
+                raise TemporaryUnavailableError("Anthropic temporarily unavailable", provider="anthropic", model=str(model))
             if attempt < 2 and ("HTTP 429" in last_err or "rate_limit_error" in last_err or "input tokens per minute" in last_err or "would exceed the rate limit" in last_err):
                 time.sleep(65.0)
                 continue
@@ -705,6 +1155,20 @@ def _setup_logging() -> None:
     except Exception:
         pass
 
+    try:
+        err_path = (Path(__file__).resolve().parent / "stderr.log").resolve()
+        eh = logging.handlers.RotatingFileHandler(
+            str(err_path),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        eh.setLevel(logging.WARNING)
+        eh.setFormatter(fmt)
+        _LOG.addHandler(eh)
+    except Exception:
+        pass
+
     global _FAULT_FH
     try:
         fault_path = (Path(__file__).resolve().parent / "runtime_server_faulthandler.log").resolve()
@@ -745,6 +1209,272 @@ def _install_exception_hooks() -> None:
             faulthandler.register(signal.SIGUSR1, all_threads=True)
     except Exception:
         pass
+
+
+def _maybe_log_truncation_alarm(
+    text: str,
+    *,
+    provider: str,
+    model: str,
+    path: str,
+    run_id: Optional[str] = None,
+    player_id: Optional[str] = None,
+) -> None:
+    t = str(text or "")
+    if not t:
+        return
+    tl = t.lower()
+    markers = [
+        "truncation",
+        "truncated",
+        "truncate",
+        "cut off",
+        "cut-off",
+        "token limit",
+        "max tokens",
+        "context length",
+    ]
+    hit = None
+    hit_idx = -1
+    for m in markers:
+        idx = tl.find(str(m))
+        if idx >= 0:
+            hit = str(m)
+            hit_idx = int(idx)
+            break
+    if hit is None:
+        return
+
+    snippet = ""
+    try:
+        lo = max(0, int(hit_idx) - 120)
+        hi = min(len(t), int(hit_idx) + 240)
+        snippet = t[lo:hi]
+    except Exception:
+        snippet = ""
+
+    try:
+        _LOG.error(
+            "TRUNCATION_ALARM path=%s provider=%s model=%s run_id=%s player_id=%s marker=%s snippet=%s",
+            str(path),
+            str(provider),
+            str(model),
+            str(run_id or ""),
+            str(player_id or ""),
+            str(hit),
+            str(snippet)[:800],
+        )
+    except Exception:
+        pass
+
+
+def _omics_analyze_diagnostics(output_text: str, response_obj: Any) -> tuple[str, Dict[str, Any]]:
+    snippets: list[Dict[str, Any]] = []
+
+    def _add_snippet(kind: str, s: str) -> None:
+        if len(snippets) >= 24:
+            return
+        t = str(s or "")
+        if not t.strip():
+            return
+        if len(t) > 2000:
+            t = t[:2000]
+        snippets.append({"kind": str(kind), "text": str(t)})
+
+    def _walk(x: Any, depth: int) -> None:
+        if len(snippets) >= 24:
+            return
+        if depth > 7:
+            return
+        if x is None:
+            return
+        if isinstance(x, str):
+            _add_snippet("text", x)
+            return
+        if isinstance(x, dict):
+            for k, v in list(x.items()):
+                ks = str(k or "")
+                ksl = ks.lower()
+                if any(w in ksl for w in ("b64", "inline", "data", "bytes", "arr", "tensor")):
+                    if isinstance(v, str) and len(v) > 2000:
+                        continue
+                _walk(v, depth + 1)
+                if len(snippets) >= 24:
+                    break
+            return
+        if isinstance(x, list):
+            for v in list(x)[:200]:
+                _walk(v, depth + 1)
+                if len(snippets) >= 24:
+                    break
+            return
+
+    _walk(response_obj, 0)
+
+    out_s = str(output_text or "")
+    diagnostics = {
+        "ok": True,
+        "output_text_chars": int(len(out_s)),
+        "response_text_snippets": list(snippets),
+        "response_text_snippet_count": int(len(snippets)),
+        "note": "heuristic_error_detection_disabled",
+    }
+    return out_s, diagnostics
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    t0 = str(text or "").strip()
+    if not t0:
+        return None
+    lines: list[str] = []
+    for ln in t0.splitlines():
+        if str(ln or "").strip().startswith("```"):
+            continue
+        lines.append(str(ln or ""))
+    t = "\n".join(lines).strip()
+    if not t:
+        return None
+    start = t.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(int(start), int(len(t))):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                cand = t[start : i + 1]
+                try:
+                    obj = json.loads(cand)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    return None
+    return None
+
+
+def _omics_analyze_judge(
+    *,
+    player_instructions: str,
+    analyze_manifest_entries: list[Dict[str, Any]],
+    output_text: str,
+    analysis_diagnostics: Dict[str, Any],
+    provider: str,
+    model: str,
+    attempt: int,
+    max_attempts: int,
+) -> Dict[str, str]:
+    enabled = str(os.environ.get("DT_OMICS_ANALYZE_JUDGE", "1") or "1").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        return {"decision": "done", "reason": "judge_disabled"}
+    if not str(os.environ.get("XAI_API_KEY") or "").strip():
+        return {"decision": "done", "reason": "judge_unavailable_missing_xai_api_key"}
+
+    try:
+        max_chars = int(os.environ.get("DT_OMICS_ANALYZE_JUDGE_MAX_OUTPUT_TEXT_CHARS", "14000") or 14000)
+    except Exception:
+        max_chars = 14000
+    max_chars = max(2000, min(80000, int(max_chars)))
+    out0 = str(output_text or "")
+    if len(out0) > int(max_chars):
+        tail = out0[-2000:] if len(out0) > 4000 else ""
+        out0 = out0[: int(max_chars) - len(tail)].rstrip() + ("\n\n[...TRUNCATED...]\n\n" + tail if tail else "\n\n[...TRUNCATED...]\n")
+
+    judge_system = (
+        "You are a strict evaluator for an automated data-analysis tool output. "
+        "Your job is to decide whether the analysis output satisfactorily answers the user's instructions. "
+        "Return ONLY a JSON object with keys: decision, reason, retry_instructions. "
+        "decision must be exactly either 'retry' or 'done'. "
+        "Use 'retry' if there are missing required computed outputs, severe tool/runtime errors, or the response is mostly process narration instead of computed results. "
+        "Use 'done' if the output contains the requested computed results in text form. "
+        "If decision='retry', set retry_instructions to a SHORT string (<= 1200 chars) that can be appended to the original analysis prompt to help the next attempt succeed. "
+        "retry_instructions MUST preserve the user's intent, reference attachments by FILE_XX labels, and should focus on concrete guidance (e.g., 'do not write files', 'compute in-memory', 'print a compact table'). "
+        "If decision='done', set retry_instructions to an empty string."
+    )
+
+    user_payload = {
+        "player_instructions": str(player_instructions or ""),
+        "attachment_manifest_entries": list(analyze_manifest_entries or []),
+        "analysis_output_text": str(out0),
+        "analysis_diagnostics": dict(analysis_diagnostics or {}),
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "attempt": int(attempt),
+        "max_attempts": int(max_attempts),
+    }
+
+    raw = ""
+    try:
+        raw = _discuss_llm_generate(
+            provider="xai",
+            model="grok-4-1-fast-reasoning",
+            system_prompt=str(judge_system),
+            user_prompt=json.dumps(user_payload, ensure_ascii=False),
+            timeout_s=float(45.0),
+            max_tokens=int(240),
+        )
+    except Exception as e:
+        return {"decision": "done", "reason": "judge_error: " + str(e)[:200]}
+
+    obj = _extract_first_json_object(raw)
+    if not isinstance(obj, dict):
+        return {"decision": "done", "reason": "judge_unparseable"}
+    dec = str(obj.get("decision") or "").strip().lower()
+    if dec not in ("retry", "done"):
+        dec = "done"
+    reason = str(obj.get("reason") or "").strip()
+    if not reason:
+        reason = "(no_reason)"
+    if len(reason) > 800:
+        reason = reason[:800]
+
+    retry_instr = str(obj.get("retry_instructions") or "").strip()
+    if len(retry_instr) > 2000:
+        retry_instr = retry_instr[:2000]
+    if dec != "retry":
+        retry_instr = ""
+    return {"decision": str(dec), "reason": str(reason), "retry_instructions": str(retry_instr)}
+
+
+def _merge_omics_analyze_retry_guidance(prev: str, new: str) -> str:
+    p = str(prev or "").strip()
+    n = str(new or "").strip()
+    if not n:
+        return p
+    merged = n if not p else (p + "\n\n" + n)
+    if len(merged) > 3500:
+        merged = merged[-3500:]
+    return str(merged).strip()
+
+
+def _apply_omics_analyze_retry_guidance(base_instructions: str, guidance: str) -> str:
+    b = str(base_instructions or "")
+    g = str(guidance or "").strip()
+    if not g:
+        return b
+    return (
+        str(b)
+        + "\n\n"
+        + "RETRY GUIDANCE (from an automated judge; follow strictly; preserve user intent):\n"
+        + str(g)
+    )
 
 
 def _compute_distribution_score(values: list[float], method: str = "entropy") -> float:
@@ -1074,6 +1804,10 @@ _STX_GENESETS_DIR = (Path(__file__).resolve().parent / "spatial_transcriptomics"
 _BULK_OMICS_DIR = (Path(__file__).resolve().parent / "bulk_omics").resolve()
 
 
+_BULK_OMICS_MASK_DICT_LOCK = threading.Lock()
+_BULK_OMICS_MASK_DICT_CACHE: Optional[Dict[str, Any]] = None
+
+
 def _list_stx_gene_sets() -> list[str]:
     d = _STX_GENESETS_DIR
     if not d.exists() or not d.is_dir():
@@ -1094,7 +1828,7 @@ def _list_stx_gene_sets() -> list[str]:
 
 
 def _load_stx_gene_set(name: str) -> tuple[str, list[str]]:
-    nm = str(name or "").strip()
+    nm = _spatial_omics_type_to_gene_set_filename(name)
     all_sets = _list_stx_gene_sets()
     if not nm:
         if "default.txt" in all_sets:
@@ -1124,6 +1858,30 @@ def _load_stx_gene_set(name: str) -> tuple[str, list[str]]:
         genes.append(s)
         seen.add(s)
     return nm, genes
+
+
+def _normalize_spatial_omics_type(name: Any) -> str:
+    s = str(name or "").strip().lower()
+    if not s:
+        return ""
+    if s in ("spatial transcriptomics", "spatial_rna", "spatial rna", "rna", "rna panel", "spatial rna panel"):
+        return "spatial_rna"
+    if s in ("spatial proteomics", "spatial_protein", "spatial protein", "protein", "protein panel", "spatial protein panel"):
+        return "spatial_protein"
+    return str(name or "").strip()
+
+
+def _list_spatial_omics_types() -> list[str]:
+    return ["spatial_protein", "spatial_rna"]
+
+
+def _spatial_omics_type_to_gene_set_filename(name: Any) -> str:
+    nm = _normalize_spatial_omics_type(name)
+    if nm == "spatial_rna":
+        return "spatial transcriptomics"
+    if nm == "spatial_protein":
+        return "spatial proteomics"
+    return str(name or "").strip()
 
 
 def _list_bulk_omics_sets() -> list[str]:
@@ -1541,10 +2299,19 @@ _COST_MODEL_CENTS = {
 }
 
 _TESTS_CANCER_MODELS = {
-    "healthy": "healthy_organism.json",
-    "cancer": "cancer_organism.json",
-    "cell_culture_healthy": "healthy_cell_culture.json",
-    "cell_culture_cancer": "cancer_cell_culture.json",
+    "healthy_organism": "healthy_organism.json",
+    "cancer_organism": "cancer_organism.json",
+    "healthy_cell_culture": "healthy_cell_culture.json",
+    "cancer_cell_culture": "cancer_cell_culture.json",
+}
+
+_TESTS_CANCER_MODEL_ALIASES = {
+    "healthy": "healthy_organism",
+    "cancer": "cancer_organism",
+    "disease": "cancer_organism",
+    "cell_culture_healthy": "healthy_cell_culture",
+    "cell_culture_cancer": "cancer_cell_culture",
+    "cell_culture_disease": "cancer_cell_culture",
 }
 
 _TESTS_HEREDITARY_DISEASE_MODELS = {
@@ -1561,14 +2328,15 @@ _TESTS_AGING_MODELS = {
 
 def _tests_cancer_model_list() -> list[Dict[str, Any]]:
     return [
-        {"key": "healthy", "label": "Healthy (organism)", "domain": "in_vivo"},
-        {"key": "cancer", "label": "Cancer (organism)", "domain": "in_vivo"},
-        {"key": "cell_culture_healthy", "label": "Healthy (cell culture)", "domain": "in_vitro"},
-        {"key": "cell_culture_cancer", "label": "Cancer (cell culture)", "domain": "in_vitro"},
+        {"key": "healthy_organism", "label": "Healthy (organism)", "domain": "in_vivo"},
+        {"key": "cancer_organism", "label": "Disease (organism)", "domain": "in_vivo"},
+        {"key": "healthy_cell_culture", "label": "Healthy (cell culture)", "domain": "in_vitro"},
+        {"key": "cancer_cell_culture", "label": "Disease (cell culture)", "domain": "in_vitro"},
     ]
 
 def _tests_cancer_model_path(model_key: Any) -> Path:
     key = str(model_key or "").strip()
+    key = str(_TESTS_CANCER_MODEL_ALIASES.get(key) or key)
     fn = _TESTS_CANCER_MODELS.get(key)
     if not fn:
         raise ValueError("unknown model")
@@ -1669,7 +2437,7 @@ def _tests_load_model_payload_for_challenge(challenge: Any, model_key: Any) -> D
 def _tests_claim_cure_disease_model_key_for_challenge(challenge: Any) -> str:
     ch = _tests_normalize_challenge(challenge)
     if ch == "cancer":
-        return "cancer"
+        return "cancer_organism"
     if ch == "hereditary_disease":
         return "disease"
     return "healthy"
@@ -1705,6 +2473,41 @@ def _tests_compute_unit_cost_cents(
     if not isinstance(kcfg, dict):
         return 0
 
+    ticks_i = max(0, int(ticks))
+    iv_i = max(0, int(interventions_n))
+
+    # New schema (costs.csv-like): kind has per-context pricing instead of a single
+    # config scaled by multipliers.
+    ctx_key = "in_vitro" if _tests_is_in_vitro_model(model_key) else "in_vivo"
+    ctxs = kcfg.get("contexts") if isinstance(kcfg, dict) else None
+    kcfg_ctx = ctxs.get(ctx_key) if isinstance(ctxs, dict) else None
+    if isinstance(kcfg_ctx, dict):
+        try:
+            base = int(kcfg_ctx.get("unit_cents") or 0)
+        except Exception:
+            base = 0
+        try:
+            per_tick_base = int(kcfg_ctx.get("unit_per_tick_cents") or 0)
+        except Exception:
+            per_tick_base = 0
+        try:
+            per_tick_per_iv = int(kcfg_ctx.get("unit_per_tick_per_intervention_cents") or 0)
+        except Exception:
+            per_tick_per_iv = 0
+        try:
+            per_iv = int(kcfg_ctx.get("unit_per_intervention_cents") or 0)
+        except Exception:
+            per_iv = 0
+
+        unit = (
+            int(base)
+            + int(ticks_i) * (int(per_tick_base) + int(per_tick_per_iv) * int(iv_i))
+            + int(per_iv) * int(iv_i)
+        )
+        return int(max(0, unit))
+
+    # Backward-compatible schema: base + per_tick*ticks + per_iv*ivs, scaled by
+    # in_vitro/in_vivo multiplier.
     try:
         base = int(kcfg.get("unit_cents") or 0)
     except Exception:
@@ -1718,16 +2521,13 @@ def _tests_compute_unit_cost_cents(
     except Exception:
         per_iv = 0
 
-    ticks_i = max(0, int(ticks))
-    iv_i = max(0, int(interventions_n))
     unit = int(base) + int(per_tick) * int(ticks_i) + int(per_iv) * int(iv_i)
 
     mults = cfg.get("multipliers") if isinstance(cfg, dict) else None
     mult = 1.0
     if isinstance(mults, dict):
-        k = "in_vitro" if _tests_is_in_vitro_model(model_key) else "in_vivo"
         try:
-            mult = float(mults.get(k) or 1.0)
+            mult = float(mults.get(ctx_key) or 1.0)
         except Exception:
             mult = 1.0
     if not np.isfinite(mult) or mult <= 0.0:
@@ -1736,10 +2536,39 @@ def _tests_compute_unit_cost_cents(
     return int(max(0, int(round(float(unit) * float(mult)))))
 
 
-def _tests_make_charge(*, kind: str, samples: int, unit_cost_cents: int, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _tests_compute_fixed_cost_cents(*, challenge: str, kind: str, model_key: Any, interventions_n: int) -> int:
+    cfg = _tests_pricing_for_challenge(challenge)
+    kinds = cfg.get("kinds") if isinstance(cfg, dict) else None
+    kcfg = kinds.get(str(kind)) if isinstance(kinds, dict) else None
+    if not isinstance(kcfg, dict):
+        return 0
+    iv_i = max(0, int(interventions_n))
+    if int(iv_i) <= 0:
+        return 0
+
+    ctx_key = "in_vitro" if _tests_is_in_vitro_model(model_key) else "in_vivo"
+    ctxs = kcfg.get("contexts") if isinstance(kcfg, dict) else None
+    kcfg_ctx = ctxs.get(ctx_key) if isinstance(ctxs, dict) else None
+    if isinstance(kcfg_ctx, dict):
+        try:
+            return int(max(0, int(kcfg_ctx.get("intervention_setup_cents") or 0)))
+        except Exception:
+            return 0
+    return 0
+
+
+def _tests_make_charge(
+    *,
+    kind: str,
+    samples: int,
+    unit_cost_cents: int,
+    fixed_cost_cents: int = 0,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     n = max(0, int(samples))
     unit = max(0, int(unit_cost_cents))
-    total = int(unit) * int(n)
+    fixed = max(0, int(fixed_cost_cents))
+    total = int(unit) * int(n) + int(fixed)
     out = {
         "id": uuid.uuid4().hex[:12],
         "ts": float(time.time()),
@@ -1747,9 +2576,11 @@ def _tests_make_charge(*, kind: str, samples: int, unit_cost_cents: int, meta: O
         "kind": str(kind or ""),
         "samples": int(n),
         "unit_cost_cents": int(unit),
+        "fixed_cost_cents": int(fixed),
         "total_cost_cents": int(total),
         "cost_cents": int(total),
         "unit_cost_usd": float(unit) / 100.0,
+        "fixed_cost_usd": float(fixed) / 100.0,
         "total_cost_usd": float(total) / 100.0,
         "cost_usd": float(total) / 100.0,
     }
@@ -1853,12 +2684,29 @@ def _tests_get_protein_mask_maps(model_key: Any, *, challenge: str = "cancer") -
     real_to_mask: Dict[str, str] = {}
     mask_to_real: Dict[str, str] = {}
 
+    next_unknown_idx: Optional[int] = None
+    if core_to_idx:
+        try:
+            next_unknown_idx = int(max(core_to_idx.values() or [0])) + 1
+        except Exception:
+            next_unknown_idx = int(len(core_to_idx) + 1)
+
     for i, real in enumerate(real_layers):
         masked: Optional[str] = None
         if core_to_idx:
             masked = _layer_to_mask(str(real))
         if not masked:
-            masked = f"protein_{int(i + 1)}"
+            if core_to_idx and next_unknown_idx is not None:
+                core = _bulk_omics_core_key(str(real))
+                idx = core_to_idx.get(str(core))
+                if idx is None:
+                    idx = int(next_unknown_idx)
+                    next_unknown_idx = int(next_unknown_idx) + 1
+                    if core:
+                        core_to_idx[str(core)] = int(idx)
+                masked = f"protein_{int(idx)}"
+            else:
+                masked = f"protein_{int(i + 1)}"
         real_to_mask[str(real)] = str(masked)
         mask_to_real[str(masked)] = str(real)
 
@@ -1922,10 +2770,78 @@ def _bulk_omics_core_key(name: Any) -> str:
     return s
 
 
+def _bulk_omics_mask_dictionary_path() -> Path:
+    try:
+        p = (_BULK_OMICS_DIR / "omics_mask_dictionary.csv").resolve()
+        if _BULK_OMICS_DIR not in p.parents and p != _BULK_OMICS_DIR:
+            return (_BULK_OMICS_DIR / "omics_mask_dictionary.csv").resolve()
+        return p
+    except Exception:
+        return (_BULK_OMICS_DIR / "omics_mask_dictionary.csv").resolve()
+
+
+def _bulk_omics_load_mask_dictionary() -> Dict[str, Any]:
+    global _BULK_OMICS_MASK_DICT_CACHE
+    with _BULK_OMICS_MASK_DICT_LOCK:
+        if isinstance(_BULK_OMICS_MASK_DICT_CACHE, dict):
+            return _BULK_OMICS_MASK_DICT_CACHE
+
+        core_to_idx: Dict[str, int] = {}
+
+        p = _bulk_omics_mask_dictionary_path()
+        try:
+            if p.exists() and p.is_file():
+                with p.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in list(reader):
+                        if not isinstance(row, dict):
+                            continue
+                        orig_rna = str(row.get("original_name_rna") or "").strip()
+                        orig_prot = str(row.get("original_name_protein") or row.get("orginal_name_protein") or "").strip()
+                        new_rna = str(row.get("new_name_rna") or "").strip()
+                        new_prot = str(row.get("new_name_protein") or "").strip()
+
+                        idx: Optional[int] = None
+                        if new_rna.startswith("rna_") and new_rna[len("rna_") :].isdigit():
+                            idx = int(new_rna[len("rna_") :])
+                        if idx is None and new_prot.startswith("protein_") and new_prot[len("protein_") :].isdigit():
+                            idx = int(new_prot[len("protein_") :])
+
+                        core = ""
+                        if orig_rna:
+                            core = _bulk_omics_core_key(orig_rna)
+                        elif orig_prot:
+                            core = _bulk_omics_core_key(orig_prot)
+
+                        if not core or idx is None or int(idx) <= 0:
+                            continue
+
+                        prev = core_to_idx.get(str(core))
+                        if prev is not None and int(prev) != int(idx):
+                            continue
+                        core_to_idx[str(core)] = int(idx)
+        except Exception:
+            core_to_idx = {}
+
+        _BULK_OMICS_MASK_DICT_CACHE = {
+            "core_to_idx": core_to_idx,
+        }
+        return _BULK_OMICS_MASK_DICT_CACHE
+
+
 def _bulk_omics_get_core_index_map() -> Dict[str, int]:
     global _BULK_OMICS_CORE_INDEX_MAP
     if isinstance(_BULK_OMICS_CORE_INDEX_MAP, dict) and _BULK_OMICS_CORE_INDEX_MAP:
         return _BULK_OMICS_CORE_INDEX_MAP
+
+    try:
+        md = _bulk_omics_load_mask_dictionary()
+        c2i = md.get("core_to_idx") if isinstance(md, dict) else None
+        if isinstance(c2i, dict) and c2i:
+            _BULK_OMICS_CORE_INDEX_MAP = dict((str(k), int(v)) for k, v in c2i.items())
+            return _BULK_OMICS_CORE_INDEX_MAP
+    except Exception:
+        pass
 
     m: Dict[str, int] = {}
     next_i = 1
@@ -1981,7 +2897,11 @@ def _bulk_omics_mask_feature_headers(features: list[str], kind: str) -> list[str
         core = _bulk_omics_core_key(f)
         idx = core_to_idx.get(str(core))
         if idx is None:
-            idx = int(len(core_to_idx) + 1)
+            try:
+                nxt = int(max(core_to_idx.values() or [0])) + 1
+            except Exception:
+                nxt = int(len(core_to_idx) + 1)
+            idx = int(nxt)
             core_to_idx[str(core)] = int(idx)
         out.append(f"{str(prefix)}_{int(idx)}")
     return out
@@ -2109,6 +3029,31 @@ def _game_player_entry(state: Dict[str, Any], player_id: str) -> Dict[str, Any]:
     return ent
 
 
+def _game_get_player_int(player_id_in: Any, key: str, *, default: int = 0) -> int:
+    player_id = _sanitize_player_id(player_id_in)
+    with _GAME_LOCK:
+        st = _game_load_state()
+        ent = _game_player_entry(st, player_id)
+        v = ent.get(str(key))
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+
+def _game_set_player_int(player_id_in: Any, key: str, value: int) -> None:
+    player_id = _sanitize_player_id(player_id_in)
+    with _GAME_LOCK:
+        st = _game_load_state()
+        ent = _game_player_entry(st, player_id)
+        try:
+            ent[str(key)] = int(value)
+        except Exception:
+            ent[str(key)] = int(0)
+        ent["updated_at"] = float(time.time())
+        _atomic_write_json(_GAME_STATE_PATH, st)
+
+
 def _game_public_player(player_id: str, ent: Dict[str, Any], *, last_charge: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cents = 0
     try:
@@ -2198,6 +3143,10 @@ def _game_reset_player(player_id_in: Any) -> Dict[str, Any]:
         ent = _game_player_entry(st, player_id)
         ent["money_spent_cents"] = 0
         ent["ledger"] = []
+        try:
+            ent.pop("aging_claim_cure_min_reps", None)
+        except Exception:
+            pass
         ent["updated_at"] = float(time.time())
         _atomic_write_json(_GAME_STATE_PATH, st)
         return _game_public_player(player_id, ent)
@@ -2860,6 +3809,324 @@ def _lifespan_worker_eval(ri: int, ticks: int, seed: int) -> tuple[int, Dict[str
     )
     r["seed0"] = int(seed0)
     return int(ri), r, series
+
+
+_BULK_OMICS_WORKER_BASE: Optional[Dict[str, Any]] = None
+_BULK_OMICS_WORKER_FEATURES: Optional[list[str]] = None
+_BULK_OMICS_WORKER_TICKS: Optional[int] = None
+_BULK_OMICS_WORKER_SEED: Optional[int] = None
+
+
+def _bulk_omics_worker_init(base: Dict[str, Any], features: list[str], ticks: int, seed: int) -> None:
+    global _BULK_OMICS_WORKER_BASE
+    global _BULK_OMICS_WORKER_FEATURES
+    global _BULK_OMICS_WORKER_TICKS
+    global _BULK_OMICS_WORKER_SEED
+    _BULK_OMICS_WORKER_BASE = base
+    _BULK_OMICS_WORKER_FEATURES = [str(x) for x in (features or []) if isinstance(x, str) and x]
+    _BULK_OMICS_WORKER_TICKS = int(ticks)
+    _BULK_OMICS_WORKER_SEED = int(seed)
+
+
+def _bulk_omics_worker_eval(ri: int) -> tuple[int, int, Optional[Dict[str, Any]], Optional[list[float]], int, int]:
+    if (
+        _BULK_OMICS_WORKER_BASE is None
+        or _BULK_OMICS_WORKER_FEATURES is None
+        or _BULK_OMICS_WORKER_TICKS is None
+        or _BULK_OMICS_WORKER_SEED is None
+    ):
+        raise ValueError("bulk omics worker not initialized")
+
+    ticks_i = int(_BULK_OMICS_WORKER_TICKS)
+    seed_i = int(_BULK_OMICS_WORKER_SEED)
+    seed0 = int(seed_i) + (int(ri) * 97)
+
+    pf = _preflight_death_before_ticks(_BULK_OMICS_WORKER_BASE, ticks=int(ticks_i), seed0=int(seed0))
+    if isinstance(pf, dict):
+        return int(ri), int(seed0), dict(pf), None, 0, 0
+
+    p = _run_payload_ticks(_BULK_OMICS_WORKER_BASE, ticks=int(ticks_i), seed0=int(seed0))
+    H = int(p.get("H") or 0)
+    W = int(p.get("W") or 0)
+    if H <= 0 or W <= 0:
+        raise ValueError("payload invalid H/W")
+    expected_len = int(H * W)
+    layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+    if not layers:
+        raise ValueError("payload has no float32 layers")
+
+    vv: list[float] = []
+    for ln in _BULK_OMICS_WORKER_FEATURES:
+        arr = layers.get(ln)
+        if arr is None:
+            vv.append(0.0)
+            continue
+        try:
+            s = float(np.asarray(arr, dtype=np.float64).reshape(-1).sum())
+        except Exception:
+            s = 0.0
+        if not np.isfinite(s) or s < 0.0:
+            s = 0.0
+        vv.append(float(s))
+
+    return int(ri), int(seed0), None, vv, int(H), int(W)
+
+
+_STX_TESTS_WORKER_BASE: Optional[Dict[str, Any]] = None
+_STX_TESTS_WORKER_GENES: Optional[list[str]] = None
+_STX_TESTS_WORKER_TICKS: Optional[int] = None
+_STX_TESTS_WORKER_SEED: Optional[int] = None
+
+
+def _stx_tests_worker_init(base: Dict[str, Any], genes: list[str], ticks: int, seed: int) -> None:
+    global _STX_TESTS_WORKER_BASE
+    global _STX_TESTS_WORKER_GENES
+    global _STX_TESTS_WORKER_TICKS
+    global _STX_TESTS_WORKER_SEED
+    _STX_TESTS_WORKER_BASE = base
+    _STX_TESTS_WORKER_GENES = [str(x) for x in (genes or []) if isinstance(x, str) and x]
+    _STX_TESTS_WORKER_TICKS = int(ticks)
+    _STX_TESTS_WORKER_SEED = int(seed)
+
+
+def _stx_tests_worker_eval(ri: int) -> tuple[int, int, Optional[Dict[str, Any]], int, int, list[Dict[str, Any]]]:
+    if (
+        _STX_TESTS_WORKER_BASE is None
+        or _STX_TESTS_WORKER_GENES is None
+        or _STX_TESTS_WORKER_TICKS is None
+        or _STX_TESTS_WORKER_SEED is None
+    ):
+        raise ValueError("spatial_tx worker not initialized")
+
+    ticks_i = int(_STX_TESTS_WORKER_TICKS)
+    seed_i = int(_STX_TESTS_WORKER_SEED)
+    seed0 = int(seed_i) + (int(ri) * 97)
+
+    pf = _preflight_death_before_ticks(_STX_TESTS_WORKER_BASE, ticks=int(ticks_i), seed0=int(seed0))
+    if isinstance(pf, dict):
+        return int(ri), int(seed0), dict(pf), 0, 0, []
+
+    p = _run_payload_ticks(_STX_TESTS_WORKER_BASE, ticks=int(ticks_i), seed0=int(seed0))
+    tx = _spatial_tx_rows(
+        p,
+        _STX_TESTS_WORKER_GENES,
+        cell_layer="",
+        min_cell_value=0.0,
+        stride=1,
+        max_spots=None,
+        seed=int(seed0),
+    )
+    H = int(tx.get("H") or 0)
+    W = int(tx.get("W") or 0)
+    rows = tx.get("rows")
+    if not isinstance(rows, list):
+        rows = []
+    rows_out: list[Dict[str, Any]] = [r for r in rows if isinstance(r, dict)]
+    return int(ri), int(seed0), None, int(H), int(W), rows_out
+
+
+_CHAR_WORKER_BASE: Optional[Dict[str, Any]] = None
+_CHAR_WORKER_TICKS: Optional[int] = None
+_CHAR_WORKER_SEED: Optional[int] = None
+_CHAR_WORKER_NAMES: Optional[list[str]] = None
+_CHAR_WORKER_DEATH_NAMES: Optional[list[str]] = None
+_CHAR_WORKER_MODE: Optional[str] = None
+
+
+def _char_worker_init(
+    base: Dict[str, Any],
+    ticks: int,
+    seed: int,
+    names: list[str],
+    death_names: list[str],
+    mode: str,
+) -> None:
+    global _CHAR_WORKER_BASE
+    global _CHAR_WORKER_TICKS
+    global _CHAR_WORKER_SEED
+    global _CHAR_WORKER_NAMES
+    global _CHAR_WORKER_DEATH_NAMES
+    global _CHAR_WORKER_MODE
+    _CHAR_WORKER_BASE = base
+    _CHAR_WORKER_TICKS = int(ticks)
+    _CHAR_WORKER_SEED = int(seed)
+    _CHAR_WORKER_NAMES = [str(x) for x in (names or []) if isinstance(x, str) and x]
+    _CHAR_WORKER_DEATH_NAMES = [str(x) for x in (death_names or []) if isinstance(x, str) and x]
+    _CHAR_WORKER_MODE = str(mode or "").strip().lower()
+
+
+def _char_worker_eval(ri: int) -> tuple[int, int, Dict[str, list[float]], int, str]:
+    if (
+        _CHAR_WORKER_BASE is None
+        or _CHAR_WORKER_TICKS is None
+        or _CHAR_WORKER_SEED is None
+        or _CHAR_WORKER_NAMES is None
+        or _CHAR_WORKER_DEATH_NAMES is None
+        or _CHAR_WORKER_MODE is None
+    ):
+        raise ValueError("characterization worker not initialized")
+
+    ticks_i = int(_CHAR_WORKER_TICKS)
+    seed_i = int(_CHAR_WORKER_SEED)
+    seed0 = int(seed_i) + (int(ri) * 97)
+
+    if str(_CHAR_WORKER_MODE) == "invivo":
+        s0, dt0, dm0 = _run_in_vivo_measurement_series_until_death(
+            _CHAR_WORKER_BASE,
+            ticks=int(ticks_i),
+            seed0=int(seed0),
+            death_names=_CHAR_WORKER_DEATH_NAMES,
+        )
+        return int(ri), int(seed0), s0, int(dt0), str(dm0)
+
+    s0, _m0 = _run_cell_culture_measurement_series_and_metrics(
+        _CHAR_WORKER_BASE,
+        ticks=int(ticks_i),
+        seed0=int(seed0),
+        names=_CHAR_WORKER_NAMES,
+    )
+    return int(ri), int(seed0), s0, int(ticks_i), ""
+
+
+_AGING_CLAIM_WORKER_HEALTHY_BASE: Optional[Dict[str, Any]] = None
+_AGING_CLAIM_WORKER_HEALTHY_TREATED: Optional[Dict[str, Any]] = None
+_AGING_CLAIM_WORKER_DEATH_NAMES: Optional[list[str]] = None
+_AGING_CLAIM_WORKER_TICKS: Optional[int] = None
+_AGING_CLAIM_WORKER_SEED: Optional[int] = None
+
+
+def _aging_claim_worker_init(
+    healthy_base: Dict[str, Any],
+    healthy_treated: Dict[str, Any],
+    death_names: list[str],
+    ticks: int,
+    seed: int,
+) -> None:
+    global _AGING_CLAIM_WORKER_HEALTHY_BASE
+    global _AGING_CLAIM_WORKER_HEALTHY_TREATED
+    global _AGING_CLAIM_WORKER_DEATH_NAMES
+    global _AGING_CLAIM_WORKER_TICKS
+    global _AGING_CLAIM_WORKER_SEED
+    _AGING_CLAIM_WORKER_HEALTHY_BASE = healthy_base
+    _AGING_CLAIM_WORKER_HEALTHY_TREATED = healthy_treated
+    _AGING_CLAIM_WORKER_DEATH_NAMES = list(death_names)
+    _AGING_CLAIM_WORKER_TICKS = int(ticks)
+    _AGING_CLAIM_WORKER_SEED = int(seed)
+
+
+def _aging_claim_worker_eval(ri: int) -> tuple[int, int, str, int, str]:
+    if (
+        _AGING_CLAIM_WORKER_HEALTHY_BASE is None
+        or _AGING_CLAIM_WORKER_HEALTHY_TREATED is None
+        or _AGING_CLAIM_WORKER_DEATH_NAMES is None
+        or _AGING_CLAIM_WORKER_TICKS is None
+        or _AGING_CLAIM_WORKER_SEED is None
+    ):
+        raise ValueError("aging claim worker not initialized")
+
+    ticks_i = int(_AGING_CLAIM_WORKER_TICKS)
+    seed_i = int(_AGING_CLAIM_WORKER_SEED)
+    seed0_b = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+    seed0_t = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+    rb = _run_lifespan_death_tick(
+        _AGING_CLAIM_WORKER_HEALTHY_BASE,
+        ticks=int(ticks_i),
+        seed0=int(seed0_b),
+        death_names=_AGING_CLAIM_WORKER_DEATH_NAMES,
+    )
+    rt = _run_lifespan_death_tick(
+        _AGING_CLAIM_WORKER_HEALTHY_TREATED,
+        ticks=int(ticks_i),
+        seed0=int(seed0_t),
+        death_names=_AGING_CLAIM_WORKER_DEATH_NAMES,
+    )
+    dt_b = int(rb.get("death_tick")) if isinstance(rb, dict) else int(ticks_i)
+    dt_t = int(rt.get("death_tick")) if isinstance(rt, dict) else int(ticks_i)
+    dm_b = str(rb.get("death_measurement") or "") if isinstance(rb, dict) else ""
+    dm_t = str(rt.get("death_measurement") or "") if isinstance(rt, dict) else ""
+    return int(ri), int(dt_b), str(dm_b), int(dt_t), str(dm_t)
+
+
+_DISEASE_CLAIM_WORKER_HEALTHY: Optional[Dict[str, Any]] = None
+_DISEASE_CLAIM_WORKER_SICK_BASE: Optional[Dict[str, Any]] = None
+_DISEASE_CLAIM_WORKER_SICK_TREATED: Optional[Dict[str, Any]] = None
+_DISEASE_CLAIM_WORKER_DEATH_NAMES: Optional[list[str]] = None
+_DISEASE_CLAIM_WORKER_TICKS: Optional[int] = None
+_DISEASE_CLAIM_WORKER_SEED: Optional[int] = None
+_DISEASE_CLAIM_WORKER_RUN_TREATED: Optional[bool] = None
+
+
+def _disease_claim_worker_init(
+    healthy: Dict[str, Any],
+    sick_base: Dict[str, Any],
+    sick_treated: Dict[str, Any],
+    death_names: list[str],
+    ticks: int,
+    seed: int,
+    run_treated: bool,
+) -> None:
+    global _DISEASE_CLAIM_WORKER_HEALTHY
+    global _DISEASE_CLAIM_WORKER_SICK_BASE
+    global _DISEASE_CLAIM_WORKER_SICK_TREATED
+    global _DISEASE_CLAIM_WORKER_DEATH_NAMES
+    global _DISEASE_CLAIM_WORKER_TICKS
+    global _DISEASE_CLAIM_WORKER_SEED
+    global _DISEASE_CLAIM_WORKER_RUN_TREATED
+    _DISEASE_CLAIM_WORKER_HEALTHY = healthy
+    _DISEASE_CLAIM_WORKER_SICK_BASE = sick_base
+    _DISEASE_CLAIM_WORKER_SICK_TREATED = sick_treated
+    _DISEASE_CLAIM_WORKER_DEATH_NAMES = list(death_names)
+    _DISEASE_CLAIM_WORKER_TICKS = int(ticks)
+    _DISEASE_CLAIM_WORKER_SEED = int(seed)
+    _DISEASE_CLAIM_WORKER_RUN_TREATED = bool(run_treated)
+
+
+def _disease_claim_worker_eval(ri: int) -> tuple[int, int, str, int, str, int, str]:
+    if (
+        _DISEASE_CLAIM_WORKER_HEALTHY is None
+        or _DISEASE_CLAIM_WORKER_SICK_BASE is None
+        or _DISEASE_CLAIM_WORKER_SICK_TREATED is None
+        or _DISEASE_CLAIM_WORKER_DEATH_NAMES is None
+        or _DISEASE_CLAIM_WORKER_TICKS is None
+        or _DISEASE_CLAIM_WORKER_SEED is None
+        or _DISEASE_CLAIM_WORKER_RUN_TREATED is None
+    ):
+        raise ValueError("disease claim worker not initialized")
+
+    ticks_i = int(_DISEASE_CLAIM_WORKER_TICKS)
+    seed_i = int(_DISEASE_CLAIM_WORKER_SEED)
+    seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+    seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+
+    rh = _run_lifespan_death_tick(
+        _DISEASE_CLAIM_WORKER_HEALTHY,
+        ticks=int(ticks_i),
+        seed0=int(seed0_h),
+        death_names=_DISEASE_CLAIM_WORKER_DEATH_NAMES,
+    )
+    rs0 = _run_lifespan_death_tick(
+        _DISEASE_CLAIM_WORKER_SICK_BASE,
+        ticks=int(ticks_i),
+        seed0=int(seed0_s),
+        death_names=_DISEASE_CLAIM_WORKER_DEATH_NAMES,
+    )
+    if bool(_DISEASE_CLAIM_WORKER_RUN_TREATED):
+        rs = _run_lifespan_death_tick(
+            _DISEASE_CLAIM_WORKER_SICK_TREATED,
+            ticks=int(ticks_i),
+            seed0=int(seed0_s),
+            death_names=_DISEASE_CLAIM_WORKER_DEATH_NAMES,
+        )
+    else:
+        rs = rs0
+
+    dt_h = int(rh.get("death_tick")) if isinstance(rh, dict) else int(ticks_i)
+    dt_s0 = int(rs0.get("death_tick")) if isinstance(rs0, dict) else int(ticks_i)
+    dt_s = int(rs.get("death_tick")) if isinstance(rs, dict) else int(ticks_i)
+    dm_h = str(rh.get("death_measurement") or "") if isinstance(rh, dict) else ""
+    dm_s0 = str(rs0.get("death_measurement") or "") if isinstance(rs0, dict) else ""
+    dm_s = str(rs.get("death_measurement") or "") if isinstance(rs, dict) else ""
+    return int(ri), int(dt_h), str(dm_h), int(dt_s0), str(dm_s0), int(dt_s), str(dm_s)
 
 
 _INVIVO_WORKER_HEALTHY_BASE: Optional[Dict[str, Any]] = None
@@ -3743,6 +5010,187 @@ def _csv_from_rows(header: list[str], rows: list[list[Any]]) -> str:
     return "\n".join(out_lines) + "\n"
 
 
+def _stx_pool_matrix_and_metadata_csv(
+    matrix_csv_bytes: bytes,
+    meta_csv_bytes: bytes,
+    *,
+    k: int,
+) -> tuple[bytes, bytes]:
+    kk = max(1, int(k))
+    if kk <= 1:
+        return bytes(matrix_csv_bytes or b""), bytes(meta_csv_bytes or b"")
+
+    mat_txt = ""
+    try:
+        mat_txt = (matrix_csv_bytes or b"").decode("utf-8", errors="replace")
+    except Exception:
+        mat_txt = ""
+    meta_txt = ""
+    try:
+        meta_txt = (meta_csv_bytes or b"").decode("utf-8", errors="replace")
+    except Exception:
+        meta_txt = ""
+
+    mat_lines = [ln for ln in str(mat_txt).splitlines() if str(ln).strip()]
+    meta_lines = [ln for ln in str(meta_txt).splitlines() if str(ln).strip()]
+    if len(mat_lines) < 2 or len(meta_lines) < 2:
+        return bytes(matrix_csv_bytes or b""), bytes(meta_csv_bytes or b"")
+
+    mat_header = [str(x or "") for x in mat_lines[0].split(",")]
+    meta_header = [str(x or "") for x in meta_lines[0].split(",")]
+    if len(mat_header) < 2 or not meta_header:
+        return bytes(matrix_csv_bytes or b""), bytes(meta_csv_bytes or b"")
+
+    try:
+        meta_cell_id_i = meta_header.index("cell_id")
+    except Exception:
+        meta_cell_id_i = -1
+    try:
+        meta_x_i = meta_header.index("x")
+    except Exception:
+        meta_x_i = -1
+    try:
+        meta_y_i = meta_header.index("y")
+    except Exception:
+        meta_y_i = -1
+    try:
+        meta_grid_i = meta_header.index("grid_index")
+    except Exception:
+        meta_grid_i = -1
+    if meta_cell_id_i < 0 or meta_x_i < 0 or meta_y_i < 0:
+        return bytes(matrix_csv_bytes or b""), bytes(meta_csv_bytes or b"")
+
+    cell_to_xy: Dict[str, tuple[int, int]] = {}
+    cell_to_meta: Dict[str, list[str]] = {}
+    block_rep_meta: Dict[tuple[int, int], list[str]] = {}
+    max_x = -1
+    max_y = -1
+    w_votes: Dict[int, int] = {}
+    for ln in meta_lines[1:]:
+        cols = [str(x or "") for x in str(ln).split(",")]
+        if len(cols) < len(meta_header):
+            continue
+        cid = str(cols[int(meta_cell_id_i)] or "")
+        if not cid:
+            continue
+        try:
+            xi = int(float(cols[int(meta_x_i)]))
+            yi = int(float(cols[int(meta_y_i)]))
+        except Exception:
+            continue
+        cell_to_xy[str(cid)] = (int(xi), int(yi))
+        cell_to_meta[str(cid)] = list(cols)
+        key = (int(yi) // int(kk), int(xi) // int(kk))
+        if key not in block_rep_meta:
+            block_rep_meta[key] = list(cols)
+        if int(meta_grid_i) >= 0:
+            try:
+                gi = int(float(cols[int(meta_grid_i)]))
+            except Exception:
+                gi = -1
+            if int(gi) >= 0 and int(yi) > 0:
+                num = int(gi) - int(xi)
+                if num >= 0 and (num % int(yi)) == 0:
+                    w0 = int(num // int(yi))
+                    if w0 > 0:
+                        w_votes[int(w0)] = int(w_votes.get(int(w0), 0)) + 1
+        if int(xi) > int(max_x):
+            max_x = int(xi)
+        if int(yi) > int(max_y):
+            max_y = int(yi)
+
+    if not cell_to_xy:
+        return bytes(matrix_csv_bytes or b""), bytes(meta_csv_bytes or b"")
+
+    w_est = 0
+    if w_votes:
+        try:
+            w_est = int(sorted(w_votes.items(), key=lambda kv: (-int(kv[1]), int(kv[0])))[0][0])
+        except Exception:
+            w_est = 0
+    if int(w_est) <= 0:
+        w_est = int(max_x + 1) if int(max_x) >= 0 else 0
+
+    g = int(len(mat_header) - 1)
+    block_sum: Dict[tuple[int, int], np.ndarray] = {}
+    block_root: Dict[tuple[int, int], str] = {}
+    block_x_acc: Dict[tuple[int, int], int] = {}
+    block_y_acc: Dict[tuple[int, int], int] = {}
+    block_n: Dict[tuple[int, int], int] = {}
+
+    for ln in mat_lines[1:]:
+        cols = [str(x or "") for x in str(ln).split(",")]
+        if len(cols) < int(g + 1):
+            continue
+        cid = str(cols[0] or "")
+        if not cid:
+            continue
+        xy = cell_to_xy.get(cid)
+        if xy is None:
+            continue
+        xi, yi = xy
+        bx = int(xi) // int(kk)
+        by = int(yi) // int(kk)
+        key = (int(by), int(bx))
+        acc = block_sum.get(key)
+        if acc is None:
+            acc = np.zeros(int(g), dtype=np.int64)
+            block_sum[key] = acc
+        for j in range(int(g)):
+            try:
+                vv = int(float(cols[int(j + 1)]))
+            except Exception:
+                vv = 0
+            acc[int(j)] += int(vv)
+        if key not in block_root:
+            base = str(cid)
+            if "_" in base:
+                try:
+                    base = base.rsplit("_", 1)[0]
+                except Exception:
+                    base = str(cid)
+            block_root[key] = str(base)
+        block_x_acc[key] = int(block_x_acc.get(key, 0)) + int(xi)
+        block_y_acc[key] = int(block_y_acc.get(key, 0)) + int(yi)
+        block_n[key] = int(block_n.get(key, 0)) + 1
+
+    if not block_sum:
+        return bytes(matrix_csv_bytes or b""), bytes(meta_csv_bytes or b"")
+
+    keys = sorted(block_sum.keys())
+    out_mat_rows: list[list[Any]] = []
+    out_meta_rows: list[list[Any]] = []
+    for key in keys:
+        by, bx = key
+        n0 = int(block_n.get(key, 0))
+        if n0 <= 0:
+            continue
+        x_new = int(round(float(block_x_acc.get(key, 0)) / float(n0)))
+        y_new = int(round(float(block_y_acc.get(key, 0)) / float(n0)))
+        root = str(block_root.get(key, "spot") or "spot")
+        new_cid = f"{root}_p{int(kk)}_{int(by)}_{int(bx)}"
+
+        acc = block_sum.get(key)
+        if acc is None:
+            continue
+        out_mat_rows.append([str(new_cid), *[int(x) for x in np.asarray(acc, dtype=np.int64).tolist()]])
+
+        rep_meta = block_rep_meta.get((int(by), int(bx)))
+        if rep_meta is None:
+            continue
+        cols = list(rep_meta)
+        cols[int(meta_cell_id_i)] = str(new_cid)
+        cols[int(meta_x_i)] = str(int(x_new))
+        cols[int(meta_y_i)] = str(int(y_new))
+        if int(meta_grid_i) >= 0 and int(w_est) > 0:
+            cols[int(meta_grid_i)] = str(int(int(y_new) * int(w_est) + int(x_new)))
+        out_meta_rows.append(cols)
+
+    out_mat_txt = _csv_from_rows(list(mat_header), out_mat_rows)
+    out_meta_txt = _csv_from_rows(list(meta_header), [[str(x) for x in r] for r in out_meta_rows])
+    return out_mat_txt.encode("utf-8"), out_meta_txt.encode("utf-8")
+
+
 def _safe_read_json(path: Path) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -4054,8 +5502,11 @@ class _OmicsWorkspace:
                     break
         return str(cond or ""), rep
 
-    def inventory(self, player_id_in: Any, *, limit_runs: int = 2000) -> Dict[str, Any]:
+    def inventory(self, player_id_in: Any, *, limit_runs: int = 2000, view: str = "compact") -> Dict[str, Any]:
         pid = _sanitize_player_id(player_id_in)
+        view_s = str(view or "").strip().lower()
+        if view_s not in ("compact", "full"):
+            view_s = "compact"
         runs = self.list_runs(limit=int(limit_runs))
         files_out: list[Dict[str, Any]] = []
         datasets_out: list[Dict[str, Any]] = []
@@ -4140,9 +5591,9 @@ class _OmicsWorkspace:
                 "gene_set": str(gene_set_s),
                 "display_name": str(dataset_display_name),
                 "dataset_prefix": str(dataset_prefix),
-                "files": [],
-                "data_files": [],
-                "metadata_files": [],
+                "file_ids": [],
+                "data_file_ids": [],
+                "metadata_file_ids": [],
                 "metadata_map": {},
             }
 
@@ -4150,7 +5601,9 @@ class _OmicsWorkspace:
             if not isinstance(f0, list):
                 f0 = []
 
-            by_name: Dict[str, Dict[str, Any]] = {}
+            by_name: Dict[str, str] = {}
+            by_fid: Dict[str, Dict[str, Any]] = {}
+            run_meta_fid = ""
             for ent in f0:
                 if not isinstance(ent, dict):
                     continue
@@ -4267,8 +5720,9 @@ class _OmicsWorkspace:
                 )
 
                 f_ent = dict(files_out[-1])
-                dataset_obj["files"].append(f_ent)
-                by_name[str(name)] = f_ent
+                by_name[str(name)] = str(fid)
+                by_fid[str(fid)] = f_ent
+                dataset_obj["file_ids"].append(str(fid))
                 if str(role) in (
                     "counts_noisy",
                     "counts_truth",
@@ -4281,34 +5735,33 @@ class _OmicsWorkspace:
                     "survival",
                     "culture_metrics",
                 ):
-                    dataset_obj["data_files"].append(f_ent)
+                    dataset_obj["data_file_ids"].append(str(fid))
                 if str(role) in ("run_metadata", "cell_metadata"):
-                    dataset_obj["metadata_files"].append(f_ent)
-
-            run_meta_file = None
-            for f_ent in dataset_obj.get("files") or []:
-                if not isinstance(f_ent, dict):
-                    continue
-                if str(f_ent.get("role") or "") == "run_metadata":
-                    run_meta_file = f_ent
-                    break
+                    dataset_obj["metadata_file_ids"].append(str(fid))
+                if str(role) == "run_metadata":
+                    run_meta_fid = str(fid)
 
             metadata_map: Dict[str, Any] = {}
-            for f_ent in dataset_obj.get("data_files") or []:
+            data_ids0 = dataset_obj.get("data_file_ids")
+            if not isinstance(data_ids0, list):
+                data_ids0 = []
+            for dfid in data_ids0:
+                if not isinstance(dfid, str) or not dfid:
+                    continue
+                f_ent = by_fid.get(str(dfid))
                 if not isinstance(f_ent, dict):
                     continue
                 nm = str(f_ent.get("name") or "")
-                metas: list[Dict[str, Any]] = []
-                if isinstance(run_meta_file, dict):
-                    metas.append(run_meta_file)
+                metas: list[str] = []
+                if run_meta_fid:
+                    metas.append(str(run_meta_fid))
                 if nm.endswith("_matrix.csv"):
                     meta_name = nm[:-len("_matrix.csv")] + "_cell_metadata.csv"
                     m2 = by_name.get(meta_name)
-                    if isinstance(m2, dict):
-                        metas.append(m2)
-                metadata_map[str(f_ent.get("file_id") or "")] = {
-                    "data_file": f_ent,
-                    "metadata_files": metas,
+                    if isinstance(m2, str) and m2:
+                        metas.append(str(m2))
+                metadata_map[str(dfid)] = {
+                    "metadata_file_ids": metas,
                 }
             dataset_obj["metadata_map"] = metadata_map
 
@@ -4355,6 +5808,14 @@ class _OmicsWorkspace:
 
         datasets_out.sort(key=_ds_key, reverse=True)
 
+        files_by_id: Dict[str, Dict[str, Any]] = {}
+        for f in files_out:
+            if not isinstance(f, dict):
+                continue
+            fid = str(f.get("file_id") or "")
+            if fid and fid not in files_by_id:
+                files_by_id[fid] = f
+
         llm_lines: list[str] = []
         analysis_data_hint = "data files"
         analysis_step2_note = ""
@@ -4364,7 +5825,13 @@ class _OmicsWorkspace:
 
             is_spatial = bool(str(recent.get("gene_set") or "").strip())
             if not is_spatial:
-                for f_ent in (recent.get("metadata_files") or []):
+                meta_ids = recent.get("metadata_file_ids")
+                if not isinstance(meta_ids, list):
+                    meta_ids = []
+                for mfid in meta_ids:
+                    if not isinstance(mfid, str) or not mfid:
+                        continue
+                    f_ent = files_by_id.get(str(mfid))
                     if not isinstance(f_ent, dict):
                         continue
                     if str(f_ent.get("role") or "") == "cell_metadata":
@@ -4396,100 +5863,201 @@ class _OmicsWorkspace:
             if ds_name:
                 llm_lines.append(f"Dataset: {ds_name}")
 
-            recent_data = recent.get("data_files")
-            if not isinstance(recent_data, list):
-                recent_data = []
-            for f_ent in recent_data:
+            recent_data_ids = recent.get("data_file_ids")
+            if not isinstance(recent_data_ids, list):
+                recent_data_ids = []
+            for dfid in recent_data_ids:
+                if not isinstance(dfid, str) or not dfid:
+                    continue
+                f_ent = files_by_id.get(str(dfid))
                 if not isinstance(f_ent, dict):
                     continue
-                fn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
                 fid = str(f_ent.get("file_id") or "")
-                if fn and fid:
-                    llm_lines.append(f"- {fn} (file_id={fid})")
+                if not fid:
+                    continue
+                if view_s == "compact":
+                    role = str(f_ent.get("role") or "")
+                    cond = str(f_ent.get("condition") or "")
+                    rep = f_ent.get("replicate")
+                    rep_s = ""
+                    try:
+                        if rep is not None:
+                            rep_s = str(int(rep))
+                    except Exception:
+                        rep_s = ""
+                    extra: list[str] = []
+                    if role:
+                        extra.append(f"role={role}")
+                    if cond:
+                        extra.append(f"condition={cond}")
+                    if rep_s:
+                        extra.append(f"replicate={rep_s}")
+                    if extra:
+                        llm_lines.append(f"- file_id={fid} (" + ", ".join(extra) + ")")
+                    else:
+                        llm_lines.append(f"- file_id={fid}")
+                else:
+                    fn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
+                    if fn:
+                        llm_lines.append(f"- {fn} (file_id={fid})")
 
             meta_map = recent.get("metadata_map")
-            if isinstance(meta_map, dict) and recent_data:
+            if isinstance(meta_map, dict) and recent_data_ids:
                 llm_lines.append("")
                 llm_lines.append("Metadata mapping (what to load alongside each data file):")
-                for f_ent in recent_data:
+                for dfid in recent_data_ids:
+                    if not isinstance(dfid, str) or not dfid:
+                        continue
+                    f_ent = files_by_id.get(str(dfid))
                     if not isinstance(f_ent, dict):
                         continue
-                    dfid = str(f_ent.get("file_id") or "")
                     dfn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
-                    if not dfid or not dfn:
-                        continue
-                    mm = meta_map.get(dfid)
+                    mm = meta_map.get(str(dfid))
                     if not isinstance(mm, dict):
                         continue
-                    mfiles = mm.get("metadata_files")
+                    mfiles = mm.get("metadata_file_ids")
                     if not isinstance(mfiles, list) or not mfiles:
                         continue
                     mrefs: list[str] = []
-                    for mf in mfiles:
+                    for mfid in mfiles:
+                        if not isinstance(mfid, str) or not mfid:
+                            continue
+                        mf = files_by_id.get(str(mfid))
                         if not isinstance(mf, dict):
                             continue
-                        mfn = str(mf.get("llm_filename") or mf.get("name") or "")
-                        mfid = str(mf.get("file_id") or "")
-                        if mfn and mfid:
-                            mrefs.append(f"{mfn} (file_id={mfid})")
+                        if view_s == "compact":
+                            mrefs.append(f"file_id={str(mfid)}")
+                        else:
+                            mfn = str(mf.get("llm_filename") or mf.get("name") or "")
+                            if mfn:
+                                mrefs.append(f"{mfn} (file_id={str(mfid)})")
                     if mrefs:
-                        llm_lines.append(f"- {dfn} -> " + ", ".join(mrefs))
+                        if view_s == "compact":
+                            llm_lines.append(f"- file_id={str(dfid)} -> " + ", ".join(mrefs))
+                        else:
+                            if not dfn:
+                                continue
+                            llm_lines.append(f"- {dfn} -> " + ", ".join(mrefs))
 
             if len(datasets_out) > 1:
                 llm_lines.append("")
                 llm_lines.append("In addition to the recently produced files you also have the following datasets available:")
-                for ds in datasets_out[1:]:
+                llm_lines.append("(To inspect an older dataset's exact file_ids, call GET /api/omics/run?run_id=<run_id>.)")
+                max_other = 30
+                for ds in datasets_out[1 : 1 + int(max_other)]:
                     if not isinstance(ds, dict):
                         continue
                     llm_lines.append("")
-                    llm_lines.append(f"Dataset: {str(ds.get('display_name') or '')}")
-                    data_files = ds.get("data_files")
-                    if not isinstance(data_files, list):
-                        data_files = []
-                    for f_ent in data_files[:12]:
-                        if not isinstance(f_ent, dict):
-                            continue
-                        fn = str(f_ent.get("llm_filename") or f_ent.get("name") or "")
-                        fid = str(f_ent.get("file_id") or "")
-                        if fn and fid:
-                            llm_lines.append(f"- {fn} (file_id={fid})")
-                    meta_file = None
-                    for f_ent in (ds.get("files") or []):
-                        if not isinstance(f_ent, dict):
-                            continue
-                        if str(f_ent.get("role") or "") == "run_metadata":
-                            meta_file = f_ent
-                            break
-                    if isinstance(meta_file, dict):
-                        fn = str(meta_file.get("llm_filename") or meta_file.get("name") or "")
-                        fid = str(meta_file.get("file_id") or "")
-                        if fn and fid:
-                            llm_lines.append("Whose run-level metadata is in file:")
-                            llm_lines.append(f"- {fn} (file_id={fid})")
+                    ds_name2 = str(ds.get("display_name") or "").strip()
+                    rid2 = str(ds.get("run_id") or "").strip()
+                    n_data = 0
+                    n_meta = 0
+                    try:
+                        n_data = int(len(ds.get("data_file_ids") or [])) if isinstance(ds.get("data_file_ids"), list) else 0
+                    except Exception:
+                        n_data = 0
+                    try:
+                        n_meta = int(len(ds.get("metadata_file_ids") or [])) if isinstance(ds.get("metadata_file_ids"), list) else 0
+                    except Exception:
+                        n_meta = 0
+                    if ds_name2:
+                        if rid2:
+                            llm_lines.append(f"Dataset: {ds_name2} (run_id={rid2}, data_file_ids={n_data}, metadata_file_ids={n_meta})")
+                        else:
+                            llm_lines.append(f"Dataset: {ds_name2} (data_file_ids={n_data}, metadata_file_ids={n_meta})")
+                    elif rid2:
+                        llm_lines.append(f"Dataset: run_id={rid2} (data_file_ids={n_data}, metadata_file_ids={n_meta})")
+                if len(datasets_out) > (1 + int(max_other)):
+                    llm_lines.append("")
+                    llm_lines.append(f"(Additional datasets omitted from this message: {int(len(datasets_out) - (1 + int(max_other)))}. See JSON field 'datasets' for the full index.)")
         else:
-            llm_lines.append("No files are available for this player_id yet.")
+            llm_lines.append("No files are available yet.")
 
         llm_lines.append("")
         llm_lines.append("To perform an analysis:")
         llm_lines.append(f"1) Choose the file_id(s) for the data you want to analyze (typically {analysis_data_hint}).")
         llm_lines.append(f"2) Include the matching metadata file_id(s) shown in the mapping above.{analysis_step2_note}")
-        llm_lines.append("3) Think of the instructions for the analysis you want to run. If you are not sure what the data/metadata looks like ask and then you can ask again to analyze.")
-        llm_lines.append("4) If you need more samples to run the analysis run more samples before asking for the analysis. For example if you asked for an experiment with cell_culture_cancer, you might want to run the same experiment with cell_culture_healthy to get a control to compare to.")
+        llm_lines.append("3) Think of the instructions for the analysis you want to run. If you are not sure what the data/metadata looks like, ask to inspect the files first and then ask again to analyze.")
+        llm_lines.append("   For in vivo timecourse data: compute death day as the first day any *_death (or other death measurement) becomes 1. If no death event occurs within the recorded time window, treat that replicate as survived-through-study (censored), not as death at the final day.")
+        llm_lines.append("4) If you need more samples to run the analysis run more samples before asking for the analysis. For example if you asked for an experiment with a disease-like cell culture model, you might want to run the corresponding healthy cell culture model to get a control to compare to.")
         llm_lines.append("5) Call POST /api/omics/analyze with JSON like:")
-        llm_lines.append('{"player_id":"<player_id>","file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}')
+        llm_lines.append('{"file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}')
 
         llm_message = "\n".join([str(x) for x in llm_lines if isinstance(x, str)])
 
+        if view_s == "full":
+            return {
+                "player_id": str(pid),
+                "files": files_out,
+                "groups": groups_out,
+                "datasets": datasets_out,
+                "llm_message": llm_message,
+            }
+
+        files_compact: list[Dict[str, Any]] = []
+        for f in files_out:
+            if not isinstance(f, dict):
+                continue
+            files_compact.append(
+                {
+                    "file_id": f.get("file_id"),
+                    "display_name": f.get("display_name"),
+                    "role": f.get("role"),
+                    "kind": f.get("kind"),
+                    "experiment": f.get("experiment"),
+                    "condition": f.get("condition"),
+                    "replicate": f.get("replicate"),
+                    "run_id": f.get("run_id"),
+                    "bytes": f.get("bytes"),
+                    "created_at": f.get("created_at"),
+                }
+            )
+
+        datasets_compact: list[Dict[str, Any]] = []
+        for i, ds in enumerate(datasets_out):
+            if not isinstance(ds, dict):
+                continue
+            ent: Dict[str, Any] = {
+                "run_id": ds.get("run_id"),
+                "created_at": ds.get("created_at"),
+                "experiment": ds.get("experiment"),
+                "kind": ds.get("kind"),
+                "friendly_kind": ds.get("friendly_kind"),
+                "model": ds.get("model"),
+                "ticks": ds.get("ticks"),
+                "age_days": ds.get("age_days"),
+                "replicates": ds.get("replicates"),
+                "omics_set": ds.get("omics_set"),
+                "gene_set": ds.get("gene_set"),
+                "display_name": ds.get("display_name"),
+            }
+
+            if i == 0:
+                ent["data_file_ids"] = ds.get("data_file_ids")
+                ent["metadata_file_ids"] = ds.get("metadata_file_ids")
+                ent["metadata_map"] = ds.get("metadata_map")
+            else:
+                try:
+                    ent["data_file_ids_n"] = int(len(ds.get("data_file_ids") or [])) if isinstance(ds.get("data_file_ids"), list) else 0
+                except Exception:
+                    ent["data_file_ids_n"] = 0
+                try:
+                    ent["metadata_file_ids_n"] = int(len(ds.get("metadata_file_ids") or [])) if isinstance(ds.get("metadata_file_ids"), list) else 0
+                except Exception:
+                    ent["metadata_file_ids_n"] = 0
+
+            datasets_compact.append(ent)
+
         return {
             "player_id": str(pid),
-            "files": files_out,
+            "files": files_compact,
             "groups": groups_out,
-            "datasets": datasets_out,
+            "datasets": datasets_compact,
             "llm_message": llm_message,
         }
 
     def resolve_player_file_ids(self, player_id_in: Any, file_ids: list[str]) -> list[Dict[str, Any]]:
-        inv = self.inventory(player_id_in)
+        inv = self.inventory(player_id_in, view="full")
         files = inv.get("files")
         if not isinstance(files, list):
             return []
@@ -4502,6 +6070,110 @@ class _OmicsWorkspace:
             if fid and fid in wanted:
                 out.append(f)
         return out
+
+    def resolve_file_ids(self, file_ids: list[str], *, limit_runs: int = 2000) -> tuple[list[Dict[str, Any]], list[str]]:
+        wanted = [str(x or "").strip() for x in (file_ids or [])]
+        wanted = [x for x in wanted if x]
+        if not wanted:
+            return [], []
+
+        wanted_set = set(wanted)
+        by_fid: Dict[str, Dict[str, Any]] = {}
+        ambiguous: set[str] = set()
+
+        runs = self.list_runs(limit=int(limit_runs))
+        for mf in runs:
+            if not isinstance(mf, dict):
+                continue
+            rid = str(mf.get("run_id") or "").strip()
+            if not rid:
+                continue
+
+            files = mf.get("files")
+            if not isinstance(files, list) or not files:
+                continue
+
+            kind = str(mf.get("kind") or "")
+            friendly_kind = self._friendly_kind(kind)
+            exp = str(mf.get("experiment") or "")
+
+            for ent in files:
+                if not isinstance(ent, dict):
+                    continue
+                name = str(ent.get("name") or "")
+                if not name:
+                    continue
+                try:
+                    fid = self._file_id(str(rid), str(name))
+                except Exception:
+                    fid = ""
+                if not fid or fid not in wanted_set:
+                    continue
+
+                prev = by_fid.get(str(fid))
+                if isinstance(prev, dict):
+                    if str(prev.get("run_id") or "") != str(rid) or str(prev.get("name") or "") != str(name):
+                        ambiguous.add(str(fid))
+                    continue
+
+                role = self._file_role(str(name))
+                cond, rep = self._extract_condition_replicate(str(name))
+                display = str(friendly_kind)
+                if role == "counts_matrix":
+                    display += " counts matrix"
+                elif role == "counts_noisy":
+                    display += " counts (noisy)"
+                elif role == "counts_truth":
+                    display += " counts (truth)"
+                elif role == "measurements":
+                    display += " measurements"
+                elif role == "summarized_results":
+                    display += " summarized results"
+                elif role == "timecourse":
+                    display += " timecourse"
+                elif role == "timecourse_n":
+                    display += " timecourse_n"
+                elif role == "death":
+                    display += " death table"
+                elif role == "survival":
+                    display += " survival"
+                elif role == "culture_metrics":
+                    display += " culture metrics"
+                elif role == "cell_metadata":
+                    display += " cell metadata"
+                elif role == "run_metadata":
+                    display += " run metadata"
+                else:
+                    display += " file"
+                if cond:
+                    display += f" — {cond}"
+                if rep is not None:
+                    try:
+                        display += f" (replicate {int(rep)})"
+                    except Exception:
+                        pass
+                if exp:
+                    display += f" [{exp}]"
+
+                by_fid[str(fid)] = {
+                    "file_id": str(fid),
+                    "display_name": str(display),
+                    "run_id": str(rid),
+                    "name": str(name),
+                    "bytes": int(ent.get("bytes") or 0),
+                }
+
+            if len(by_fid) >= len(wanted_set):
+                break
+
+        out: list[Dict[str, Any]] = []
+        for fid in wanted:
+            if fid in ambiguous:
+                continue
+            ent = by_fid.get(str(fid))
+            if isinstance(ent, dict):
+                out.append(ent)
+        return out, sorted(list(ambiguous))
 
     def get_run(self, run_id: str) -> Dict[str, Any]:
         rid = _omics_safe_run_id(run_id)
@@ -8123,10 +9795,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
-    def _send_json(self, code: int, obj: Dict[str, Any]) -> None:
+    def _send_json(self, code: int, obj: Dict[str, Any], *, extra_headers: Optional[Dict[str, str]] = None) -> None:
         raw = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        if isinstance(extra_headers, dict):
+            for k, v in extra_headers.items():
+                try:
+                    if str(k or "").strip() and str(v or "").strip():
+                        self.send_header(str(k), str(v))
+                except Exception:
+                    pass
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -8228,6 +9907,9 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
             if path == "/api/spatial_tx/gene_sets":
                 self._send_json(200, {"ok": True, "gene_sets": _list_stx_gene_sets()})
                 return
+            if path == "/api/spatial_omics/type":
+                self._send_json(200, {"ok": True, "types": _list_spatial_omics_types()})
+                return
             if path == "/api/bulk_omics/sets":
                 self._send_json(200, {"ok": True, "sets": _list_bulk_omics_sets()})
                 return
@@ -8272,15 +9954,22 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/omics/inventory":
                 pid = ""
+                view = "compact"
                 try:
                     qv = qs.get("player_id")
                     if isinstance(qv, list) and qv:
                         pid = str(qv[0] or "")
                 except Exception:
                     pid = ""
+                try:
+                    qv = qs.get("view")
+                    if isinstance(qv, list) and qv:
+                        view = str(qv[0] or "compact")
+                except Exception:
+                    view = "compact"
                 if not pid:
                     raise ValueError("missing player_id")
-                inv = _OMICS.inventory(pid)
+                inv = _OMICS.inventory(pid, view=str(view or "compact"))
                 self._send_json(200, {"ok": True, **inv})
                 return
             if path == "/api/omics/run":
@@ -8295,7 +9984,27 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     raise ValueError("missing run_id")
                 manifest = _OMICS.get_run(rid)
                 files = _OMICS.list_files(rid)
-                self._send_json(200, {"ok": True, "run": manifest, "files": files})
+                out_files: list[Dict[str, Any]] = []
+                if isinstance(files, list):
+                    for ent in files:
+                        if not isinstance(ent, dict):
+                            continue
+                        name = str(ent.get("name") or "")
+                        if not name:
+                            continue
+                        try:
+                            fid = _OMICS._file_id(str(rid), str(name))
+                        except Exception:
+                            fid = ""
+                        out_files.append(
+                            {
+                                "name": str(name),
+                                "bytes": int(ent.get("bytes") or 0),
+                                "file_id": str(fid),
+                                "download_url": f"/api/omics/file?run_id={str(rid)}&name={str(name)}",
+                            }
+                        )
+                self._send_json(200, {"ok": True, "run": manifest, "files": out_files})
                 return
             if path == "/api/omics/file":
                 rid = ""
@@ -8328,9 +10037,13 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     name = ""
 
                 if fid:
-                    if not pid:
-                        raise ValueError("missing player_id")
-                    matches = _OMICS.resolve_player_file_ids(pid, [fid])
+                    matches: list[Dict[str, Any]] = []
+                    if pid:
+                        matches = _OMICS.resolve_player_file_ids(pid, [fid])
+                    else:
+                        matches, ambiguous = _OMICS.resolve_file_ids([fid])
+                        if ambiguous:
+                            raise ValueError("file_id is ambiguous")
                     if not matches:
                         raise ValueError("file not found")
                     m0 = matches[0]
@@ -8358,6 +10071,22 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 self._send_json(200, _DOC.list_docs())
                 return
             super().do_GET()
+        except Exception as e:
+            err_id = uuid.uuid4().hex[:12]
+            try:
+                _LOG.exception("GET handler error id=%s path=%s", str(err_id), str(self.path))
+            except Exception:
+                pass
+            if str(path).startswith("/api/"):
+                code = 500
+                if isinstance(e, ValueError):
+                    code = 400
+                try:
+                    self._send_json(int(code), {"ok": False, "error": str(e), "error_id": str(err_id)})
+                    return
+                except Exception:
+                    return
+            raise
         finally:
             try:
                 dt_ms = (time.time() - t0) * 1000.0
@@ -8482,20 +10211,31 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     t = str(text or "")
                     if not t:
                         return ""
+                    t = t.replace("tests_cancer_", "tests_disease_")
+                    t = t.replace("healthy_organism", "healthy")
+                    t = t.replace("cancer_organism", "disease")
+                    t = t.replace("healthy_cell_culture", "cell_culture_healthy")
+                    t = t.replace("cancer_cell_culture", "cell_culture_disease")
                     t = t.replace("/api/tests/cancer/", "/api/tests/disease/")
                     t = t.replace("/api/tests/cancer", "/api/tests/disease")
                     t = t.replace("/api/tests/hereditary_disease/", "/api/tests/disease/")
                     t = t.replace("/api/tests/hereditary_disease", "/api/tests/disease")
                     t = t.replace("/api/tests/aging/", "/api/tests/disease/")
                     t = t.replace("/api/tests/aging", "/api/tests/disease")
-                    t = re.sub(r"cancerous", "diseased", t, flags=re.IGNORECASE)
-                    t = re.sub(r"cancer", "disease", t, flags=re.IGNORECASE)
+                    t = re.sub(r"\bcancerous\b", "diseased", t, flags=re.IGNORECASE)
+                    t = re.sub(r"\bcancer\b", "disease", t, flags=re.IGNORECASE)
                     return t
 
                 instructions_prefix = (
                     "You will be communicating with an LLM. Do not generate files, plots, or charts. "
                     "Describe your findings in as much detail as possible using pure text. "
-                    "If helpful, you may include a small table in plain text."
+                    "If helpful, you may include a small table in plain text. "
+                    "IMPORTANT: Avoid strategic or normative language (e.g., 'candidate', 'recommend', 'therapy', 'inhibit', 'activate') "
+                    "unless the user's instructions explicitly ask you to recommend next steps. Default to descriptive reporting of computed results only. "
+                    "IMPORTANT: If you encounter any errors reading files or executing code, you must explicitly report the errors and stop; do not guess or approximate results. "
+                    "IMPORTANT: Always use the actual column names from the attached files as identifiers; never assume protein_1..protein_N ordering by index. "
+                    "IMPORTANT: The user's instructions may include additional context beyond the attachments (e.g., characterization or experimental setup). "
+                    "Clearly separate (A) results computed from attached files vs (B) statements inferred from extra context, and never present inferred statements as computed results."
                 )
                 instructions_eff = _mask_disease_term(instructions_prefix + "\n\n" + str(instructions))
 
@@ -8507,16 +10247,26 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                 selected: list[Dict[str, Any]] = []
                 if isinstance(file_ids_req, list) and file_ids_req:
-                    pid = _sanitize_player_id(player_id_req)
-                    if not pid:
-                        raise ValueError("missing player_id")
                     fids = [str(x or "").strip() for x in file_ids_req]
                     fids = [x for x in fids if x]
                     if not fids:
                         raise ValueError("no file_ids selected")
-                    selected = _OMICS.resolve_player_file_ids(pid, fids)
+                    pid = _sanitize_player_id(player_id_req)
+                    if pid:
+                        selected = _OMICS.resolve_player_file_ids(pid, fids)
+                    else:
+                        selected, ambiguous = _OMICS.resolve_file_ids(fids)
+                        if ambiguous:
+                            raise ValueError("ambiguous file_id(s): " + ", ".join([str(x) for x in ambiguous[:20]]))
                     if not selected:
-                        raise ValueError("no files selected")
+                        raise ValueError(
+                            "no files selected (0/%d file_ids matched inventory; pass file_id values from GET /api/omics/inventory?player_id=...)" % int(len(fids))
+                        )
+                    try:
+                        idx_by_fid = {str(fid): int(i) for i, fid in enumerate(list(fids)) if str(fid)}
+                        selected.sort(key=lambda d: idx_by_fid.get(str((d or {}).get("file_id") or ""), 10**9))
+                    except Exception:
+                        pass
                 else:
                     if not isinstance(run_id, str) or not run_id.strip():
                         raise ValueError("missing run_id")
@@ -8543,6 +10293,32 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 except Exception:
                     manifest = None
 
+                analyze_manifest_entries: list[Dict[str, Any]] = []
+                for i, ent in enumerate(list(selected)):
+                    if not isinstance(ent, dict):
+                        continue
+                    label = "FILE_%02d" % int(i + 1)
+                    ent["analyze_label"] = str(label)
+                    analyze_manifest_entries.append(
+                        {
+                            "label": str(label),
+                            "run_id": str(ent.get("run_id") or ""),
+                            "file_id": str(ent.get("file_id") or ""),
+                            "display_name": str(ent.get("display_name") or ent.get("name") or ""),
+                            "name": str(ent.get("name") or ""),
+                        }
+                    )
+
+                if analyze_manifest_entries:
+                    analyze_manifest_text = (
+                        "ATTACHMENT MANIFEST (authoritative):\n"
+                        "The files you can read are listed below with stable labels.\n"
+                        "When you refer to a file or dataset, use the label (e.g., FILE_01).\n"
+                        "Do NOT infer which file is baseline/treated from filenames; follow the user's instructions and map roles to FILE_XX explicitly.\n\n"
+                        + json.dumps(analyze_manifest_entries, indent=2)
+                    )
+                    instructions_eff = str(instructions_eff) + "\n\n" + _mask_disease_term(str(analyze_manifest_text))
+
                 model = "gpt-5.2"
                 if prov == "anthropic":
                     model = "claude-sonnet-4-5-20250929"
@@ -8556,6 +10332,43 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                 if isinstance(model_req, str) and model_req.strip():
                     model = str(model_req).strip()
+
+                stx_pool_k = 4
+                try:
+                    stx_pool_k = int(os.environ.get("DT_OMICS_ANALYZE_STX_POOL_K", str(stx_pool_k)) or stx_pool_k)
+                except Exception:
+                    stx_pool_k = 4
+                stx_pool_k = max(1, int(stx_pool_k))
+
+                ent_by_rid_name: Dict[tuple[str, str], Dict[str, Any]] = {}
+                for ent in selected:
+                    rid0 = str(ent.get("run_id") or "")
+                    name0 = str(ent.get("name") or "")
+                    if rid0 and name0:
+                        ent_by_rid_name[(str(rid0), str(name0))] = ent
+
+                pooled_bytes_by_rid_name: Dict[tuple[str, str], bytes] = {}
+                if int(stx_pool_k) > 1:
+                    for (rid0, name0), _ent0 in ent_by_rid_name.items():
+                        if not str(name0).endswith("_matrix.csv"):
+                            continue
+                        meta_name0 = str(name0[:-len("_matrix.csv")] + "_cell_metadata.csv")
+                        if (str(rid0), str(meta_name0)) not in ent_by_rid_name:
+                            continue
+                        try:
+                            p_mat = _OMICS.file_path(str(rid0), str(name0))
+                            p_meta = _OMICS.file_path(str(rid0), str(meta_name0))
+                            mat_bytes = p_mat.read_bytes()
+                            meta_bytes = p_meta.read_bytes()
+                            pooled_mat, pooled_meta = _stx_pool_matrix_and_metadata_csv(
+                                mat_bytes,
+                                meta_bytes,
+                                k=int(stx_pool_k),
+                            )
+                            pooled_bytes_by_rid_name[(str(rid0), str(name0))] = bytes(pooled_mat)
+                            pooled_bytes_by_rid_name[(str(rid0), str(meta_name0))] = bytes(pooled_meta)
+                        except Exception:
+                            pass
 
 
                 if prov in ("openai", "openai_compat"):
@@ -8582,12 +10395,15 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             raw_bytes = p.read_bytes()
                         except Exception:
                             raw_bytes = b""
-                        try:
-                            uploaded_bytes_total += int(len(raw_bytes or b""))
-                        except Exception:
-                            pass
 
+                        pb = pooled_bytes_by_rid_name.get((str(rid0), str(name0)))
+                        if pb is not None:
+                            raw_bytes = bytes(pb)
+
+                        label = str(ent.get("analyze_label") or "")
                         upload_name = str(p.name)
+                        if label:
+                            upload_name = str(label) + "__" + str(upload_name)
                         suf = str(p.suffix or "").lower()
                         if suf in (".csv", ".tsv", ".txt", ".json"):
                             try:
@@ -8597,6 +10413,11 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 upload_name = _mask_disease_term(upload_name)
                             except Exception:
                                 pass
+
+                        try:
+                            uploaded_bytes_total += int(len(raw_bytes or b""))
+                        except Exception:
+                            pass
 
                         bio = io.BytesIO(raw_bytes)
                         try:
@@ -8608,6 +10429,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         if fid:
                             file_ids.append(fid)
                         used_files.append({
+                            "label": str(label),
                             "run_id": rid0,
                             "name": name0,
                             "file_id": str(ent.get("file_id") or ""),
@@ -8621,28 +10443,119 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         }
                     ]
 
+                    max_out_tokens = 120000
+                    try:
+                        if max_tokens_req is not None:
+                            max_out_tokens = int(max_tokens_req)
+                    except Exception:
+                        max_out_tokens = 120000
+                    max_out_tokens = max(256, min(120000, int(max_out_tokens)))
+
                     base_model, effort = _openai_base_model_and_effort(str(model))
+                    model_call = str(base_model or model)
                     eff = str(effort or "medium")
-                    resp = client.responses.create(
-                        model=str(base_model or model),
-                        input=str(instructions_eff),
-                        text={"format": {"type": "text"}, "verbosity": "medium"},
-                        reasoning={"effort": eff, "summary": "auto"},
-                        tools=tools,
-                        include=["code_interpreter_call.outputs"],
+                    reasoning: Dict[str, Any] = {"effort": str(eff), "summary": "auto"}
+                    if str(model or "").strip() == "gpt-5.2":
+                        reasoning = {"effort": "high", "summary": None}
+                    max_judge_attempts = 3
+                    try:
+                        max_judge_attempts = int(os.environ.get("DT_OMICS_ANALYZE_MAX_JUDGE_ATTEMPTS", str(max_judge_attempts)) or max_judge_attempts)
+                    except Exception:
+                        max_judge_attempts = 3
+                    max_judge_attempts = max(1, min(3, int(max_judge_attempts)))
+
+                    judge_traces: list[Dict[str, Any]] = []
+                    resp = None
+                    resp_dump: Any = None
+                    out_text_raw = ""
+                    out_text = ""
+                    diag: Dict[str, Any] = {}
+                    retry_guidance = ""
+
+                    for judge_attempt in range(int(max_judge_attempts)):
+                        prompt_attempt = _apply_omics_analyze_retry_guidance(str(instructions_eff), str(retry_guidance))
+                        try:
+                            try:
+                                resp = client.responses.create(
+                                    model=str(model_call),
+                                    input=str(prompt_attempt),
+                                    text={"format": {"type": "text"}, "verbosity": "medium"},
+                                    reasoning=reasoning,
+                                    tools=tools,
+                                    include=["code_interpreter_call.outputs"],
+                                    max_output_tokens=int(max_out_tokens),
+                                )
+                            except Exception:
+                                resp = client.responses.create(
+                                    model=str(model_call),
+                                    input=str(prompt_attempt),
+                                    text={"format": {"type": "text"}, "verbosity": "medium"},
+                                    reasoning=reasoning,
+                                    tools=tools,
+                                    include=["code_interpreter_call.outputs"],
+                                )
+                        except Exception:
+                            raise
+
+                        out_text_raw = ""
+                        try:
+                            out_text_raw = str(getattr(resp, "output_text", "") or "")
+                        except Exception:
+                            out_text_raw = ""
+
+                        resp_dump = None
+                        try:
+                            resp_dump = resp.model_dump()
+                        except Exception:
+                            resp_dump = None
+
+                        out_text, diag = _omics_analyze_diagnostics(out_text_raw, resp_dump)
+
+                        judge = _omics_analyze_judge(
+                            player_instructions=str(instructions),
+                            analyze_manifest_entries=list(analyze_manifest_entries),
+                            output_text=str(out_text_raw),
+                            analysis_diagnostics=dict(diag),
+                            provider="openai",
+                            model=str(model_call),
+                            attempt=int(judge_attempt) + 1,
+                            max_attempts=int(max_judge_attempts),
+                        )
+                        judge_traces.append({"attempt": int(judge_attempt) + 1, **dict(judge)})
+
+                        if str(judge.get("decision")) == "retry":
+                            retry_guidance = _merge_omics_analyze_retry_guidance(
+                                str(retry_guidance),
+                                str(judge.get("retry_instructions") or ""),
+                            )
+
+                        if str(judge.get("decision")) != "retry" or judge_attempt >= (int(max_judge_attempts) - 1):
+                            break
+
+                    _maybe_log_truncation_alarm(
+                        out_text,
+                        provider="openai",
+                        model=str(model_call),
+                        path="/api/omics/analyze",
+                        run_id=str(run_id or "") if run_id is not None else None,
+                        player_id=str(player_id_req or "") if player_id_req is not None else None,
                     )
 
-                    out_text = ""
                     try:
-                        out_text = str(getattr(resp, "output_text", "") or "")
+                        if judge_traces and str(judge_traces[-1].get("decision")) == "retry":
+                            summary = (
+                                "\n\nAUTO_RETRY_EXHAUSTED: The analysis tool output still appeared incomplete or erroneous after "
+                                + str(len(judge_traces))
+                                + " attempt(s).\n"
+                                + "Judge_reason: "
+                                + str(judge_traces[-1].get("reason") or "")
+                            )
+                            out_text = str(out_text or "") + str(summary)
                     except Exception:
-                        out_text = ""
+                        pass
 
-                    resp_dump: Any = None
-                    try:
-                        resp_dump = resp.model_dump()
-                    except Exception:
-                        resp_dump = None
+                    if isinstance(diag, dict):
+                        diag["judge"] = {"attempts": int(len(judge_traces)), "trace": list(judge_traces)}
 
                     self._send_json(
                         200,
@@ -8658,6 +10571,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 "file_ids": file_ids,
                             },
                             "output_text": out_text,
+                            "analysis_diagnostics": diag,
                             "response": resp_dump,
                         },
                     )
@@ -8694,6 +10608,10 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         except Exception:
                             raw_bytes = b""
 
+                        pb = pooled_bytes_by_rid_name.get((str(rid0), str(name0)))
+                        if pb is not None:
+                            raw_bytes = bytes(pb)
+
                         try:
                             uploaded_bytes_total += int(len(raw_bytes or b""))
                         except Exception:
@@ -8727,6 +10645,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                         used_files.append(
                             {
+                                "label": str(ent.get("analyze_label") or ""),
                                 "run_id": rid0,
                                 "name": name0,
                                 "file_id": str(ent.get("file_id") or ""),
@@ -8755,19 +10674,92 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                     resp_json: Dict[str, Any] = {}
                     last_err: Optional[str] = None
-                    for attempt in range(3):
+                    rate_limited = False
+                    sleep_budget_s = 300.0
+                    try:
+                        sleep_budget_s = float(os.environ.get("DT_GEMINI_RATE_LIMIT_SLEEP_BUDGET_S", str(sleep_budget_s)) or sleep_budget_s)
+                    except Exception:
+                        sleep_budget_s = 300.0
+                    sleep_budget_s = max(0.0, min(3600.0, float(sleep_budget_s)))
+
+                    attempts = int(max(3, _gemini_retry_attempts()))
+                    for attempt in range(int(attempts)):
+                        rem_s = _gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model))
+                        if rem_s > 0.0:
+                            if sleep_budget_s <= 0.0:
+                                rate_limited = True
+                                try:
+                                    _gemini_debug_write_snapshot(
+                                        event="cooldown_budget_exhausted",
+                                        provider="gemini",
+                                        model=str(model),
+                                        base_url=str(base_url_g),
+                                        url=str(url),
+                                        headers=dict(headers),
+                                        payload=dict(payload),
+                                        error=None,
+                                        attempt=int(attempt),
+                                        attempts=int(attempts),
+                                        sleep_budget_s=float(sleep_budget_s),
+                                        cooldown_remaining_s=float(rem_s),
+                                        path="/api/omics/analyze",
+                                        run_id=str(run_id or "") if run_id is not None else None,
+                                        player_id=str(player_id_req or "") if player_id_req is not None else None,
+                                    )
+                                except Exception:
+                                    pass
+                                break
+                            try:
+                                sleep_s = min(float(rem_s), float(sleep_budget_s))
+                                time.sleep(float(max(0.0, sleep_s)))
+                                sleep_budget_s -= float(sleep_s)
+                            except Exception:
+                                pass
+                            continue
+
                         try:
                             t_s = float(600.0)
-                            if attempt == 1:
-                                t_s = float(900.0)
-                            if attempt == 2:
-                                t_s = float(1200.0)
+                            if attempt >= 1:
+                                t_s = float(600.0) + float(300.0) * float(min(5, int(attempt)))
                             resp_json = _http_post_json(url=str(url), headers=headers, payload=payload, timeout_s=t_s)
                             last_err = None
                             break
                         except Exception as e:
                             last_err = str(e)
-                            if _should_retry_remote_http_error(last_err) and attempt < 2:
+                            if _is_rate_limited_error(last_err):
+                                rate_limited = True
+                                hint_s = _retry_delay_seconds_from_error(last_err)
+                                wait_s = _gemini_set_cooldown(base_url=str(base_url_g), model=str(model), retry_after_s=hint_s)
+                                try:
+                                    _gemini_debug_write_snapshot(
+                                        event="rate_limited",
+                                        provider="gemini",
+                                        model=str(model),
+                                        base_url=str(base_url_g),
+                                        url=str(url),
+                                        headers=dict(headers),
+                                        payload=dict(payload),
+                                        error=str(last_err),
+                                        attempt=int(attempt),
+                                        attempts=int(attempts),
+                                        sleep_budget_s=float(sleep_budget_s),
+                                        cooldown_remaining_s=float(wait_s),
+                                        path="/api/omics/analyze",
+                                        run_id=str(run_id or "") if run_id is not None else None,
+                                        player_id=str(player_id_req or "") if player_id_req is not None else None,
+                                    )
+                                except Exception:
+                                    pass
+                                if attempt >= (int(attempts) - 1) or sleep_budget_s <= 0.0:
+                                    break
+                                try:
+                                    sleep_s = min(float(wait_s), float(sleep_budget_s))
+                                    time.sleep(float(max(0.0, sleep_s)))
+                                    sleep_budget_s -= float(sleep_s)
+                                except Exception:
+                                    pass
+                                continue
+                            if _should_retry_remote_http_error(last_err) and attempt < (int(attempts) - 1):
                                 try:
                                     _LOG.warning("Gemini /generateContent retry attempt=%d error=%s", int(attempt + 1), str(last_err)[:300])
                                 except Exception:
@@ -8777,30 +10769,204 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                     hint_s = _retry_delay_seconds_from_error(last_err)
                                     if hint_s is not None:
                                         sleep_s = max(float(sleep_s), float(hint_s))
-                                    sleep_s = min(300.0, max(0.0, float(sleep_s)))
+                                    sleep_s = min(60.0, max(0.0, float(sleep_s)))
                                     time.sleep(float(sleep_s))
                                 except Exception:
                                     pass
                                 continue
                             raise
                     if last_err:
+                        if rate_limited:
+                            try:
+                                _gemini_debug_write_snapshot(
+                                    event="temporary_unavailable",
+                                    provider="gemini",
+                                    model=str(model),
+                                    base_url=str(base_url_g),
+                                    url=str(url),
+                                    headers=dict(headers),
+                                    payload=dict(payload),
+                                    error=str(last_err),
+                                    attempt=None,
+                                    attempts=int(attempts),
+                                    sleep_budget_s=float(sleep_budget_s),
+                                    cooldown_remaining_s=_gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model)),
+                                    path="/api/omics/analyze",
+                                    run_id=str(run_id or "") if run_id is not None else None,
+                                    player_id=str(player_id_req or "") if player_id_req is not None else None,
+                                )
+                            except Exception:
+                                pass
+                            raise TemporaryUnavailableError("Gemini temporarily unavailable", provider="gemini", model=str(model))
                         raise ValueError(str(last_err))
+                    if rate_limited and last_err is None:
+                        try:
+                            _gemini_debug_write_snapshot(
+                                event="temporary_unavailable",
+                                provider="gemini",
+                                model=str(model),
+                                base_url=str(base_url_g),
+                                url=str(url),
+                                headers=dict(headers),
+                                payload=dict(payload),
+                                error=None,
+                                attempt=None,
+                                attempts=int(attempts),
+                                sleep_budget_s=float(sleep_budget_s),
+                                cooldown_remaining_s=_gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model)),
+                                path="/api/omics/analyze",
+                                run_id=str(run_id or "") if run_id is not None else None,
+                                player_id=str(player_id_req or "") if player_id_req is not None else None,
+                            )
+                        except Exception:
+                            pass
+                        raise TemporaryUnavailableError("Gemini temporarily unavailable", provider="gemini", model=str(model))
 
-                    out_text = ""
+                    max_judge_attempts = 3
                     try:
-                        candidates = resp_json.get("candidates") if isinstance(resp_json, dict) else None
-                        if isinstance(candidates, list) and candidates:
-                            c0 = candidates[0] if isinstance(candidates[0], dict) else {}
-                            content0 = c0.get("content") if isinstance(c0, dict) else None
-                            parts0 = content0.get("parts") if isinstance(content0, dict) else None
-                            if isinstance(parts0, list) and parts0:
-                                out_chunks: list[str] = []
-                                for p0 in parts0:
-                                    if isinstance(p0, dict) and isinstance(p0.get("text"), str):
-                                        out_chunks.append(str(p0.get("text") or ""))
-                                out_text = "".join(out_chunks).strip()
+                        max_judge_attempts = int(os.environ.get("DT_OMICS_ANALYZE_MAX_JUDGE_ATTEMPTS", str(max_judge_attempts)) or max_judge_attempts)
                     except Exception:
-                        out_text = ""
+                        max_judge_attempts = 3
+                    max_judge_attempts = max(1, min(3, int(max_judge_attempts)))
+
+                    judge_traces: list[Dict[str, Any]] = []
+                    out_text_raw = ""
+                    out_text = ""
+                    diag: Dict[str, Any] = {}
+                    retry_guidance = ""
+
+                    for judge_attempt in range(int(max_judge_attempts)):
+                        out_text_raw = ""
+                        try:
+                            candidates = resp_json.get("candidates") if isinstance(resp_json, dict) else None
+                            if isinstance(candidates, list) and candidates:
+                                c0 = candidates[0] if isinstance(candidates[0], dict) else {}
+                                content0 = c0.get("content") if isinstance(c0, dict) else None
+                                parts0 = content0.get("parts") if isinstance(content0, dict) else None
+                                if isinstance(parts0, list) and parts0:
+                                    out_chunks: list[str] = []
+                                    for p0 in parts0:
+                                        if isinstance(p0, dict) and isinstance(p0.get("text"), str):
+                                            out_chunks.append(str(p0.get("text") or ""))
+                                    out_text_raw = "".join(out_chunks).strip()
+                        except Exception:
+                            out_text_raw = ""
+
+                        out_text, diag = _omics_analyze_diagnostics(out_text_raw, resp_json)
+
+                        judge = _omics_analyze_judge(
+                            player_instructions=str(instructions),
+                            analyze_manifest_entries=list(analyze_manifest_entries),
+                            output_text=str(out_text_raw),
+                            analysis_diagnostics=dict(diag),
+                            provider="gemini",
+                            model=str(model),
+                            attempt=int(judge_attempt) + 1,
+                            max_attempts=int(max_judge_attempts),
+                        )
+                        judge_traces.append({"attempt": int(judge_attempt) + 1, **dict(judge)})
+
+                        if str(judge.get("decision")) == "retry":
+                            retry_guidance = _merge_omics_analyze_retry_guidance(
+                                str(retry_guidance),
+                                str(judge.get("retry_instructions") or ""),
+                            )
+                            try:
+                                parts[0]["text"] = _apply_omics_analyze_retry_guidance(str(instructions_eff), str(retry_guidance))
+                            except Exception:
+                                pass
+
+                        if str(judge.get("decision")) != "retry" or judge_attempt >= (int(max_judge_attempts) - 1):
+                            break
+
+                        last_err = None
+                        rate_limited = False
+                        sleep_budget_s = 300.0
+                        try:
+                            sleep_budget_s = float(os.environ.get("DT_GEMINI_RATE_LIMIT_SLEEP_BUDGET_S", str(sleep_budget_s)) or sleep_budget_s)
+                        except Exception:
+                            sleep_budget_s = 300.0
+                        sleep_budget_s = max(0.0, min(3600.0, float(sleep_budget_s)))
+
+                        attempts = int(max(3, _gemini_retry_attempts()))
+                        for attempt in range(int(attempts)):
+                            rem_s = _gemini_cooldown_remaining_s(base_url=str(base_url_g), model=str(model))
+                            if rem_s > 0.0:
+                                if sleep_budget_s <= 0.0:
+                                    rate_limited = True
+                                    break
+                                try:
+                                    sleep_s = min(float(rem_s), float(sleep_budget_s))
+                                    time.sleep(float(max(0.0, sleep_s)))
+                                    sleep_budget_s -= float(sleep_s)
+                                except Exception:
+                                    pass
+                                continue
+                            try:
+                                t_s = float(600.0)
+                                if attempt >= 1:
+                                    t_s = float(600.0) + float(300.0) * float(min(5, int(attempt)))
+                                resp_json = _http_post_json(url=str(url), headers=headers, payload=payload, timeout_s=t_s)
+                                last_err = None
+                                break
+                            except Exception as e:
+                                last_err = str(e)
+                                if _is_rate_limited_error(last_err):
+                                    rate_limited = True
+                                    hint_s = _retry_delay_seconds_from_error(last_err)
+                                    wait_s = _gemini_set_cooldown(base_url=str(base_url_g), model=str(model), retry_after_s=hint_s)
+                                    if attempt >= (int(attempts) - 1) or sleep_budget_s <= 0.0:
+                                        break
+                                    try:
+                                        sleep_s = min(float(wait_s), float(sleep_budget_s))
+                                        time.sleep(float(max(0.0, sleep_s)))
+                                        sleep_budget_s -= float(sleep_s)
+                                    except Exception:
+                                        pass
+                                    continue
+                                if _should_retry_remote_http_error(last_err) and attempt < (int(attempts) - 1):
+                                    try:
+                                        sleep_s = float(1.0 + (2.0 * float(attempt)))
+                                        hint_s = _retry_delay_seconds_from_error(last_err)
+                                        if hint_s is not None:
+                                            sleep_s = max(float(sleep_s), float(hint_s))
+                                        sleep_s = min(60.0, max(0.0, float(sleep_s)))
+                                        time.sleep(float(sleep_s))
+                                    except Exception:
+                                        pass
+                                    continue
+                                raise
+                        if last_err:
+                            if rate_limited:
+                                raise TemporaryUnavailableError("Gemini temporarily unavailable", provider="gemini", model=str(model))
+                            raise ValueError(str(last_err))
+                        if rate_limited and last_err is None:
+                            raise TemporaryUnavailableError("Gemini temporarily unavailable", provider="gemini", model=str(model))
+
+                    try:
+                        if judge_traces and str(judge_traces[-1].get("decision")) == "retry":
+                            summary = (
+                                "\n\nAUTO_RETRY_EXHAUSTED: The analysis tool output still appeared incomplete or erroneous after "
+                                + str(len(judge_traces))
+                                + " attempt(s).\n"
+                                + "Judge_reason: "
+                                + str(judge_traces[-1].get("reason") or "")
+                            )
+                            out_text = str(out_text or "") + str(summary)
+                    except Exception:
+                        pass
+
+                    if isinstance(diag, dict):
+                        diag["judge"] = {"attempts": int(len(judge_traces)), "trace": list(judge_traces)}
+
+                    _maybe_log_truncation_alarm(
+                        out_text,
+                        provider="gemini",
+                        model=str(model),
+                        path="/api/omics/analyze",
+                        run_id=str(run_id or "") if run_id is not None else None,
+                        player_id=str(player_id_req or "") if player_id_req is not None else None,
+                    )
 
                     self._send_json(
                         200,
@@ -8816,6 +10982,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 "max_tokens": int(max_tokens_g),
                             },
                             "output_text": str(out_text or ""),
+                            "analysis_diagnostics": diag,
                             "response": resp_json,
                         },
                     )
@@ -8830,8 +10997,58 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     base_url = str(os.environ.get("XAI_BASE_URL") or "").strip() or "https://api.x.ai/v1"
 
                     client = OpenAI(api_key=api_key, base_url=str(base_url))
+                    model_call = _xai_canonical_model(str(model))
                     file_ids: list[str] = []
                     used_files: list[Dict[str, Any]] = []
+
+                    def _xai_is_safety_check_bio(err: Exception) -> bool:
+                        s = str(err or "")
+                        if not s.strip():
+                            return False
+                        if "SAFETY_CHECK_TYPE_BIO" in s:
+                            return True
+                        if "usage guidelines" in s.lower() and "safety_check" in s.lower():
+                            return True
+                        if "Content violates usage guidelines" in s:
+                            return True
+                        return False
+
+                    def _xai_neutralize_analyze_instructions(text: str, level: int) -> str:
+                        t = str(text or "")
+                        if not t:
+                            return ""
+                        try:
+                            t = re.sub(r"\btherapy\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bcure\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bcures\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\btreating\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\btreatment\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\btreatments\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bdiagnose\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bdiagnosis\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bpatient\b", "sample", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bdrug\b", "perturbation", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bdrugs\b", "perturbations", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\s{2,}", " ", t)
+                        except Exception:
+                            pass
+                        if int(level) >= 1:
+                            t = re.sub(r"\bdisease\b", "condition", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bhealthy\b", "control", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\borganism\b", "sample", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bblood\b", "fluid", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bintervention\b", "variant", t, flags=re.IGNORECASE)
+                        if int(level) >= 2:
+                            t = re.sub(r"\bbiolog(y|ical)\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bclinical\b", "", t, flags=re.IGNORECASE)
+                            t = re.sub(r"\bmedical\b", "", t, flags=re.IGNORECASE)
+                        prefix = (
+                            "Perform descriptive data analysis on the attached CSV files. "
+                            "Do not provide advice or recommendations. "
+                            "Use neutral language (e.g., dataset, group, condition, control). "
+                            "When referencing attachments, use the FILE_XX labels from the manifest.\n\n"
+                        )
+                        return str(prefix) + str(t)
 
                     for ent in selected:
                         rid0 = str(ent.get("run_id") or "")
@@ -8846,7 +11063,14 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         except Exception:
                             raw_bytes = b""
 
+                        pb = pooled_bytes_by_rid_name.get((str(rid0), str(name0)))
+                        if pb is not None:
+                            raw_bytes = bytes(pb)
+
+                        label = str(ent.get("analyze_label") or "")
                         upload_name = str(p.name)
+                        if label:
+                            upload_name = str(label) + "__" + str(upload_name)
                         suf = str(p.suffix or "").lower()
                         if suf in (".csv", ".tsv", ".txt", ".json"):
                             try:
@@ -8862,12 +11086,13 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             bio.name = upload_name
                         except Exception:
                             pass
-                        fo = client.files.create(file=bio, purpose="user_data")
+                        fo = client.files.create(file=bio, purpose="assistants")
                         fid = str(getattr(fo, "id", "") or "")
                         if fid:
                             file_ids.append(fid)
                         used_files.append(
                             {
+                                "label": str(label),
                                 "run_id": rid0,
                                 "name": name0,
                                 "file_id": str(ent.get("file_id") or ""),
@@ -8882,23 +11107,133 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         input_parts.append({"type": "input_file", "file_id": str(fid)})
 
                     tools = [{"type": "code_interpreter"}]
-                    resp = client.responses.create(
+
+                    max_out_tokens = 120000
+                    try:
+                        if max_tokens_req is not None:
+                            max_out_tokens = int(max_tokens_req)
+                    except Exception:
+                        max_out_tokens = 120000
+                    max_out_tokens = max(256, min(120000, int(max_out_tokens)))
+
+                    xai_policy_retries = 2
+                    try:
+                        xai_policy_retries = int(os.environ.get("DT_OMICS_ANALYZE_XAI_POLICY_RETRIES", str(xai_policy_retries)) or xai_policy_retries)
+                    except Exception:
+                        xai_policy_retries = 2
+                    xai_policy_retries = max(0, min(5, int(xai_policy_retries)))
+
+                    max_judge_attempts = 3
+                    try:
+                        max_judge_attempts = int(os.environ.get("DT_OMICS_ANALYZE_MAX_JUDGE_ATTEMPTS", str(max_judge_attempts)) or max_judge_attempts)
+                    except Exception:
+                        max_judge_attempts = 3
+                    max_judge_attempts = max(1, min(3, int(max_judge_attempts)))
+
+                    judge_traces: list[Dict[str, Any]] = []
+                    resp = None
+                    resp_dump: Any = None
+                    out_text_raw = ""
+                    out_text = ""
+                    diag: Dict[str, Any] = {}
+                    retry_guidance = ""
+
+                    for judge_attempt in range(int(max_judge_attempts)):
+                        prompt_attempt = _apply_omics_analyze_retry_guidance(str(instructions_eff), str(retry_guidance))
+                        resp = None
+                        last_err: Optional[Exception] = None
+                        for pol_attempt in range(int(xai_policy_retries) + 1):
+                            lvl = int(pol_attempt) + 1
+                            instructions_xai = _xai_neutralize_analyze_instructions(str(prompt_attempt), level=lvl)
+                            input_parts = [{"type": "input_text", "text": str(instructions_xai)}]
+                            for fid in file_ids:
+                                input_parts.append({"type": "input_file", "file_id": str(fid)})
+                            try:
+                                try:
+                                    resp = client.responses.create(
+                                        model=str(model_call),
+                                        input=[{"role": "user", "content": input_parts}],
+                                        tools=tools,
+                                        include=["code_interpreter_call.outputs"],
+                                        max_output_tokens=int(max_out_tokens),
+                                    )
+                                except Exception:
+                                    resp = client.responses.create(
+                                        model=str(model_call),
+                                        input=[{"role": "user", "content": input_parts}],
+                                        tools=tools,
+                                        include=["code_interpreter_call.outputs"],
+                                    )
+                                last_err = None
+                                break
+                            except Exception as e:
+                                last_err = e
+                                if pol_attempt >= int(xai_policy_retries) or (not _xai_is_safety_check_bio(e)):
+                                    raise
+                                continue
+
+                        if resp is None and last_err is not None:
+                            raise last_err
+
+                        out_text_raw = ""
+                        try:
+                            out_text_raw = str(getattr(resp, "output_text", "") or "")
+                        except Exception:
+                            out_text_raw = ""
+
+                        resp_dump = None
+                        try:
+                            resp_dump = resp.model_dump()
+                        except Exception:
+                            resp_dump = None
+
+                        out_text, diag = _omics_analyze_diagnostics(out_text_raw, resp_dump)
+
+                        judge = _omics_analyze_judge(
+                            player_instructions=str(instructions),
+                            analyze_manifest_entries=list(analyze_manifest_entries),
+                            output_text=str(out_text_raw),
+                            analysis_diagnostics=dict(diag),
+                            provider="xai",
+                            model=str(model_call),
+                            attempt=int(judge_attempt) + 1,
+                            max_attempts=int(max_judge_attempts),
+                        )
+                        judge_traces.append({"attempt": int(judge_attempt) + 1, **dict(judge)})
+
+                        if str(judge.get("decision")) == "retry":
+                            retry_guidance = _merge_omics_analyze_retry_guidance(
+                                str(retry_guidance),
+                                str(judge.get("retry_instructions") or ""),
+                            )
+
+                        if str(judge.get("decision")) != "retry" or judge_attempt >= (int(max_judge_attempts) - 1):
+                            break
+
+                    _maybe_log_truncation_alarm(
+                        out_text,
+                        provider="xai",
                         model=str(model),
-                        input=[{"role": "user", "content": input_parts}],
-                        tools=tools,
+                        path="/api/omics/analyze",
+                        run_id=str(run_id or "") if run_id is not None else None,
+                        player_id=str(player_id_req or "") if player_id_req is not None else None,
                     )
 
-                    out_text = ""
                     try:
-                        out_text = str(getattr(resp, "output_text", "") or "")
+                        if judge_traces and str(judge_traces[-1].get("decision")) == "retry":
+                            summary = (
+                                "\n\nAUTO_RETRY_EXHAUSTED: The analysis tool output still appeared incomplete or erroneous after "
+                                + str(len(judge_traces))
+                                + " attempt(s).\n"
+                                + "Judge_reason: "
+                                + str(judge_traces[-1].get("reason") or "")
+                            )
+                            out_text = str(out_text or "") + str(summary)
                     except Exception:
-                        out_text = ""
+                        pass
 
-                    resp_dump: Any = None
-                    try:
-                        resp_dump = resp.model_dump()
-                    except Exception:
-                        resp_dump = None
+                    if isinstance(diag, dict):
+                        diag["judge"] = {"attempts": int(len(judge_traces)), "trace": list(judge_traces)}
 
                     self._send_json(
                         200,
@@ -8914,6 +11249,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 "file_ids": list(file_ids),
                             },
                             "output_text": str(out_text or ""),
+                            "analysis_diagnostics": diag,
                             "response": resp_dump,
                         },
                     )
@@ -8932,21 +11268,6 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         max_tokens_a = 8192
                     max_tokens_a = max(256, min(16384, int(max_tokens_a)))
 
-                    auto_continue = True
-                    try:
-                        if auto_continue_req is not None:
-                            auto_continue = bool(auto_continue_req)
-                    except Exception:
-                        auto_continue = True
-
-                    max_continuations = 2
-                    try:
-                        if max_continuations_req is not None:
-                            max_continuations = int(max_continuations_req)
-                    except Exception:
-                        max_continuations = 2
-                    max_continuations = max(0, min(4, int(max_continuations)))
-
                     used_files: list[Dict[str, Any]] = []
                     file_ids: list[str] = []
                     uploaded_bytes_total = 0
@@ -8964,7 +11285,14 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         except Exception:
                             raw_bytes = b""
 
+                        pb = pooled_bytes_by_rid_name.get((str(rid0), str(name0)))
+                        if pb is not None:
+                            raw_bytes = bytes(pb)
+
+                        label = str(ent.get("analyze_label") or "")
                         upload_name = str(p.name)
+                        if label:
+                            upload_name = str(label) + "__" + str(upload_name)
                         suf = str(p.suffix or "").lower()
                         if suf in (".csv", ".tsv", ".txt", ".json"):
                             try:
@@ -8974,6 +11302,11 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 upload_name = _mask_disease_term(upload_name)
                             except Exception:
                                 pass
+
+                        try:
+                            uploaded_bytes_total += int(len(raw_bytes or b""))
+                        except Exception:
+                            pass
 
                         up = _anthropic_upload_file(
                             api_key=str(api_key_a),
@@ -8985,6 +11318,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         if fid:
                             file_ids.append(fid)
                         used_files.append({
+                            "label": str(label),
                             "run_id": rid0,
                             "name": name0,
                             "file_id": str(ent.get("file_id") or ""),
@@ -9003,50 +11337,91 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
 
-                    resp_jsons: list[Dict[str, Any]] = []
-                    out_texts: list[str] = []
-
                     content_blocks0: list[Dict[str, Any]] = [{"type": "text", "text": str(instructions_eff)}]
                     for fid in list(file_ids):
                         if str(fid or "").strip():
                             content_blocks0.append({"type": "container_upload", "file_id": str(fid)})
                     messages0: list[Dict[str, Any]] = [{"role": "user", "content": content_blocks0}]
 
-                    for i in range(int(max_continuations) + 1):
-                        resp_i = _anthropic_messages_code_execution(
+                    max_judge_attempts = 3
+                    try:
+                        max_judge_attempts = int(os.environ.get("DT_OMICS_ANALYZE_MAX_JUDGE_ATTEMPTS", str(max_judge_attempts)) or max_judge_attempts)
+                    except Exception:
+                        max_judge_attempts = 3
+                    max_judge_attempts = max(1, min(3, int(max_judge_attempts)))
+
+                    judge_traces: list[Dict[str, Any]] = []
+                    resp_json: Dict[str, Any] = {}
+                    out_text_raw = ""
+                    out_text = ""
+                    diag: Dict[str, Any] = {}
+                    retry_guidance = ""
+
+                    for judge_attempt in range(int(max_judge_attempts)):
+                        prompt_attempt = _apply_omics_analyze_retry_guidance(str(instructions_eff), str(retry_guidance))
+                        content_blocks = [{"type": "text", "text": str(prompt_attempt)}]
+                        for fid in list(file_ids):
+                            if str(fid or "").strip():
+                                content_blocks.append({"type": "container_upload", "file_id": str(fid)})
+                        messages_attempt: list[Dict[str, Any]] = [{"role": "user", "content": content_blocks}]
+                        resp_json = _anthropic_messages_code_execution(
                             api_key=str(api_key_a),
                             model=str(model or "claude-sonnet-4-5"),
-                            instructions=str(instructions_eff),
+                            instructions=str(prompt_attempt),
                             file_ids=list(file_ids),
                             timeout_s=600.0,
                             max_tokens=int(max_tokens_a),
-                            messages=list(messages0),
+                            messages=list(messages_attempt),
                         )
-                        resp_jsons.append(resp_i if isinstance(resp_i, dict) else {})
-                        out_i = _anthropic_message_text(resp_i if isinstance(resp_i, dict) else {})
-                        out_texts.append(str(out_i or ""))
+                        out_text_raw = str(_anthropic_message_text(resp_json if isinstance(resp_json, dict) else {}) or "")
 
-                        stop_r = str((resp_i if isinstance(resp_i, dict) else {}).get("stop_reason") or "").strip().lower()
-                        if (not auto_continue) or stop_r != "max_tokens" or i >= int(max_continuations):
+                        out_text, diag = _omics_analyze_diagnostics(out_text_raw, resp_json)
+
+                        judge = _omics_analyze_judge(
+                            player_instructions=str(instructions),
+                            analyze_manifest_entries=list(analyze_manifest_entries),
+                            output_text=str(out_text_raw),
+                            analysis_diagnostics=dict(diag),
+                            provider="anthropic",
+                            model=str(model),
+                            attempt=int(judge_attempt) + 1,
+                            max_attempts=int(max_judge_attempts),
+                        )
+                        judge_traces.append({"attempt": int(judge_attempt) + 1, **dict(judge)})
+
+                        if str(judge.get("decision")) == "retry":
+                            retry_guidance = _merge_omics_analyze_retry_guidance(
+                                str(retry_guidance),
+                                str(judge.get("retry_instructions") or ""),
+                            )
+
+                        if str(judge.get("decision")) != "retry" or judge_attempt >= (int(max_judge_attempts) - 1):
                             break
 
-                        tail = str(out_i or "")
-                        if len(tail) > 1400:
-                            tail = tail[-1400:]
-                        cont_prompt = (
-                            "Your previous message was cut off due to max_tokens. "
-                            "Continue immediately after the end of the previous message. Do not repeat any content. "
-                            "For reference, the end of your previous message was:\n\n"
-                            + tail
-                        )
-                        messages0 = [
-                            {"role": "user", "content": content_blocks0},
-                            {"role": "assistant", "content": [{"type": "text", "text": str(tail)}]},
-                            {"role": "user", "content": [{"type": "text", "text": cont_prompt}]},
-                        ]
+                    try:
+                        if judge_traces and str(judge_traces[-1].get("decision")) == "retry":
+                            summary = (
+                                "\n\nAUTO_RETRY_EXHAUSTED: The analysis tool output still appeared incomplete or erroneous after "
+                                + str(len(judge_traces))
+                                + " attempt(s).\n"
+                                + "Judge_reason: "
+                                + str(judge_traces[-1].get("reason") or "")
+                            )
+                            out_text = str(out_text or "") + str(summary)
+                    except Exception:
+                        pass
 
-                    resp_json = resp_jsons[-1] if resp_jsons else {}
-                    out_text = "".join([str(x or "") for x in out_texts])
+                    if isinstance(diag, dict):
+                        diag["judge"] = {"attempts": int(len(judge_traces)), "trace": list(judge_traces)}
+
+                    _maybe_log_truncation_alarm(
+                        out_text,
+                        provider="anthropic",
+                        model=str(model),
+                        path="/api/omics/analyze",
+                        run_id=str(run_id or "") if run_id is not None else None,
+                        player_id=str(player_id_req or "") if player_id_req is not None else None,
+                    )
 
                     self._send_json(
                         200,
@@ -9060,11 +11435,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 "model": str(model),
                                 "file_ids": list(file_ids),
                                 "max_tokens": int(max_tokens_a),
-                                "auto_continue": bool(auto_continue),
-                                "max_continuations": int(max_continuations),
-                                "continuations": int(max(0, len(resp_jsons) - 1)),
+                                "auto_continue": False,
+                                "max_continuations": 0,
+                                "continuations": 0,
                             },
                             "output_text": str(out_text or ""),
+                            "analysis_diagnostics": diag,
                             "response": resp_json,
                         },
                     )
@@ -9113,16 +11489,25 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         ticks=int(ticks_i),
                         interventions_n=int(iv_n),
                     )
+                    fixed = _tests_compute_fixed_cost_cents(
+                        challenge=challenge,
+                        kind=str(kind0),
+                        model_key=model_key,
+                        interventions_n=int(iv_n),
+                    )
                     charge = _tests_make_charge(
                         kind=f"tests_{challenge}_{str(kind0)}",
                         samples=int(reps_i),
                         unit_cost_cents=int(unit),
+                        fixed_cost_cents=int(fixed),
                         meta={"experiment": f"tests_{challenge}_bulk_omics_v1", "player_id": _sanitize_player_id(player_id)},
                     )
                     self._send_json(200, {"ok": True, "charge": charge})
                     return
 
-                if exp in ("spatial", "spatial_tx"):
+                if exp in ("spatial", "spatial_tx", "spatial_omics"):
+                    exp_label = f"tests_{challenge}_spatial_omics_v1" if exp == "spatial_omics" else f"tests_{challenge}_spatial_tx_v1"
+                    charge_kind = f"tests_{challenge}_spatial_omics" if exp == "spatial_omics" else f"tests_{challenge}_spatial_transcriptomics"
                     unit = _tests_compute_unit_cost_cents(
                         challenge=challenge,
                         kind="spatial_transcriptomics",
@@ -9130,11 +11515,18 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         ticks=int(ticks_i),
                         interventions_n=int(iv_n),
                     )
+                    fixed = _tests_compute_fixed_cost_cents(
+                        challenge=challenge,
+                        kind="spatial_transcriptomics",
+                        model_key=model_key,
+                        interventions_n=int(iv_n),
+                    )
                     charge = _tests_make_charge(
-                        kind=f"tests_{challenge}_spatial_transcriptomics",
+                        kind=str(charge_kind),
                         samples=int(reps_i),
                         unit_cost_cents=int(unit),
-                        meta={"experiment": f"tests_{challenge}_spatial_tx_v1", "player_id": _sanitize_player_id(player_id)},
+                        fixed_cost_cents=int(fixed),
+                        meta={"experiment": str(exp_label), "player_id": _sanitize_player_id(player_id)},
                     )
                     self._send_json(200, {"ok": True, "charge": charge})
                     return
@@ -9147,10 +11539,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         ticks=int(ticks_i),
                         interventions_n=int(iv_n),
                     )
+                    fixed = _tests_compute_fixed_cost_cents(
+                        challenge=challenge,
+                        kind="characterization",
+                        model_key=model_key,
+                        interventions_n=int(iv_n),
+                    )
                     charge = _tests_make_charge(
                         kind=f"tests_{challenge}_characterization",
                         samples=int(reps_i),
                         unit_cost_cents=int(unit),
+                        fixed_cost_cents=int(fixed),
                         meta={"experiment": f"tests_{challenge}_characterization_v1", "player_id": _sanitize_player_id(player_id)},
                     )
                     self._send_json(200, {"ok": True, "charge": charge})
@@ -9169,23 +11568,40 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         ticks=int(ticks_i),
                         interventions_n=int(iv_n + 1),
                     )
+                    fixed = _tests_compute_fixed_cost_cents(
+                        challenge=challenge,
+                        kind="protein_screen",
+                        model_key=model_key,
+                        interventions_n=int(iv_n + 1),
+                    )
                     charge = _tests_make_charge(
                         kind=f"tests_{challenge}_protein_screen",
                         samples=int(samples_run),
                         unit_cost_cents=int(unit),
+                        fixed_cost_cents=int(fixed),
                         meta={"experiment": f"tests_{challenge}_protein_screen_v1", "player_id": _sanitize_player_id(player_id)},
                     )
                     self._send_json(200, {"ok": True, "charge": charge})
                     return
 
                 if exp in ("claim_cure", "cure"):
-                    ticks_i = 400
+                    ticks_i = 1500 if str(challenge or "").strip().lower() == "aging" else 400
                     disease_key = _tests_claim_cure_disease_model_key_for_challenge(challenge)
+                    if str(challenge or "").strip().lower() == "aging":
+                        prev_min_reps = _game_get_player_int(player_id, "aging_claim_cure_min_reps", default=0)
+                        reps_min_i = max(10, int(prev_min_reps))
+                        reps_i = max(int(reps_i), int(reps_min_i))
                     unit = _tests_compute_unit_cost_cents(
                         challenge=challenge,
                         kind="claim_cure",
                         model_key=str(disease_key),
                         ticks=int(ticks_i),
+                        interventions_n=int(iv_n),
+                    )
+                    fixed = _tests_compute_fixed_cost_cents(
+                        challenge=challenge,
+                        kind="claim_cure",
+                        model_key=str(disease_key),
                         interventions_n=int(iv_n),
                     )
                     groups = 2
@@ -9195,6 +11611,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         kind=f"tests_{challenge}_claim_cure",
                         samples=int(int(groups) * int(reps_i)),
                         unit_cost_cents=int(unit),
+                        fixed_cost_cents=int(fixed),
                         meta={"experiment": f"tests_{challenge}_claim_cure_v1", "player_id": _sanitize_player_id(player_id)},
                     )
                     self._send_json(200, {"ok": True, "charge": charge})
@@ -9294,14 +11711,73 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 run_T: list[list[float]] = []
                 out_runs: list[Dict[str, Any]] = []
 
-                for ri in range(reps_i):
-                    seed0 = int(seed_i) + (int(ri) * 97)
-                    pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                results_by_ri: list[Optional[tuple[int, int, Optional[Dict[str, Any]], Optional[list[float]], int, int]]] = [
+                    None for _ in range(int(reps_i))
+                ]
+                if int(reps_i) <= 1:
+                    for ri in range(int(reps_i)):
+                        seed0 = int(seed_i) + (int(ri) * 97)
+                        pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                        if isinstance(pf, dict):
+                            results_by_ri[int(ri)] = (int(ri), int(seed0), dict(pf), None, 0, 0)
+                            continue
+                        p = _run_payload_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                        H = int(p.get("H") or 0)
+                        W = int(p.get("W") or 0)
+                        if H <= 0 or W <= 0:
+                            raise ValueError("payload invalid H/W")
+                        expected_len = int(H * W)
+                        layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
+                        if not layers:
+                            raise ValueError("payload has no float32 layers")
+
+                        vv: list[float] = []
+                        for ln in features:
+                            arr = layers.get(ln)
+                            if arr is None:
+                                vv.append(0.0)
+                                continue
+                            try:
+                                s = float(np.asarray(arr, dtype=np.float64).reshape(-1).sum())
+                            except Exception:
+                                s = 0.0
+                            if not np.isfinite(s) or s < 0.0:
+                                s = 0.0
+                            vv.append(float(s))
+
+                        results_by_ri[int(ri)] = (int(ri), int(seed0), None, vv, int(H), int(W))
+                else:
+                    ctx = mp.get_context("spawn")
+                    cpu_req = max(1, min(int(reps_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=2.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(reps_i),
+                            mp_context=ctx,
+                            initializer=_bulk_omics_worker_init,
+                            initargs=(payload, list(features), int(ticks_i), int(seed_i)),
+                        ) as ex:
+                            futs: list[concurrent.futures.Future] = []
+                            for ri in range(int(reps_i)):
+                                futs.append(ex.submit(_bulk_omics_worker_eval, int(ri)))
+                            for fut in concurrent.futures.as_completed(futs):
+                                ri0, seed0, pf, vv, H, W = fut.result()
+                                if 0 <= int(ri0) < int(len(results_by_ri)):
+                                    results_by_ri[int(ri0)] = (int(ri0), int(seed0), pf, vv, int(H), int(W))
+                    finally:
+                        _cm.__exit__(None, None, None)
+
+                for ri in range(int(reps_i)):
+                    ent = results_by_ri[int(ri)]
+                    if ent is None:
+                        continue
+                    ri0, seed0, pf, vv, H, W = ent
                     if isinstance(pf, dict):
                         replicate_deaths.append(
                             {
                                 "model": str(model_key or ""),
-                                "replicate": int(ri),
+                                "replicate": int(ri0),
                                 "seed": int(seed0),
                                 "requested_ticks": int(ticks_i),
                                 "death_tick": int(pf.get("death_tick") or 0),
@@ -9310,45 +11786,27 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             }
                         )
                         continue
-                    p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
-                    H = int(p.get("H") or 0)
-                    W = int(p.get("W") or 0)
-                    if H <= 0 or W <= 0:
-                        raise ValueError("payload invalid H/W")
-                    expected_len = int(H * W)
-                    layers = _layers_dict_from_payload_data(p, expected_len=expected_len)
-                    if not layers:
-                        raise ValueError("payload has no float32 layers")
 
-                    sample_id = f"{model_label}_r{int(ri)}_{run_tag}"
-                    vv: list[float] = []
-                    for ln in features:
-                        arr = layers.get(ln)
-                        if arr is None:
-                            vv.append(0.0)
-                            continue
-                        try:
-                            s = float(np.asarray(arr, dtype=np.float64).reshape(-1).sum())
-                        except Exception:
-                            s = 0.0
-                        if not np.isfinite(s) or s < 0.0:
-                            s = 0.0
-                        vv.append(float(s))
+                    if not isinstance(vv, list):
+                        continue
 
-                    meta_rows.append([
-                        sample_id,
-                        str(assay),
-                        str(model_key or ""),
-                        int(ri),
-                        int(ticks_i),
-                    ])
+                    sample_id = f"{model_label}_r{int(ri0)}_{run_tag}"
+                    meta_rows.append(
+                        [
+                            sample_id,
+                            str(assay),
+                            str(model_key or ""),
+                            int(ri0),
+                            int(ticks_i),
+                        ]
+                    )
                     run_ids.append(sample_id)
-                    run_T.append(vv)
+                    run_T.append([float(x) for x in vv])
 
                     out_runs.append(
                         {
                             "model": str(model_key or ""),
-                            "replicate": int(ri),
+                            "replicate": int(ri0),
                             "seed": int(seed0),
                             "ticks": int(ticks_i),
                             "age_days": int(ticks_i),
@@ -9419,10 +11877,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     ticks=int(ticks_i),
                     interventions_n=int(iv_n),
                 )
+                fixed = _tests_compute_fixed_cost_cents(
+                    challenge=challenge,
+                    kind=str(kind0),
+                    model_key=model_key,
+                    interventions_n=int(iv_n),
+                )
                 charge = _tests_make_charge(
                     kind=f"tests_{challenge}_{str(kind0)}",
                     samples=int(len(out_runs)),
                     unit_cost_cents=int(unit),
+                    fixed_cost_cents=int(fixed),
                     meta={
                         "experiment": f"tests_{challenge}_bulk_omics_v1",
                         "ticks": int(ticks_i),
@@ -9468,7 +11933,14 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 )
                 return
 
-            if self.path in ("/api/tests/cancer/spatial_tx", "/api/tests/hereditary_disease/spatial_tx", "/api/tests/aging/spatial_tx"):
+            if self.path in (
+                "/api/tests/cancer/spatial_tx",
+                "/api/tests/hereditary_disease/spatial_tx",
+                "/api/tests/aging/spatial_tx",
+                "/api/tests/cancer/spatial_omics",
+                "/api/tests/hereditary_disease/spatial_omics",
+                "/api/tests/aging/spatial_omics",
+            ):
                 if self.path.startswith("/api/tests/cancer/"):
                     challenge = "cancer"
                 elif self.path.startswith("/api/tests/hereditary_disease/"):
@@ -9485,6 +11957,15 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 seed = body.get("seed", 1)
                 gene_set_req = body.get("gene_set")
                 gene_set_name, genes = _load_stx_gene_set(str(gene_set_req or ""))
+
+                is_spatial_omics = bool(self.path.endswith("/spatial_omics"))
+                exp_label = f"tests_{challenge}_spatial_omics_v1" if is_spatial_omics else f"tests_{challenge}_spatial_tx_v1"
+                gene_set_out = str(gene_set_name or "")
+                if is_spatial_omics:
+                    gene_set_type = _normalize_spatial_omics_type(gene_set_req)
+                    if not gene_set_type:
+                        gene_set_type = _normalize_spatial_omics_type(gene_set_name)
+                    gene_set_out = str(gene_set_type or gene_set_name)
 
                 payload0 = _tests_load_model_payload_for_challenge(challenge, model_key)
                 if not genes:
@@ -9553,20 +12034,75 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 assay = "Spatial transcriptomics"
                 if str(stx_kind) == "bulk_proteomics":
                     assay = "Spatial proteomics"
+                if is_spatial_omics:
+                    assay = "Spatial protein" if str(stx_kind) == "bulk_proteomics" else "Spatial RNA"
                 genes_masked = _bulk_omics_mask_feature_headers(genes, kind=str(stx_kind))
                 mat_header = ["cell_id", *genes_masked]
                 noisy_mat_rows: list[list[Any]] = []
 
                 out_runs: list[Dict[str, Any]] = []
                 files_text: Dict[str, Any] = {}
-                for ri in range(reps_i):
-                    seed0 = int(seed_i) + (int(ri) * 97)
-                    pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+
+                results_by_ri: list[Optional[tuple[int, int, Optional[Dict[str, Any]], int, int, list[Dict[str, Any]]]]] = [
+                    None for _ in range(int(reps_i))
+                ]
+                if int(reps_i) <= 1:
+                    for ri in range(int(reps_i)):
+                        seed0 = int(seed_i) + (int(ri) * 97)
+                        pf = _preflight_death_before_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                        if isinstance(pf, dict):
+                            results_by_ri[int(ri)] = (int(ri), int(seed0), dict(pf), 0, 0, [])
+                            continue
+                        p = _run_payload_ticks(payload, ticks=int(ticks_i), seed0=int(seed0))
+                        tx = _spatial_tx_rows(
+                            p,
+                            genes,
+                            cell_layer="",
+                            min_cell_value=0.0,
+                            stride=1,
+                            max_spots=None,
+                            seed=int(seed0),
+                        )
+                        H = int(tx.get("H") or 0)
+                        W = int(tx.get("W") or 0)
+                        rows = tx.get("rows")
+                        if not isinstance(rows, list):
+                            rows = []
+                        rows_out: list[Dict[str, Any]] = [r for r in rows if isinstance(r, dict)]
+                        results_by_ri[int(ri)] = (int(ri), int(seed0), None, int(H), int(W), rows_out)
+                else:
+                    ctx = mp.get_context("spawn")
+                    cpu_req = max(1, min(int(reps_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=3.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(reps_i),
+                            mp_context=ctx,
+                            initializer=_stx_tests_worker_init,
+                            initargs=(payload, list(genes), int(ticks_i), int(seed_i)),
+                        ) as ex:
+                            futs: list[concurrent.futures.Future] = []
+                            for ri in range(int(reps_i)):
+                                futs.append(ex.submit(_stx_tests_worker_eval, int(ri)))
+                            for fut in concurrent.futures.as_completed(futs):
+                                ri0, seed0, pf, H, W, rows = fut.result()
+                                if 0 <= int(ri0) < int(len(results_by_ri)):
+                                    rows_out: list[Dict[str, Any]] = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+                                    results_by_ri[int(ri0)] = (int(ri0), int(seed0), pf, int(H), int(W), rows_out)
+                    finally:
+                        _cm.__exit__(None, None, None)
+
+                for ri in range(int(reps_i)):
+                    ent = results_by_ri[int(ri)]
+                    if ent is None:
+                        continue
+                    ri0, seed0, pf, H, W, rows = ent
                     if isinstance(pf, dict):
                         replicate_deaths.append(
                             {
                                 "model": str(model_key or ""),
-                                "replicate": int(ri),
+                                "replicate": int(ri0),
                                 "seed": int(seed0),
                                 "requested_ticks": int(ticks_i),
                                 "death_tick": int(pf.get("death_tick") or 0),
@@ -9575,22 +12111,6 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             }
                         )
                         continue
-                    p = _run_payload_ticks(payload, ticks=ticks_i, seed0=seed0)
-                    tx = _spatial_tx_rows(
-                        p,
-                        genes,
-                        cell_layer="",
-                        min_cell_value=0.0,
-                        stride=1,
-                        max_spots=None,
-                        seed=seed0,
-                    )
-
-                    H = int(tx.get("H") or 0)
-                    W = int(tx.get("W") or 0)
-                    rows = tx.get("rows")
-                    if not isinstance(rows, list):
-                        rows = []
 
                     run_cell_ids: list[str] = []
                     run_x: list[int] = []
@@ -9611,15 +12131,15 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             yi = int(y)
                         except Exception:
                             continue
-                        grid_index = (yi * int(W) + xi) if (W > 0) else int(yi)
-                        cell_id = f"{model_label}_r{int(ri)}_{run_tag}_s{int(seed0)}_{int(si)}"
+                        grid_index = (yi * int(W) + xi) if (int(W) > 0) else int(yi)
+                        cell_id = f"{model_label}_r{int(ri0)}_{run_tag}_s{int(seed0)}_{int(si)}"
 
                         meta_rows.append(
                             [
                                 cell_id,
                                 str(assay),
                                 str(model_key or ""),
-                                int(ri),
+                                int(ri0),
                                 int(seed0),
                                 int(ticks_i),
                                 int(xi),
@@ -9627,17 +12147,19 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                                 int(grid_index),
                             ]
                         )
-                        rep_meta_rows.append([
-                            cell_id,
-                            str(assay),
-                            str(model_key or ""),
-                            int(ri),
-                            int(seed0),
-                            int(ticks_i),
-                            int(xi),
-                            int(yi),
-                            int(grid_index),
-                        ])
+                        rep_meta_rows.append(
+                            [
+                                cell_id,
+                                str(assay),
+                                str(model_key or ""),
+                                int(ri0),
+                                int(seed0),
+                                int(ticks_i),
+                                int(xi),
+                                int(yi),
+                                int(grid_index),
+                            ]
+                        )
 
                         vv: list[float] = []
                         for g in genes:
@@ -9670,16 +12192,18 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         for ii, cid in enumerate(run_cell_ids):
                             noisy_mat_rows.append([cid, *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]])
 
-                        # Persist per-replicate wide matrix + per-cell metadata.
-                        rep_prefix = f"replicates/{model_label}_r{int(ri)}_{run_tag}"
-                        rep_rows = [[run_cell_ids[ii], *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]] for ii in range(len(run_cell_ids))]
+                        rep_prefix = f"replicates/{model_label}_r{int(ri0)}_{run_tag}"
+                        rep_rows = [
+                            [run_cell_ids[ii], *[int(x) for x in np.asarray(Y[ii], dtype=np.int64).tolist()]]
+                            for ii in range(len(run_cell_ids))
+                        ]
                         files_text[f"{rep_prefix}_matrix.csv"] = _csv_from_rows(mat_header, rep_rows)
                         files_text[f"{rep_prefix}_cell_metadata.csv"] = _csv_from_rows(meta_header, rep_meta_rows)
 
                     out_runs.append(
                         {
                             "model": str(model_key or ""),
-                            "replicate": int(ri),
+                            "replicate": int(ri0),
                             "seed": int(seed0),
                             "ticks": int(ticks_i),
                             "cells": int(len(rows)),
@@ -9695,7 +12219,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             "ok": False,
                             "error": f"all replicates died before requested ticks={int(ticks_i)}",
                             "error_kind": "all_replicates_died",
-                            "experiment": f"tests_{challenge}_spatial_tx_v1",
+                            "experiment": str(exp_label),
                             "details": {
                                 "model": str(model_key or ""),
                                 "requested_ticks": int(ticks_i),
@@ -9711,7 +12235,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                 files_text[f"metadata_{run_tag}.csv"] = str(metadata_csv)
                 manifest = {
-                    "experiment": f"tests_{challenge}_spatial_tx_v1",
+                    "experiment": str(exp_label),
                     "kind": str(stx_kind),
                     "player_id": _sanitize_player_id(player_id),
                     "model": str(model_key or ""),
@@ -9719,7 +12243,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     "replicates": int(reps_i),
                     "replicates_completed": int(len(out_runs)),
                     "replicate_deaths": list(replicate_deaths),
-                    "gene_set": str(gene_set_name or ""),
+                    "gene_set": str(gene_set_out or ""),
                     "genes": list(genes_masked),
                     "runs": out_runs,
                 }
@@ -9733,15 +12257,23 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     ticks=int(ticks_i),
                     interventions_n=int(iv_n),
                 )
+                fixed = _tests_compute_fixed_cost_cents(
+                    challenge=challenge,
+                    kind="spatial_transcriptomics",
+                    model_key=model_key,
+                    interventions_n=int(iv_n),
+                )
+                charge_kind = f"tests_{challenge}_spatial_omics" if is_spatial_omics else f"tests_{challenge}_spatial_transcriptomics"
                 charge = _tests_make_charge(
-                    kind=f"tests_{challenge}_spatial_transcriptomics",
+                    kind=str(charge_kind),
                     samples=int(len(out_runs)),
                     unit_cost_cents=int(unit),
+                    fixed_cost_cents=int(fixed),
                     meta={
-                        "experiment": f"tests_{challenge}_spatial_tx_v1",
+                        "experiment": str(exp_label),
                         "ticks": int(ticks_i),
                         "replicates": int(reps_i),
-                        "gene_set": str(gene_set_name or ""),
+                        "gene_set": str(gene_set_out or ""),
                         "model": str(model_key or ""),
                     },
                 )
@@ -9751,13 +12283,13 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     200,
                     {
                         "ok": True,
-                        "experiment": f"tests_{challenge}_spatial_tx_v1",
+                        "experiment": str(exp_label),
                         "model": str(model_key or ""),
                         "ticks": int(ticks_i),
                         "replicates": int(reps_i),
                         "replicates_completed": int(len(out_runs)),
                         "replicate_deaths": list(replicate_deaths),
-                        "gene_set": str(gene_set_name or ""),
+                        "gene_set": str(gene_set_out or ""),
                         "genes": genes_masked,
                         "run_id": str(omics_saved.get("run_id") or ""),
                         "files": omics_saved.get("files"),
@@ -9830,16 +12362,51 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                     rep_series: list[Dict[str, list[float]]] = []
                     rep_seeds: list[int] = []
+                    rep_series_out: list[Optional[Dict[str, list[float]]]] = [None for _ in range(int(reps_i))]
+                    rep_seeds_out: list[Optional[int]] = [None for _ in range(int(reps_i))]
+                    if int(reps_i) <= 1:
+                        for ri in range(int(reps_i)):
+                            seed0 = int(seed_i) + (int(ri) * 97)
+                            s0, _m0 = _run_cell_culture_measurement_series_and_metrics(
+                                payload,
+                                ticks=int(ticks_i),
+                                seed0=int(seed0),
+                                names=names,
+                            )
+                            rep_series_out[int(ri)] = s0
+                            rep_seeds_out[int(ri)] = int(seed0)
+                    else:
+                        ctx = mp.get_context("spawn")
+                        cpu_req = max(1, min(int(reps_i), int(_RESOURCE_SCHED.cpu_total)))
+                        _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=2.0)
+                        _cm.__enter__()
+                        try:
+                            with concurrent.futures.ProcessPoolExecutor(
+                                max_workers=int(reps_i),
+                                mp_context=ctx,
+                                initializer=_char_worker_init,
+                                initargs=(payload, int(ticks_i), int(seed_i), list(names), [], "vitro"),
+                            ) as ex:
+                                futs: list[concurrent.futures.Future] = []
+                                for ri in range(int(reps_i)):
+                                    futs.append(ex.submit(_char_worker_eval, int(ri)))
+                                for fut in concurrent.futures.as_completed(futs):
+                                    ri0, seed0, s0, _dt0, _dm0 = fut.result()
+                                    if 0 <= int(ri0) < int(len(rep_series_out)):
+                                        rep_series_out[int(ri0)] = s0
+                                        rep_seeds_out[int(ri0)] = int(seed0)
+                        finally:
+                            _cm.__exit__(None, None, None)
+
                     for ri in range(int(reps_i)):
-                        seed0 = int(seed_i) + (int(ri) * 97)
-                        s0, m0 = _run_cell_culture_measurement_series_and_metrics(
-                            payload,
-                            ticks=int(ticks_i),
-                            seed0=int(seed0),
-                            names=names,
-                        )
+                        s0 = rep_series_out[int(ri)]
+                        sd = rep_seeds_out[int(ri)]
+                        if not isinstance(sd, int):
+                            sd = int(seed_i) + (int(ri) * 97)
+                        if not isinstance(s0, dict):
+                            s0 = {}
                         rep_series.append(s0)
-                        rep_seeds.append(int(seed0))
+                        rep_seeds.append(int(sd))
 
                     # Persist files to disk.
                     files_text: Dict[str, Any] = {}
@@ -9927,10 +12494,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         ticks=int(ticks_i),
                         interventions_n=int(iv_n),
                     )
+                    fixed = _tests_compute_fixed_cost_cents(
+                        challenge="cancer",
+                        kind="characterization",
+                        model_key=model_key,
+                        interventions_n=int(iv_n),
+                    )
                     charge = _tests_make_charge(
                         kind="tests_cancer_characterization",
                         samples=int(reps_i),
                         unit_cost_cents=int(unit),
+                        fixed_cost_cents=int(fixed),
                         meta={
                             "experiment": "tests_cancer_characterization_v1",
                             "ticks": int(ticks_i),
@@ -9970,13 +12544,64 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 death_days: list[int] = []
                 death_meas: list[str] = []
 
+                rep_series_out: list[Optional[Dict[str, list[float]]]] = [None for _ in range(int(reps_i))]
+                rep_seeds_out: list[Optional[int]] = [None for _ in range(int(reps_i))]
+                death_days_out: list[Optional[int]] = [None for _ in range(int(reps_i))]
+                death_meas_out: list[Optional[str]] = [None for _ in range(int(reps_i))]
+                if int(reps_i) <= 1:
+                    for ri in range(int(reps_i)):
+                        seed0 = int(seed_i) + (int(ri) * 97)
+                        s0, dt0, dm0 = _run_in_vivo_measurement_series_until_death(
+                            payload,
+                            ticks=int(ticks_i),
+                            seed0=int(seed0),
+                            death_names=death_names,
+                        )
+                        rep_series_out[int(ri)] = s0
+                        rep_seeds_out[int(ri)] = int(seed0)
+                        death_days_out[int(ri)] = int(dt0)
+                        death_meas_out[int(ri)] = str(dm0)
+                else:
+                    ctx = mp.get_context("spawn")
+                    cpu_req = max(1, min(int(reps_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=4.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(reps_i),
+                            mp_context=ctx,
+                            initializer=_char_worker_init,
+                            initargs=(payload, int(ticks_i), int(seed_i), list(names), list(death_names), "invivo"),
+                        ) as ex:
+                            futs: list[concurrent.futures.Future] = []
+                            for ri in range(int(reps_i)):
+                                futs.append(ex.submit(_char_worker_eval, int(ri)))
+                            for fut in concurrent.futures.as_completed(futs):
+                                ri0, seed0, s0, dt0, dm0 = fut.result()
+                                if 0 <= int(ri0) < int(len(rep_series_out)):
+                                    rep_series_out[int(ri0)] = s0
+                                    rep_seeds_out[int(ri0)] = int(seed0)
+                                    death_days_out[int(ri0)] = int(dt0)
+                                    death_meas_out[int(ri0)] = str(dm0)
+                    finally:
+                        _cm.__exit__(None, None, None)
+
                 for ri in range(int(reps_i)):
-                    seed0 = int(seed_i) + (int(ri) * 97)
-                    s0, dt0, dm0 = _run_in_vivo_measurement_series_until_death(
-                        payload, ticks=int(ticks_i), seed0=int(seed0), death_names=death_names
-                    )
+                    sd = rep_seeds_out[int(ri)]
+                    if not isinstance(sd, int):
+                        sd = int(seed_i) + (int(ri) * 97)
+                    s0 = rep_series_out[int(ri)]
+                    if not isinstance(s0, dict):
+                        s0 = {}
+                    dt0 = death_days_out[int(ri)]
+                    if not isinstance(dt0, int):
+                        dt0 = int(ticks_i)
+                    dm0 = death_meas_out[int(ri)]
+                    if not isinstance(dm0, str):
+                        dm0 = ""
+
                     rep_series.append(s0)
-                    rep_seeds.append(int(seed0))
+                    rep_seeds.append(int(sd))
                     death_days.append(int(dt0))
                     death_meas.append(str(dm0))
 
@@ -10000,6 +12625,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     "replicate",
                     "seed",
                     "study_ran_for_days",
+                    "death_observed",
                     "death_occurred_on_day",
                     "death_measurement",
                     "timecourse_filename",
@@ -10013,8 +12639,11 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     sample_id = f"{model_label}_r{int(ri)}_{run_tag}"
                     tc_name = f"replicates/{sample_id}_timecourse.csv"
                     tc_names.append(tc_name)
-                    dd = int(death_days[int(ri)]) if int(ri) < int(len(death_days)) else int(ticks_i)
-                    dm = str(death_meas[int(ri)]) if int(ri) < int(len(death_meas)) else ""
+                    dd0 = int(death_days[int(ri)]) if int(ri) < int(len(death_days)) else int(ticks_i)
+                    dm0 = str(death_meas[int(ri)]) if int(ri) < int(len(death_meas)) else ""
+                    death_observed = 1 if int(dd0) < int(ticks_i) else 0
+                    dd = int(dd0) if int(death_observed) == 1 else None
+                    dm = str(dm0) if int(death_observed) == 1 else ""
                     tc_fid = _OMICS._file_id(run_id0, tc_name)
                     tc_url = f"/api/omics/file?run_id={run_id0}&name={tc_name}"
                     meta_rows.append(
@@ -10026,7 +12655,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             int(ri),
                             int(sd),
                             int(ticks_i),
-                            int(dd),
+                            int(death_observed),
+                            dd,
                             str(dm),
                             str(Path(tc_name).name),
                             str(tc_name),
@@ -10073,10 +12703,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     ticks=int(ticks_i),
                     interventions_n=int(iv_n),
                 )
+                fixed = _tests_compute_fixed_cost_cents(
+                    challenge=challenge,
+                    kind="characterization",
+                    model_key=model_key,
+                    interventions_n=int(iv_n),
+                )
                 charge = _tests_make_charge(
                     kind=f"tests_{challenge}_characterization",
                     samples=int(reps_i),
                     unit_cost_cents=int(unit),
+                    fixed_cost_cents=int(fixed),
                     meta={
                         "experiment": f"tests_{challenge}_characterization_v1",
                         "ticks": int(ticks_i),
@@ -10205,35 +12842,41 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         results_out[int(li)] = _eval_layer(int(li), str(nm))
                 else:
                     ctx = mp.get_context("spawn")
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=int(workers_i),
-                        mp_context=ctx,
-                        initializer=_vitro_screen_worker_init,
-                        initargs=(payload, int(ticks_i), int(seed_i), int(reps_i), str(direction_s), float(dose_f), list(meas_names)),
-                    ) as ex:
-                        pending: set[concurrent.futures.Future] = set()
-                        it = iter(list(enumerate(prot_layers)))
+                    cpu_req = max(1, min(int(workers_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=8.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(workers_i),
+                            mp_context=ctx,
+                            initializer=_vitro_screen_worker_init,
+                            initargs=(payload, int(ticks_i), int(seed_i), int(reps_i), str(direction_s), float(dose_f), list(meas_names)),
+                        ) as ex:
+                            pending: set[concurrent.futures.Future] = set()
+                            it = iter(list(enumerate(prot_layers)))
 
-                        def _submit_one() -> None:
-                            try:
-                                li0, nm0 = next(it)
-                            except StopIteration:
-                                return
-                            pending.add(ex.submit(_vitro_screen_worker_eval, int(li0), str(nm0)))
+                            def _submit_one() -> None:
+                                try:
+                                    li0, nm0 = next(it)
+                                except StopIteration:
+                                    return
+                                pending.add(ex.submit(_vitro_screen_worker_eval, int(li0), str(nm0)))
 
-                        for _ in range(min(int(workers_i), int(len(prot_layers)))):
-                            _submit_one()
-
-                        while pending:
-                            done, pending = concurrent.futures.wait(
-                                pending, return_when=concurrent.futures.FIRST_COMPLETED
-                            )
-                            for fut in done:
-                                r = fut.result()
-                                li = int(r.get("layer_index") or 0)
-                                if 0 <= li < int(len(results_out)):
-                                    results_out[li] = r
+                            for _ in range(min(int(workers_i), int(len(prot_layers)))):
                                 _submit_one()
+
+                            while pending:
+                                done, pending = concurrent.futures.wait(
+                                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                                )
+                                for fut in done:
+                                    r = fut.result()
+                                    li = int(r.get("layer_index") or 0)
+                                    if 0 <= li < int(len(results_out)):
+                                        results_out[li] = r
+                                    _submit_one()
+                    finally:
+                        _cm.__exit__(None, None, None)
 
                 results: list[Dict[str, Any]] = [r for r in results_out if isinstance(r, dict)]
 
@@ -10433,10 +13076,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     ticks=int(ticks_i),
                     interventions_n=int(iv_n + 1),
                 )
+                fixed = _tests_compute_fixed_cost_cents(
+                    challenge=challenge,
+                    kind="protein_screen",
+                    model_key=model_key,
+                    interventions_n=int(iv_n + 1),
+                )
                 charge = _tests_make_charge(
                     kind=f"tests_{challenge}_protein_screen",
                     samples=int(samples_run),
                     unit_cost_cents=int(unit),
+                    fixed_cost_cents=int(fixed),
                     meta={
                         "experiment": f"tests_{challenge}_protein_screen_v1",
                         "ticks": int(ticks_i),
@@ -10488,11 +13138,14 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 replicates = body.get("replicates", 10)
                 seed = body.get("seed", 1)
 
-                ticks_i = 400
+                ticks_cap = 1500
                 try:
-                    reps_i = max(1, int(replicates))
+                    reps_req_i = max(1, int(replicates))
                 except Exception as e:
                     raise ValueError(f"replicates must be an int: {e}") from e
+                prev_min_reps = _game_get_player_int(player_id, "aging_claim_cure_min_reps", default=0)
+                reps_min_i = max(10, int(prev_min_reps))
+                reps_i = max(int(reps_req_i), int(reps_min_i))
                 try:
                     seed_i = int(seed)
                 except Exception as e:
@@ -10516,26 +13169,71 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 death_ticks_treated: list[int] = []
                 death_meas_base: list[str] = []
                 death_meas_treated: list[str] = []
-                for ri in range(int(reps_i)):
-                    seed0_b = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
-                    seed0_t = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
-                    rb = _run_lifespan_death_tick(healthy_base, ticks=int(ticks_i), seed0=int(seed0_b), death_names=death_names)
-                    rt = _run_lifespan_death_tick(healthy, ticks=int(ticks_i), seed0=int(seed0_t), death_names=death_names)
+                death_ticks_base = [int(ticks_cap) for _ in range(int(reps_i))]
+                death_ticks_treated = [int(ticks_cap) for _ in range(int(reps_i))]
+                death_meas_base = ["" for _ in range(int(reps_i))]
+                death_meas_treated = ["" for _ in range(int(reps_i))]
+                if int(reps_i) <= 1:
+                    for ri in range(int(reps_i)):
+                        seed0_b = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                        seed0_t = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+                        rb = _run_lifespan_death_tick(
+                            healthy_base, ticks=int(ticks_cap), seed0=int(seed0_b), death_names=death_names
+                        )
+                        rt = _run_lifespan_death_tick(
+                            healthy, ticks=int(ticks_cap), seed0=int(seed0_t), death_names=death_names
+                        )
+                        try:
+                            death_ticks_base[int(ri)] = int(rb.get("death_tick"))
+                        except Exception:
+                            death_ticks_base[int(ri)] = int(ticks_cap)
+                        try:
+                            death_ticks_treated[int(ri)] = int(rt.get("death_tick"))
+                        except Exception:
+                            death_ticks_treated[int(ri)] = int(ticks_cap)
+                        death_meas_base[int(ri)] = str(rb.get("death_measurement") or "")
+                        death_meas_treated[int(ri)] = str(rt.get("death_measurement") or "")
+                else:
+                    ctx = mp.get_context("spawn")
+                    cpu_req = max(1, min(int(reps_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=6.0)
+                    _cm.__enter__()
                     try:
-                        death_ticks_base.append(int(rb.get("death_tick")))
-                    except Exception:
-                        death_ticks_base.append(int(ticks_i))
-                    try:
-                        death_ticks_treated.append(int(rt.get("death_tick")))
-                    except Exception:
-                        death_ticks_treated.append(int(ticks_i))
-                    death_meas_base.append(str(rb.get("death_measurement") or ""))
-                    death_meas_treated.append(str(rt.get("death_measurement") or ""))
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(cpu_req),
+                            mp_context=ctx,
+                            initializer=_aging_claim_worker_init,
+                            initargs=(healthy_base, healthy, list(death_names), int(ticks_cap), int(seed_i)),
+                        ) as ex:
+                            futs: list[concurrent.futures.Future] = []
+                            for ri in range(int(reps_i)):
+                                futs.append(ex.submit(_aging_claim_worker_eval, int(ri)))
+                            for fut in concurrent.futures.as_completed(futs):
+                                ri0, dt_b, dm_b, dt_t, dm_t = fut.result()
+                                if 0 <= int(ri0) < int(reps_i):
+                                    death_ticks_base[int(ri0)] = int(dt_b)
+                                    death_meas_base[int(ri0)] = str(dm_b)
+                                    death_ticks_treated[int(ri0)] = int(dt_t)
+                                    death_meas_treated[int(ri0)] = str(dm_t)
+                    finally:
+                        _cm.__exit__(None, None, None)
 
-                stats_base = _tests_lifespan_stats(death_ticks_base, ticks=int(ticks_i))
-                stats_treated = _tests_lifespan_stats(death_ticks_treated, ticks=int(ticks_i))
-                curve_base = _lifespan_survival_curve(death_ticks_base, ticks=int(ticks_i))
-                curve_treated = _lifespan_survival_curve(death_ticks_treated, ticks=int(ticks_i))
+                observed_until = int(ticks_cap)
+                try:
+                    max_dt = int(max([int(x) for x in (death_ticks_base + death_ticks_treated)]))
+                    if int(max_dt) >= int(ticks_cap):
+                        observed_until = int(ticks_cap)
+                    else:
+                        observed_until = int(min(int(ticks_cap), int(max_dt) + 1))
+                except Exception:
+                    observed_until = int(ticks_cap)
+                if int(observed_until) < 1:
+                    observed_until = 1
+
+                stats_base = _tests_lifespan_stats(death_ticks_base, ticks=int(observed_until))
+                stats_treated = _tests_lifespan_stats(death_ticks_treated, ticks=int(observed_until))
+                curve_base = _lifespan_survival_curve(death_ticks_base, ticks=int(observed_until))
+                curve_treated = _lifespan_survival_curve(death_ticks_treated, ticks=int(observed_until))
                 try:
                     med_b = float(stats_base.get("median_lifespan_tick") or 0.0)
                 except Exception:
@@ -10547,6 +13245,10 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 delta_med = float(med_t) - float(med_b)
                 extra_days = float(delta_med)
                 win = False
+                try:
+                    win = bool(int(max([int(x) for x in death_ticks_treated])) >= int(ticks_cap))
+                except Exception:
+                    win = False
                 lifespan_recovery_pct = None
                 try:
                     if float(med_b) > 0.0:
@@ -10580,20 +13282,20 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 sum_rows: list[list[Any]] = []
 
                 for ri in range(int(reps_i)):
-                    dt = int(death_ticks_base[int(ri)]) if int(ri) < int(len(death_ticks_base)) else int(ticks_i)
+                    dt = int(death_ticks_base[int(ri)]) if int(ri) < int(len(death_ticks_base)) else int(ticks_cap)
                     dm = str(death_meas_base[int(ri)]) if int(ri) < int(len(death_meas_base)) else ""
                     cause = str(dm or "")
-                    if int(dt) >= int(ticks_i):
+                    if int(dt) >= int(ticks_cap):
                         cause = "survived_to_end"
-                    sum_rows.append(["baseline_healthy", int(ticks_i), int(dt), str(cause)])
+                    sum_rows.append(["baseline_healthy", int(observed_until), int(dt), str(cause)])
 
                 for ri in range(int(reps_i)):
-                    dt = int(death_ticks_treated[int(ri)]) if int(ri) < int(len(death_ticks_treated)) else int(ticks_i)
+                    dt = int(death_ticks_treated[int(ri)]) if int(ri) < int(len(death_ticks_treated)) else int(ticks_cap)
                     dm = str(death_meas_treated[int(ri)]) if int(ri) < int(len(death_meas_treated)) else ""
                     cause = str(dm or "")
-                    if int(dt) >= int(ticks_i):
+                    if int(dt) >= int(ticks_cap):
                         cause = "survived_to_end"
-                    sum_rows.append(["treated_healthy", int(ticks_i), int(dt), str(cause)])
+                    sum_rows.append(["treated_healthy", int(observed_until), int(dt), str(cause)])
 
                 files_text[fn_sum] = _csv_from_rows(sum_header, sum_rows)
 
@@ -10602,7 +13304,7 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         str(run_id0),
                         str(sid_sum),
                         "in vivo lifespan study (aging claim)",
-                        int(ticks_i),
+                        int(observed_until),
                         int(reps_i),
                         bool(bool(interventions_real)),
                         json.dumps(interventions_real, ensure_ascii=False),
@@ -10618,20 +13320,30 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     challenge=challenge,
                     kind="claim_cure",
                     model_key="healthy",
-                    ticks=int(ticks_i),
+                    ticks=int(ticks_cap),
+                    interventions_n=int(iv_n),
+                )
+                fixed = _tests_compute_fixed_cost_cents(
+                    challenge=challenge,
+                    kind="claim_cure",
+                    model_key="healthy",
                     interventions_n=int(iv_n),
                 )
                 charge = _tests_make_charge(
                     kind=f"tests_{challenge}_claim_cure",
                     samples=int(2 * reps_i),
                     unit_cost_cents=int(unit),
+                    fixed_cost_cents=int(fixed),
                     meta={
                         "experiment": f"tests_{challenge}_claim_cure_v1",
-                        "ticks": int(ticks_i),
+                        "ticks": int(ticks_cap),
+                        "ticks_cap": int(ticks_cap),
+                        "study_observed_until_days": int(observed_until),
                         "replicates": int(reps_i),
                     },
                 )
                 game = _game_apply_charge(player_id, charge)
+                _game_set_player_int(player_id, "aging_claim_cure_min_reps", int(reps_i))
 
                 score_lifedays_per_usd = None
                 try:
@@ -10655,8 +13367,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     "experiment": f"tests_{challenge}_claim_cure_v1",
                     "kind": "claim_cure",
                     "player_id": _sanitize_player_id(player_id),
-                    "ticks": int(ticks_i),
+                    "ticks": int(ticks_cap),
+                    "ticks_cap": int(ticks_cap),
+                    "study_observed_until_days": int(observed_until),
                     "replicates": int(reps_i),
+                    "replicates_requested": int(reps_req_i),
+                    "replicates_min_enforced": int(reps_min_i),
                     "seed": int(seed_i),
                     "interventions": interventions_real,
                     "baseline_healthy_median_tick": float(med_b),
@@ -10675,8 +13391,12 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     {
                         "ok": True,
                         "experiment": f"tests_{challenge}_claim_cure_v1",
-                        "ticks": int(ticks_i),
+                        "ticks": int(ticks_cap),
+                        "ticks_cap": int(ticks_cap),
+                        "study_observed_until_days": int(observed_until),
                         "replicates": int(reps_i),
+                        "replicates_requested": int(reps_req_i),
+                        "replicates_min_enforced": int(reps_min_i),
                         "death_measurements": list(death_names),
                         "run_id": str(omics_saved.get("run_id") or ""),
                         "files": omics_saved.get("files"),
@@ -10733,7 +13453,8 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 run_tag = str(run_id0)[:12]
 
                 disease_key = _tests_claim_cure_disease_model_key_for_challenge(challenge)
-                healthy = _tests_load_model_payload_for_challenge(challenge, "healthy")
+                healthy_key = "healthy_organism" if str(challenge) == "cancer" else "healthy"
+                healthy = _tests_load_model_payload_for_challenge(challenge, healthy_key)
                 sick0 = _tests_load_model_payload_for_challenge(challenge, str(disease_key))
                 sick = _deepcopy_payload(sick0)
                 interventions_real = _tests_translate_interventions_masked_to_real(interventions, model_key=str(disease_key), challenge=challenge)
@@ -10759,27 +13480,68 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 death_meas_healthy: list[str] = []
                 death_meas_sick_base: list[str] = []
                 death_meas_sick: list[str] = []
-                for ri in range(int(reps_i)):
-                    seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
-                    seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
-                    rh = _run_lifespan_death_tick(healthy, ticks=int(ticks_i), seed0=int(seed0_h), death_names=death_names)
-                    rs0 = _run_lifespan_death_tick(sick0, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names)
-                    rs = _run_lifespan_death_tick(sick, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names) if run_treated else rs0
+                death_ticks_healthy = [int(ticks_i) for _ in range(int(reps_i))]
+                death_ticks_sick_base = [int(ticks_i) for _ in range(int(reps_i))]
+                death_ticks_sick = [int(ticks_i) for _ in range(int(reps_i))]
+                death_meas_healthy = ["" for _ in range(int(reps_i))]
+                death_meas_sick_base = ["" for _ in range(int(reps_i))]
+                death_meas_sick = ["" for _ in range(int(reps_i))]
+                if int(reps_i) <= 1:
+                    for ri in range(int(reps_i)):
+                        seed0_h = int(seed_i) + (0 * 1000003) + (int(ri) * 97)
+                        seed0_s = int(seed_i) + (1 * 1000003) + (int(ri) * 97)
+                        rh = _run_lifespan_death_tick(
+                            healthy, ticks=int(ticks_i), seed0=int(seed0_h), death_names=death_names
+                        )
+                        rs0 = _run_lifespan_death_tick(
+                            sick0, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names
+                        )
+                        rs = (
+                            _run_lifespan_death_tick(sick, ticks=int(ticks_i), seed0=int(seed0_s), death_names=death_names)
+                            if run_treated
+                            else rs0
+                        )
+                        try:
+                            death_ticks_healthy[int(ri)] = int(rh.get("death_tick"))
+                        except Exception:
+                            death_ticks_healthy[int(ri)] = int(ticks_i)
+                        try:
+                            death_ticks_sick_base[int(ri)] = int(rs0.get("death_tick"))
+                        except Exception:
+                            death_ticks_sick_base[int(ri)] = int(ticks_i)
+                        try:
+                            death_ticks_sick[int(ri)] = int(rs.get("death_tick"))
+                        except Exception:
+                            death_ticks_sick[int(ri)] = int(ticks_i)
+                        death_meas_healthy[int(ri)] = str(rh.get("death_measurement") or "")
+                        death_meas_sick_base[int(ri)] = str(rs0.get("death_measurement") or "")
+                        death_meas_sick[int(ri)] = str(rs.get("death_measurement") or "")
+                else:
+                    ctx = mp.get_context("spawn")
+                    cpu_req = max(1, min(int(reps_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=6.0)
+                    _cm.__enter__()
                     try:
-                        death_ticks_healthy.append(int(rh.get("death_tick")))
-                    except Exception:
-                        death_ticks_healthy.append(int(ticks_i))
-                    try:
-                        death_ticks_sick_base.append(int(rs0.get("death_tick")))
-                    except Exception:
-                        death_ticks_sick_base.append(int(ticks_i))
-                    try:
-                        death_ticks_sick.append(int(rs.get("death_tick")))
-                    except Exception:
-                        death_ticks_sick.append(int(ticks_i))
-                    death_meas_healthy.append(str(rh.get("death_measurement") or ""))
-                    death_meas_sick_base.append(str(rs0.get("death_measurement") or ""))
-                    death_meas_sick.append(str(rs.get("death_measurement") or ""))
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(reps_i),
+                            mp_context=ctx,
+                            initializer=_disease_claim_worker_init,
+                            initargs=(healthy, sick0, sick, list(death_names), int(ticks_i), int(seed_i), bool(run_treated)),
+                        ) as ex:
+                            futs: list[concurrent.futures.Future] = []
+                            for ri in range(int(reps_i)):
+                                futs.append(ex.submit(_disease_claim_worker_eval, int(ri)))
+                            for fut in concurrent.futures.as_completed(futs):
+                                ri0, dt_h, dm_h, dt_s0, dm_s0, dt_s, dm_s = fut.result()
+                                if 0 <= int(ri0) < int(reps_i):
+                                    death_ticks_healthy[int(ri0)] = int(dt_h)
+                                    death_meas_healthy[int(ri0)] = str(dm_h)
+                                    death_ticks_sick_base[int(ri0)] = int(dt_s0)
+                                    death_meas_sick_base[int(ri0)] = str(dm_s0)
+                                    death_ticks_sick[int(ri0)] = int(dt_s)
+                                    death_meas_sick[int(ri0)] = str(dm_s)
+                    finally:
+                        _cm.__exit__(None, None, None)
 
                 stats_healthy = _tests_lifespan_stats(death_ticks_healthy, ticks=int(ticks_i))
                 stats_sick_base = _tests_lifespan_stats(death_ticks_sick_base, ticks=int(ticks_i))
@@ -10893,10 +13655,17 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     ticks=int(ticks_i),
                     interventions_n=int(iv_n),
                 )
+                fixed = _tests_compute_fixed_cost_cents(
+                    challenge=challenge,
+                    kind="claim_cure",
+                    model_key=str(disease_key),
+                    interventions_n=int(iv_n),
+                )
                 charge = _tests_make_charge(
                     kind=f"tests_{challenge}_claim_cure",
                     samples=int(int((3 if run_treated else 2)) * int(reps_i)),
                     unit_cost_cents=int(unit),
+                    fixed_cost_cents=int(fixed),
                     meta={
                         "experiment": f"tests_{challenge}_claim_cure_v1",
                         "ticks": int(ticks_i),
@@ -11431,25 +14200,31 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
                     if worker_mode == "process":
                         ctx = mp.get_context("spawn")
-                        with concurrent.futures.ProcessPoolExecutor(
-                            max_workers=int(workers_i),
-                            mp_context=ctx,
-                            initializer=_invivo_worker_init_v2,
-                            initargs=(healthy, sick2, death_names),
-                        ) as ex:
-                            futs: list[concurrent.futures.Future] = []
-                            for ci in (0, 1):
-                                for ri in range(int(reps_i)):
-                                    futs.append(ex.submit(_invivo_worker_death_eval, int(ci), int(ri), int(ticks_run), int(seed_i)))
-                            for fut in concurrent.futures.as_completed(futs):
-                                ci, ri, dt, dm = fut.result()
-                                if 0 <= int(ri) < int(reps_i):
-                                    if int(ci) == 0:
-                                        probe_death_ticks_h[int(ri)] = int(dt)
-                                        probe_death_meas_h[int(ri)] = str(dm)
-                                    else:
-                                        probe_death_ticks_s[int(ri)] = int(dt)
-                                        probe_death_meas_s[int(ri)] = str(dm)
+                        cpu_req = max(1, min(int(workers_i), int(_RESOURCE_SCHED.cpu_total)))
+                        _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=6.0)
+                        _cm.__enter__()
+                        try:
+                            with concurrent.futures.ProcessPoolExecutor(
+                                max_workers=int(workers_i),
+                                mp_context=ctx,
+                                initializer=_invivo_worker_init_v2,
+                                initargs=(healthy, sick2, death_names),
+                            ) as ex:
+                                futs: list[concurrent.futures.Future] = []
+                                for ci in (0, 1):
+                                    for ri in range(int(reps_i)):
+                                        futs.append(ex.submit(_invivo_worker_death_eval, int(ci), int(ri), int(ticks_run), int(seed_i)))
+                                for fut in concurrent.futures.as_completed(futs):
+                                    ci, ri, dt, dm = fut.result()
+                                    if 0 <= int(ri) < int(reps_i):
+                                        if int(ci) == 0:
+                                            probe_death_ticks_h[int(ri)] = int(dt)
+                                            probe_death_meas_h[int(ri)] = str(dm)
+                                        else:
+                                            probe_death_ticks_s[int(ri)] = int(dt)
+                                            probe_death_meas_s[int(ri)] = str(dm)
+                        finally:
+                            _cm.__exit__(None, None, None)
                         return
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
@@ -11546,37 +14321,46 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                     out_dt_s: list[int] = [int(ticks_i) for _ in range(int(reps_i))]
                     out_dm_h: list[str] = ["" for _ in range(int(reps_i))]
                     out_dm_s: list[str] = ["" for _ in range(int(reps_i))]
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=int(workers_i),
-                        mp_context=ctx,
-                        initializer=_invivo_worker_init_v2,
-                        initargs=(healthy, sick2, death_names),
-                    ) as ex:
-                        pending: set[concurrent.futures.Future] = set()
-                        it = iter(range(reps_i))
 
-                        def _submit_one() -> None:
-                            try:
-                                ri0 = next(it)
-                            except StopIteration:
-                                return
-                            pending.add(ex.submit(_invivo_worker_eval, int(ri0), int(ticks_i), int(seed_i)))
+                    cpu_req = max(1, min(int(workers_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=6.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(workers_i),
+                            mp_context=ctx,
+                            initializer=_invivo_worker_init_v2,
+                            initargs=(healthy, sick2, death_names),
+                        ) as ex:
+                            pending: set[concurrent.futures.Future] = set()
+                            it = iter(range(reps_i))
 
-                        for _ in range(min(int(workers_i), int(reps_i))):
-                            _submit_one()
+                            def _submit_one() -> None:
+                                try:
+                                    ri0 = next(it)
+                                except StopIteration:
+                                    return
+                                pending.add(ex.submit(_invivo_worker_eval, int(ri0), int(ticks_i), int(seed_i)))
 
-                        while pending:
-                            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
-                            for fut in done:
-                                ri, sh, ss, dt_h, dm_h, dt_s, dm_s = fut.result()
-                                if 0 <= int(ri) < int(reps_i):
-                                    out_h[int(ri)] = sh
-                                    out_s[int(ri)] = ss
-                                    out_dt_h[int(ri)] = int(dt_h)
-                                    out_dt_s[int(ri)] = int(dt_s)
-                                    out_dm_h[int(ri)] = str(dm_h)
-                                    out_dm_s[int(ri)] = str(dm_s)
+                            for _ in range(min(int(workers_i), int(reps_i))):
                                 _submit_one()
+
+                            while pending:
+                                done, pending = concurrent.futures.wait(
+                                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                                )
+                                for fut in done:
+                                    ri, sh, ss, dt_h, dm_h, dt_s, dm_s = fut.result()
+                                    if 0 <= int(ri) < int(reps_i):
+                                        out_h[int(ri)] = sh
+                                        out_s[int(ri)] = ss
+                                        out_dt_h[int(ri)] = int(dt_h)
+                                        out_dt_s[int(ri)] = int(dt_s)
+                                        out_dm_h[int(ri)] = str(dm_h)
+                                        out_dm_s[int(ri)] = str(dm_s)
+                                    _submit_one()
+                    finally:
+                        _cm.__exit__(None, None, None)
 
                     rep_series_healthy = [x if isinstance(x, dict) else {} for x in out_h]
                     rep_series_sick = [x if isinstance(x, dict) else {} for x in out_s]
@@ -11876,33 +14660,39 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                         results_out[int(li)] = _eval_layer(int(li), str(nm))
                 elif worker_mode == "process":
                     ctx = mp.get_context("spawn")
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=int(workers_i),
-                        mp_context=ctx,
-                        initializer=_invivo_screen_worker_init,
-                        initargs=(sick2, death_names, int(ticks_i), int(seed_i), int(reps_i), str(direction), float(dose_f)),
-                    ) as ex:
-                        pending: set[concurrent.futures.Future] = set()
-                        it = iter(list(enumerate(prot_layers)))
+                    cpu_req = max(1, min(int(workers_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=6.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(workers_i),
+                            mp_context=ctx,
+                            initializer=_invivo_screen_worker_init,
+                            initargs=(sick2, death_names, int(ticks_i), int(seed_i), int(reps_i), str(direction), float(dose_f)),
+                        ) as ex:
+                            pending: set[concurrent.futures.Future] = set()
+                            it = iter(list(enumerate(prot_layers)))
 
-                        def _submit_one() -> None:
-                            try:
-                                li0, nm0 = next(it)
-                            except StopIteration:
-                                return
-                            pending.add(ex.submit(_invivo_screen_worker_eval, int(li0), str(nm0)))
+                            def _submit_one() -> None:
+                                try:
+                                    li0, nm0 = next(it)
+                                except StopIteration:
+                                    return
+                                pending.add(ex.submit(_invivo_screen_worker_eval, int(li0), str(nm0)))
 
-                        for _ in range(min(int(workers_i), int(len(prot_layers)))):
-                            _submit_one()
-
-                        while pending:
-                            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
-                            for fut in done:
-                                r = fut.result()
-                                li = int(r.get("layer_index") or 0)
-                                if 0 <= li < int(len(results_out)):
-                                    results_out[li] = r
+                            for _ in range(min(int(workers_i), int(len(prot_layers)))):
                                 _submit_one()
+
+                            while pending:
+                                done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                                for fut in done:
+                                    r = fut.result()
+                                    li = int(r.get("layer_index") or 0)
+                                    if 0 <= li < int(len(results_out)):
+                                        results_out[li] = r
+                                    _submit_one()
+                    finally:
+                        _cm.__exit__(None, None, None)
                 else:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
                         pending: set[concurrent.futures.Future] = set()
@@ -12563,40 +15353,46 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                             death_ticks[int(ri)] = int(ticks_i)
                 elif worker_mode == "process":
                     ctx = mp.get_context("spawn")
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=int(workers_i),
-                        mp_context=ctx,
-                        initializer=_lifespan_worker_init,
-                        initargs=(payload, death_names, series_names),
-                    ) as ex:
-                        pending: set[concurrent.futures.Future] = set()
-                        it = iter(range(reps_i))
+                    cpu_req = max(1, min(int(workers_i), int(_RESOURCE_SCHED.cpu_total)))
+                    _cm = _RESOURCE_SCHED.acquire(cpu=int(cpu_req), mem_gb=4.0)
+                    _cm.__enter__()
+                    try:
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=int(workers_i),
+                            mp_context=ctx,
+                            initializer=_lifespan_worker_init,
+                            initargs=(payload, death_names, series_names),
+                        ) as ex:
+                            pending: set[concurrent.futures.Future] = set()
+                            it = iter(range(reps_i))
 
-                        def _submit_one() -> None:
-                            try:
-                                ri0 = next(it)
-                            except StopIteration:
-                                return
-                            pending.add(ex.submit(_lifespan_worker_eval, int(ri0), int(ticks_i), int(seed_i)))
+                            def _submit_one() -> None:
+                                try:
+                                    ri0 = next(it)
+                                except StopIteration:
+                                    return
+                                pending.add(ex.submit(_lifespan_worker_eval, int(ri0), int(ticks_i), int(seed_i)))
 
-                        for _ in range(min(int(workers_i), int(reps_i))):
-                            _submit_one()
-
-                        while pending:
-                            done, pending = concurrent.futures.wait(
-                                pending, return_when=concurrent.futures.FIRST_COMPLETED
-                            )
-                            for fut in done:
-                                ri, r, series = fut.result()
-                                if 0 <= int(ri) < int(reps_i):
-                                    reps_out[int(ri)] = r
-                                    reps_series_out[int(ri)] = series
-                                    _accum_series(series)
-                                    try:
-                                        death_ticks[int(ri)] = int(r.get("death_tick"))
-                                    except Exception:
-                                        death_ticks[int(ri)] = int(ticks_i)
+                            for _ in range(min(int(workers_i), int(reps_i))):
                                 _submit_one()
+
+                            while pending:
+                                done, pending = concurrent.futures.wait(
+                                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                                )
+                                for fut in done:
+                                    ri, r, series = fut.result()
+                                    if 0 <= int(ri) < int(reps_i):
+                                        reps_out[int(ri)] = r
+                                        reps_series_out[int(ri)] = series
+                                        _accum_series(series)
+                                        try:
+                                            death_ticks[int(ri)] = int(r.get("death_tick"))
+                                        except Exception:
+                                            death_ticks[int(ri)] = int(ticks_i)
+                                    _submit_one()
+                    finally:
+                        _cm.__exit__(None, None, None)
                 else:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_i)) as ex:
                         pending: set[concurrent.futures.Future] = set()
@@ -12671,13 +15467,82 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
                 return
 
             self._send_json(404, {"ok": False, "error": "not found"})
-        except Exception as e:
+        except TemporaryUnavailableError as e:
+            err_id = uuid.uuid4().hex[:10]
+            try:
+                _LOG.warning(
+                    "POST %s temporarily unavailable (error_id=%s provider=%s model=%s)",
+                    str(self.path),
+                    err_id,
+                    str(getattr(e, "provider", "") or ""),
+                    str(getattr(e, "model", "") or ""),
+                )
+            except Exception:
+                pass
+
+            self._send_json(
+                503,
+                {
+                    "ok": False,
+                    "error": "temporarily unavailable",
+                    "error_id": err_id,
+                    "provider": str(getattr(e, "provider", "") or ""),
+                    "model": str(getattr(e, "model", "") or ""),
+                },
+            )
+        except RateLimitError as e:
+            err_id = uuid.uuid4().hex[:10]
+            retry_after_s = None
+            try:
+                retry_after_s = float(e.retry_after_s) if e.retry_after_s is not None else None
+            except Exception:
+                retry_after_s = None
+
+            extra_headers: Dict[str, str] = {}
+            if retry_after_s is not None:
+                try:
+                    extra_headers["Retry-After"] = str(int(max(1.0, float(retry_after_s))))
+                except Exception:
+                    extra_headers = {}
+
+            try:
+                _LOG.warning(
+                    "POST %s rate limited (error_id=%s provider=%s model=%s retry_after_s=%s)",
+                    str(self.path),
+                    err_id,
+                    str(getattr(e, "provider", "") or ""),
+                    str(getattr(e, "model", "") or ""),
+                    str(retry_after_s),
+                )
+            except Exception:
+                pass
+
+            self._send_json(
+                429,
+                {
+                    "ok": False,
+                    "error": str(e),
+                    "error_id": err_id,
+                    "provider": str(getattr(e, "provider", "") or ""),
+                    "model": str(getattr(e, "model", "") or ""),
+                    "retry_after_s": retry_after_s,
+                },
+                extra_headers=extra_headers if extra_headers else None,
+            )
+        except ValueError as e:
             err_id = uuid.uuid4().hex[:10]
             try:
                 _LOG.exception("POST %s failed (error_id=%s)", str(self.path), err_id)
             except Exception:
                 pass
             self._send_json(400, {"ok": False, "error": str(e), "error_id": err_id})
+        except Exception as e:
+            err_id = uuid.uuid4().hex[:10]
+            try:
+                _LOG.exception("POST %s failed (error_id=%s)", str(self.path), err_id)
+            except Exception:
+                pass
+            self._send_json(500, {"ok": False, "error": str(e), "error_id": err_id})
         finally:
             try:
                 dt_ms = (time.time() - t0) * 1000.0

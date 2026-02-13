@@ -1,0 +1,193 @@
+AUTONOMOUS AGENT BENCHMARK: BIOLOGY STRATEGY GAME (SCIENTIFIC PUZZLE)
+
+Story & biology (what’s being simulated)
+You are studying a novel organism. There is NO disease in this challenge.
+Your job is to discover interventions that increase the lifespan of an otherwise healthy organism as much as possible.
+This organism is NOT human and is poorly studied.
+Molecular feature names are meaningless (e.g., “protein_7”).
+
+Time:
+The simulator measures time in ticks (roughly days).
+Some endpoints report age_days; this is the same as ticks.
+
+2. Objective / scoring
+Primary objective:
+
+Maximize lifespan extension of the healthy organism.
+
+Scoring is based on:
+
+POST /api/tests/disease/claim_cure
+(For aging, this is a healthy-baseline vs treated-healthy lifespan study.)
+The claim_cure response includes:
+
+extra_days: treated_healthy_median_tick - baseline_healthy_median_tick
+lifespan_recovery_pct: treated_healthy_median_tick / baseline_healthy_median_tick * 100
+score: (extra_days / game.money_spent_usd) * 10000
+
+Important:
+
+For aging claim_cure, the server simulates until ALL organisms have died OR 1500 ticks (days), whichever occurs first.
+If the treated group reaches 1500 ticks (i.e., at least one treated replicate survives to the 1500-tick cap), the game is WON for aging: win=true.
+The harness may stop early if win=true.
+Your goal is to maximize extra_days (and/or score) within budget.
+
+3. What you can do (scientific actions)
+You can run experiments that reveal how the organism responds to interventions:
+
+A) Characterization (time course data)
+
+Purpose: provides time course data from day 0 until the day the experiment ends.
+Can be run in vivo or in vitro.
+In vitro: equivalent of sampling cells every day and measuring biomarkers.
+In vivo: equivalent of sampling blood every day and measuring biomarkers.
+Note on death channels:
+Death channels end with "_death" and are 0/1.
+For a replicate timecourse, the death time is the first day where any "*_death" becomes 1; later rows may be empty.
+
+B) Bulk omics (snapshots)
+
+Bulk transcriptomics, proteomics, or metabolomics from samples in cell culture or from the organism's target tissue.
+Shows levels of RNA, protein, or metabolites in vitro or in vivo at a given timepoint, with or without an intervention.
+
+C) Spatial omics
+
+Spatial RNA or spatial protein.
+Can run with or without an intervention to understand how the intervention works.
+Can run in cell culture or in vivo.
+
+D) Protein perturbation screen (in vitro only)
+
+Purpose: discover how altering protein activity changes cellular behavior.
+Equivalent to perturbing one gene in cultured cells, then measuring biomarker effects at the day you indicate.
+
+E) Final validation (claim_cure)
+
+Purpose: head-to-head lifespan test: baseline healthy vs treated healthy.
+
+Replicates rule (aging claim_cure):
+You choose replicates in the request, but the server ENFORCES:
+- replicates >= 10
+- replicates cannot decrease across successive aging claim_cure calls for the same player_id (you may only increase)
+If you request fewer than allowed, the server will silently increase it.
+
+4. Interventions (what treatments look like)
+An intervention is a list of protein-target perturbations. Each perturbation is a dict:
+
+layer: a masked protein id like "protein_17"
+direction: "up" or "down"
+dose: positive integer
+Dose 1 up increases protein activity by 10%; dose 10 up increases by 100%, etc.
+Dose 10 down decreases activity by 100%, etc.
+Each dose equals a 10% change in activity.
+
+5. Data handling: inventory + analysis (omics)
+Omics outputs are saved as files on the server.
+
+Inventory:
+
+GET /api/omics/inventory?player_id=...
+
+To perform an analysis (POST /api/omics/analyze):
+
+Choose the file_id(s) for the data you want to analyze (typically count matrices).
+Include the matching metadata file_id(s) shown in the mapping above.
+For spatial: include BOTH run metadata and per-replicate cell_metadata when present.
+Write instructions for the analysis you want to run.
+
+For in vivo timecourse data: compute a replicate's death day as the first day any *death measurement* becomes 1 (often columns ending in _death). If no death event occurs within the recorded time window, treat that replicate as survived-through-study (censored), not as death at the final day.
+
+When evaluating an intervention, include BOTH baseline/control files and treated/intervention files in the SAME /api/omics/analyze call so the analysis can compute deltas directly.
+
+IMPORTANT: /api/omics/analyze is stateless (no memory of prior steps/goals).
+Your instructions must include necessary context: what the selected files are, which groups/conditions to compare, and what question to answer.
+
+Minimal “how to operate the simulator” (API you can call)
+You can ONLY interact with the world by calling these HTTP APIs. Base URL is provided by the harness.
+
+General rules:
+
+Pass player_id for any endpoint that takes it.
+Use GET /api/tests/disease/models to learn valid model keys.
+For aging, the available models are typically:
+- healthy (organism)
+- cell_culture (cell culture)
+
+ticks is study duration (roughly “days”).
+If you request too many ticks and the organism/culture dies earlier, the API can return an error telling you the death tick; reduce ticks or change the intervention.
+replicates is the number of independent repeats. Cost scales roughly linearly with replicates.
+interventions is a list of perturbations; an empty list means a baseline/control run.
+
+Cost model (you MUST manage budget)
+
+Money spent is tracked server-side per player_id:
+GET /api/game/state?player_id=...
+Before running expensive studies, request an exact quote:
+POST /api/tests/disease/estimate_cost body: { "player_id":"...", "experiment":"bulk_omics|spatial_omics|characterization|protein_screen|claim_cure", "model":"...", "ticks":<int>, "replicates":<int>, "omics_set":"...", "gene_set":"...", "interventions":[...] }
+Notes:
+model is required for all experiments except claim_cure.
+omics_set is required for bulk_omics.
+gene_set is required for spatial_omics.
+claim_cure ignores ticks (it always uses a long study).
+
+Game / housekeeping:
+
+GET /api/health
+GET /api/game/state?player_id=... (use this to track money_spent)
+
+Advisor discussion (free)
+
+POST /api/discuss body: {"player_id":"...","problem":"...","context":"..."}
+Returns:
+advice: short actionable guidance you can incorporate into next steps
+
+Discovery helpers (learn what you can target + what panels exist)
+
+GET /api/tests/disease/models
+GET /api/tests/disease/proteins?model=...
+GET /api/bulk_omics/sets
+GET /api/spatial_omics/type
+
+Core experiments (what to call, what you get back, and how to use it)
+
+A) Characterization
+POST /api/tests/disease/characterization
+
+B) Bulk omics
+POST /api/tests/disease/bulk_omics
+
+C) Spatial omics
+POST /api/tests/disease/spatial_omics
+
+D) Protein perturbation screen (in vitro only)
+POST /api/tests/disease/protein_screen
+
+claim_cure (scoring)
+
+POST /api/tests/disease/claim_cure body: {"player_id":"...","replicates":<int>,"interventions":[...]}
+What it does:
+Baseline healthy vs treated healthy lifespan test.
+
+For aging, claim_cure always uses a 1500-tick cap and may end earlier if all replicates die before that.
+
+9. Output format (BENCHMARK CRITICAL)
+You MUST respond with EXACTLY ONE JSON object per turn. No prose.
+
+Choose ONE action:
+
+Call an API
+{
+"action": "call_api",
+"method": "GET" | "POST",
+"path": "/api/...",
+"query": {"k": "v", ...},                 // optional, only for GET
+"body": {...},                            // optional, only for POST
+"last_result_summary": "brief summary of the previous TOOL_RESULT (or 'none' if first step)",
+"next_step_rationale": "brief reason why you are making this API call and what you expect to learn"
+}
+
+Now begin.
+
+Budget is 5 million dollars; you may go into debt if needed.
+
+claim_cure is the lifespan study used for scoring. It is expensive.

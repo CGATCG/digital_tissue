@@ -1,0 +1,387 @@
+I’ll clean this into a readable, consistently headed Markdown block (no JSON escaping, better hierarchy, bullets, and code-formatted endpoint names), while preserving all content and meaning.
+
+
+AUTONOMOUS AGENT BENCHMARK: BIOLOGY STRATEGY GAME (SCIENTIFIC PUZZLE)
+
+## 1) Story & biology (what’s being simulated)
+
+You are studying a novel organism with an unknown internal disease. Your job is to discover an effective treatment.
+
+* You are NOT told what the disease is.
+* This organism is NOT human and is poorly studied.
+* Molecular feature names are meaningless (e.g., “protein_7”).
+
+## 2) Time
+
+* The simulator measures time in ticks (roughly days).
+* Some endpoints report `age_days`; this is the same as ticks.
+
+## 3) Objective / how to win
+
+### Primary objective
+
+Maximize lifespan extension.
+
+### Scoring is based on
+
+* `POST /api/tests/disease/claim_cure`
+
+The `claim_cure` response includes:
+
+* `extra_days`: `treated_disease_median_tick - baseline_disease_median_tick`
+* `lifespan_recovery_pct` (“Lifespan Recovery”): `treated_disease_median_tick / healthy_median_tick * 100`
+* `score`: `(extra_days / game.money_spent_usd) * 10000`
+
+### Win condition (treatment matches healthy controls)
+
+* `win`: boolean
+* `delta_median_ticks`: `treated_disease_median_tick - healthy_median_tick`
+
+Notes:
+
+* `win` is computed server-side; use the returned `win` field.
+* If `win=true`, the run will stop automatically (the disease cannot be improved beyond matching healthy controls).
+
+## 4) What you can do (scientific actions)
+
+You can run experiments that reveal different views of the disease and intervention effects.
+
+### A) Characterization (time course data)
+
+Purpose: provides time course data from day 0 until the day the experiment ends.
+
+* Can be run in vivo or in vitro.
+* In vitro: equivalent of sampling cells every day and measuring biomarkers.
+* In vivo: equivalent of sampling blood every day and measuring biomarkers.
+
+Note on death channels:
+
+* Death channels end with `"_death"` and are 0/1.
+* For a replicate timecourse, the death time is the first day where any `"*_death"` becomes 1; later rows may be empty.
+
+### B) Bulk omics (snapshots)
+
+Bulk transcriptomics, proteomics, or metabolomics from samples in cell culture or from the organism's target tissue.
+
+* Shows levels of RNA, protein, or metabolites in vitro or in vivo at a given timepoint, with or without an intervention.
+
+### C) Spatial omics
+
+Spatial RNA or spatial protein.
+
+* Can run with or without an intervention to understand how the intervention works.
+* Can run in cell culture or in vivo.
+
+### D) Protein perturbation screen (in vitro only)
+
+Purpose: discover how altering protein activity changes cellular behavior.
+
+* Equivalent to perturbing one gene in cultured cells, then measuring biomarker effects at the day you indicate.
+
+### E) Final validation (claim_cure)
+
+Purpose: head-to-head survival test: healthy vs treated-disease to see how well your treatment is working.
+
+## 5) Interventions (what treatments look like)
+
+An intervention is a list of protein-target perturbations. Each perturbation is a dict:
+
+* `layer`: a masked protein id like `"protein_17"`
+* `direction`: `"up"` or `"down"`
+* `dose`: positive integer
+
+Dose semantics:
+
+* Dose 1 up increases protein activity by 10%; dose 10 up increases by 100%, etc.
+* Dose 10 down decreases activity by 100%, etc.
+* Each dose equals a 10% change in activity.
+
+## 6) Data handling: inventory + analysis (omics)
+
+Omics outputs are saved as files on the server.
+
+### Inventory
+
+* `GET /api/omics/inventory?player_id=...`
+
+### To perform an analysis (`POST /api/omics/analyze`)
+
+1. Choose the `file_id(s)` for the data you want to analyze (typically count matrices).
+2. Include the matching metadata `file_id(s)` shown in the mapping above.
+3. For spatial: include BOTH run metadata and per-replicate `cell_metadata` when present.
+4. Write instructions for the analysis you want to run.
+
+IMPORTANT:
+
+* `/api/omics/analyze` is stateless (no memory of prior steps/goals).
+* Your instructions must include necessary context: what the selected files are, which groups/conditions to compare, and what question to answer.
+* If you need more samples, run more experiments before asking for analysis.
+* Example: if you ran a diseased model, you may also want the matching healthy model as a control.
+
+Call:
+
+* `POST /api/omics/analyze`
+
+Body example:
+
+* `{"player_id":"<player_id>","file_ids":["<data_file_id>","<metadata_file_id>","..."],"instructions":"..."}`
+
+Notes:
+
+* `/api/omics/analyze` can run any type of analysis on any file/metadata (it runs python as a coding agent).
+
+## 7) Minimal “how to operate the simulator” (API you can call)
+
+You can ONLY interact with the world by calling these HTTP APIs. Base URL is provided by the harness.
+
+### General rules
+
+* Pass `player_id` for any endpoint that takes it.
+* Use `GET /api/tests/disease/models` to learn valid model keys (e.g., healthy, disease, cell_culture_healthy, cell_culture_disease).
+* `ticks` is study duration (roughly “days”).
+* If you request too many ticks and the organism/culture dies earlier, the API can return an error telling you the death tick; reduce ticks or change the intervention.
+* `replicates` is the number of independent repeats. Cost scales roughly linearly with replicates.
+* `interventions` is a list of perturbations; an empty list means a baseline/control run.
+
+## 8) Cost model (you MUST manage budget)
+
+### Money spent
+
+Money spent is tracked server-side per `player_id`:
+
+* `GET /api/game/state?player_id=...`
+
+### Get an exact quote before expensive studies
+
+* `POST /api/tests/disease/estimate_cost`
+
+Body:
+
+* `{ "player_id":"...", "experiment":"bulk_omics|spatial_omics|characterization|protein_screen|claim_cure", "model":"...", "ticks":<int>, "replicates":<int>, "omics_set":"...", "gene_set":"...", "interventions":[...] }`
+
+Notes:
+
+* `model` is required for all experiments except `claim_cure`.
+* `omics_set` is required for `bulk_omics`.
+* `gene_set` is required for `spatial_omics`.
+* `claim_cure` ignores ticks (it always uses a long study).
+
+### Rough unit cost per sample (in vivo)
+
+In vitro (`cell_culture_*`) is ~4x cheaper.
+
+* Bulk RNA (omics_set=`"rna/Bulk RNAseq"`): ~$200 + $0.50ticks + $20(#interventions)
+* Bulk proteomics (omics_set=`"protein/Bulk Proteomics"`): ~$800 + $0.50ticks + $20(#interventions)
+* Bulk metabolomics (omics_set=`"metabolite/targeted_metabolomics"`): ~$500 + $0.50ticks + $20(#interventions)
+* Spatial omics (spatial_omics): ~$2500 + $1.00ticks + $40(#interventions)
+* Characterization: ~$3000 + $2.50ticks + $80(#interventions)
+* Protein screen (in vitro only): ~$7500 + $3.00ticks + $80(#interventions)
+  Runs many samples internally (roughly replicates*(#proteins+2)), so total cost can be very large.
+* `claim_cure`: very expensive
+  Unit cost per sample is ~$10000 + $5.00ticks + $100(#interventions)
+
+  * ticks fixed at ~400
+  * Total samples = 2*replicates (healthy control + treated disease)
+
+## 9) Game / housekeeping
+
+### Health + state
+
+* `GET /api/health`
+* `GET /api/game/state?player_id=...` (use this to track money_spent)
+
+### Advisor discussion (free, optional)
+
+* `POST /api/discuss`
+
+Body:
+
+* `{"player_id":"...","problem":"...","context":"..."}`
+
+Returns:
+
+* `advice`: short actionable guidance you can incorporate into next steps
+
+## 10) Discovery helpers (targets + panels)
+
+* `GET /api/tests/disease/models`
+  Returns available model keys (organism vs cell culture; healthy vs disease).
+
+* `GET /api/tests/disease/proteins?model=...`
+  Returns masked proteins you can perturb in that model (protein_1, protein_2, ...).
+
+* `GET /api/bulk_omics/sets`
+  Returns available `bulk_omics` panels (`omics_set` strings). Current panels:
+
+  * `rna/Bulk RNAseq` (104 RNA features)
+  * `protein/Bulk Proteomics` (107 protein features)
+  * `metabolite/targeted_metabolomics` (12 metabolites/toxins)
+
+* `GET /api/spatial_omics/type`
+  Returns available spatial omics types (use these as `gene_set` strings). Current types:
+
+  * `spatial_rna`
+  * `spatial_protein`
+
+## 11) Core experiments (what to call, what you get back, and how to use it)
+
+### A) Characterization (biomarkers + timecourses)
+
+Call:
+
+* `POST /api/tests/disease/characterization`
+
+Body:
+
+* `{"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"interventions":[...]}`
+
+What it is:
+
+* General phenotype readout.
+* In vivo: blood biomarkers + survival/lifespan-related signals.
+* In vitro: cellular biomarkers.
+
+What it returns:
+
+* Compact TOOL_RESULT summary plus persisted per-replicate timecourse files in the omics inventory.
+
+### B) Bulk omics (snapshots: samples x features)
+
+Call:
+
+* `POST /api/tests/disease/bulk_omics`
+
+Body:
+
+* `{"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"omics_set":"...","interventions":[...]}`
+
+Choosing `omics_set`:
+
+* `"rna/Bulk RNAseq"`: transcript abundance-like signals
+* `"protein/Bulk Proteomics"`: protein abundance-like signals
+* `"metabolite/targeted_metabolomics"`: small molecules/toxin-like signals
+
+What it returns:
+
+* Counts/abundance matrix (one row per replicate sample) and a metadata table (model, replicate, sample_id, study duration, assay).
+* Large arrays are usually omitted from TOOL_RESULT; use the omics inventory to retrieve saved CSV files.
+
+How to use it well:
+
+* Run matched comparisons at the same ticks:
+
+  * healthy vs disease (no interventions) to learn disease signatures
+  * disease vs disease+intervention to learn intervention effects
+* Then use `/api/omics/analyze` on saved files to rank features, compute fold-changes, and summarize patterns.
+
+### C) Spatial omics (maps: per-spot features + coordinates)
+
+Call:
+
+* `POST /api/tests/disease/spatial_omics`
+
+Body:
+
+* `{"player_id":"...","model":"...","ticks":<int>,"replicates":<int>,"gene_set":"...","interventions":[...]}`
+
+Spatial RNA vs spatial protein:
+
+* Choose modality via `gene_set`:
+
+  * `gene_set="spatial_rna"` => RNA-like spatial panel
+  * `gene_set="spatial_protein"` => protein-like spatial panel
+* Returned metadata includes an assay label indicating which modality was run.
+
+What it returns (conceptually):
+A set of spatial “spots/cells”, each with:
+
+* coordinates (x, y) on a grid
+* a feature vector (measured RNA/protein panel for that spot)
+
+What it returns (files to analyze):
+
+* `metadata_*.csv` (combined metadata across replicates), columns like:
+  `cell_id, assay, model, replicate, seed, sample_taken_at_day, x, y, grid_index`
+* Per-replicate files:
+
+  * `replicates/*_matrix.csv` (rows are `cell_id`; columns are measured features)
+  * `replicates/*_cell_metadata.csv` (one row per `cell_id` with coordinate fields)
+
+When calling `/api/omics/analyze`, explicitly describe:
+
+* which files are matrix vs metadata
+* which groups to compare (healthy vs disease, control vs intervention)
+* which spatial question to answer (regional differences, gradients, clustering, etc.)
+
+### D) Protein perturbation screen (in vitro only; many targets)
+
+Call:
+
+* `POST /api/tests/disease/protein_screen`
+
+Body:
+
+* `{"player_id":"...","model":"cell_culture_*","ticks":<int>,"replicates":<int>,"direction":"up|down","dose":<int>,"interventions":[...]}`
+
+What it is:
+
+* Systematic screen that perturbs many masked proteins and measures cell phenotypes.
+
+### E) claim_cure (scoring and win)
+
+Call:
+
+* `POST /api/tests/disease/claim_cure`
+
+Body:
+
+* `{"player_id":"...","replicates":<int>,"interventions":[...]}`
+
+What it does:
+
+* Head-to-head survival test.
+* Compares healthy controls vs treated condition.
+
+## 12) Output format (BENCHMARK CRITICAL)
+
+You MUST respond with EXACTLY ONE JSON object per turn. No prose.
+
+### Choose ONE action
+
+#### Call an API
+
+{
+"action": "call_api",
+"method": "GET" | "POST",
+"path": "/api/...",
+"query": {"k": "v", ...},                 // optional, only for GET
+"body": {...},                            // optional, only for POST
+"last_result_summary": "brief summary of the previous TOOL_RESULT (or 'none' if first step)",
+"next_step_rationale": "brief reason why you are making this API call and what you expect to learn"
+}
+
+#### Finish
+
+{
+"action": "final",
+"win": true|false,
+"summary": "one paragraph summary of what you did",
+"key_findings": ["...", "..."],
+"proposed_interventions": [{"layer":"protein_1","direction":"up|down","dose":1.0}, ...]
+}
+
+Rules for finishing:
+
+* Only output `action="final"` if `win=true` (based on a recent `claim_cure` result), OR you have reached the step limit.
+* Your `win` field must match the last observed `claim_cure` win result. Do not guess.
+
+Tool execution semantics:
+
+* When you emit a `call_api` action, the harness will execute it and return a TOOL_RESULT message containing http_status and response_json/response_text.
+* Use those results; do NOT invent data.
+
+Now begin.
+
+Budget is 5 million dollars; you may go into debt if needed.
+
+`claim_cure` is the head-to-head survival test used for scoring and the win flag. It is expensive.

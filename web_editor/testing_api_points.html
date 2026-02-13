@@ -33,7 +33,7 @@
       </div>
       <div style="min-width: 260px; flex: 1 1 260px">
         <label for="dModel">model</label>
-        <input id="dModel" value="cell_culture_cancer" />
+        <input id="dModel" value="cancer_cell_culture" />
       </div>
       <div style="min-width: 160px; flex: 0 0 160px">
         <label for="dTicks">ticks</label>
@@ -187,10 +187,10 @@
       </div>
 
       <label for="query">Query (JSON object, optional)</label>
-      <textarea id="query" spellcheck="false" placeholder='{"model":"cell_culture_cancer"}'></textarea>
+      <textarea id="query" spellcheck="false" placeholder='{"model":"cancer_cell_culture"}'></textarea>
 
       <label for="body">Body (JSON object, optional)</label>
-      <textarea id="body" spellcheck="false" placeholder='{"player_id":"debug","model":"cell_culture_cancer"}'></textarea>
+      <textarea id="body" spellcheck="false" placeholder='{"player_id":"debug","model":"cancer_cell_culture"}'></textarea>
 
       <div class="row" style="margin-top: 10px">
         <button id="send">Send</button>
@@ -459,6 +459,11 @@
       if (p === '/api/tests/cancer/models') {
         const models0 = Array.isArray(r.models) ? r.models : [];
         const desc = {
+          healthy_organism: 'This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is a healthy organism, the baseline.',
+          healthy_cell_culture: 'Gut-derived cells from a healthy organism. You can perform the same assays as in the gut of the organism but the characterization is showing the values of molecules in the cells that are in culture and instead of showing lifespan curves and biomarkers it will show things like confluency, division rate, cell death, etc.',
+          cancer_organism: 'This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is an organism in the early stages of developing cancer and will eventually develop it.',
+          cancer_cell_culture: 'Gut-derived cells from an organism with cancer. You can perform the same assays as in the gut of the organism but the characterization is showing the values of molecules in the cells that are in culture and instead of showing lifespan curves and biomarkers it will show things like confluency, division rate, cell death, etc.',
+
           healthy: 'This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is a healthy organism, the baseline.',
           cell_culture_healthy: 'Gut-derived cells from a healthy organism. You can perform the same assays as in the gut of the organism but the characterization is showing the values of molecules in the cells that are in culture and instead of showing lifespan curves and biomarkers it will show things like confluency, division rate, cell death, etc.',
           cancer: 'This is a whole organism, an animal. If this is used for omics it will look at the gut specifically but if it is run for characterization it will show biomarkers as well as lifespan curves. Screens cannot be done in organisms since it is too expensive. This specific sample is an organism in the early stages of developing cancer and will eventually develop it.',
@@ -499,7 +504,7 @@
 
       if (p === '/api/tests/cancer/protein_screen') {
         const model = String(r.model || '');
-        const isVitro = model.startsWith('cell_culture_');
+        const isVitro = (model === 'cell_culture' || model.startsWith('cell_culture_') || model.endsWith('_cell_culture'));
         const inv = (r.omics_inventory && typeof r.omics_inventory === 'object') ? r.omics_inventory : null;
         const invMsg = inv ? String(inv.llm_message || '').trim() : '';
         if (isVitro) {

@@ -22,9 +22,7 @@ TIME
 
 BUDGET
 
-* Total budget is 5,000,000 USD.
-* You may go into debt if needed.
-* Spending is tracked server-side for the duration of a run (harness-managed identity).
+* You have infinite budget.
 
 HOW TO TAKE ACTIONS (MANDATORY)
 
@@ -652,79 +650,8 @@ PROTEIN SCREEN ACTION EXAMPLE (FULL WRAPPED ACTION)
 
   * POST /api/omics/analyze to rank proteins and extract top candidates
 
-ACTION G: INSPECT BUDGET AND STATE
 
-* Purpose: track money spent and any other tracked game state for the current run
-* Call:
-
-  * GET /api/game/state
-
-GAME STATE ACTION EXAMPLE (FULL WRAPPED ACTION)
-{
-  "action": "call_api",
-  "method": "GET",
-  "path": "/api/game/state",
-  "query": {},
-  "body": {},
-  "last_result_summary": "I need to check spending and current run state.",
-  "next_step_rationale": "Confirm budget/ledger before choosing the next experiments."
-}
-
-ACTION H: GET EXACT COST QUOTE BEFORE RUNNING AN EXPERIMENT
-
-* Purpose: price estimate for a planned experiment before spending money
-* Useful for:
-
-  * large replicate counts
-  * expensive assays
-  * many interventions
-* Call:
-
-  * POST /api/tests/disease/estimate_cost
-* Body example:
-  {
-  "experiment": "spatial_omics",
-  "model": "disease",
-  "ticks": 60,
-  "replicates": 3,
-  "gene_set": "spatial_rna",
-  "interventions": [{"layer": "protein_12", "direction": "down", "dose": 3}]
-  }
-
-ESTIMATE COST ACTION EXAMPLE (FULL WRAPPED ACTION)
-{
-  "action": "call_api",
-  "method": "POST",
-  "path": "/api/tests/disease/estimate_cost",
-  "query": {},
-  "body": {
-    "experiment": "bulk_omics",
-    "model": "disease",
-    "ticks": 60,
-    "replicates": 3,
-    "omics_set": "protein/Bulk Proteomics",
-    "interventions": []
-  },
-  "last_result_summary": "I want a cost estimate before spending money.",
-  "next_step_rationale": "Use the quote to decide whether to adjust replicates/ticks/panel before running the real experiment."
-}
-* Request fields:
-
-  * experiment: required string, one of:
-
-    * bulk_omics
-    * spatial_omics
-    * characterization
-    * protein_screen
-    * claim_cure
-  * model: required for all experiments except claim_cure
-  * ticks: optional int duration or sample timepoint
-  * replicates: optional int repeats
-  * omics_set: required only when experiment is bulk_omics
-  * gene_set: required only when experiment is spatial_omics
-  * interventions: list; empty list means baseline/control
-
-ACTION I: ADVISOR DISCUSSION (FREE)
+ACTION I: ADVISOR DISCUSSION
 
 * Purpose: get short actionable guidance without running an experiment
 * Not data-generating
@@ -795,3 +722,4 @@ TIMECOURSE DEATH RULE (SHORT REFERENCE)
 
 
 VERY IMPORTANT, NEVER FORGET THIS: When you call analyze to analyze a set of files, it is probable that the analysis will fail or that you will not get the information you were trying to get. It is important that you try again, analyze won't remember the last attempt so you need to state your instructions again and you migh adjust them to get the information that you need but if it failed for any reason you should 100% retry. 
+

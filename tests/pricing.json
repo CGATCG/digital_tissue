@@ -2,131 +2,392 @@
   "version": 1,
   "tests": {
     "cancer": {
-      "multipliers": {
-        "in_vitro": 0.25,
-        "in_vivo": 1.0
-      },
       "kinds": {
         "bulk_rnaseq": {
-          "unit_cents": 20000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 45000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 70000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "bulk_proteomics": {
-          "unit_cents": 80000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 40000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 65000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "bulk_metabolomics": {
-          "unit_cents": 50000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 25000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 50000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "spatial_transcriptomics": {
-          "unit_cents": 250000,
-          "unit_per_tick_cents": 100,
-          "unit_per_intervention_cents": 4000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 350000,
+              "unit_per_tick_cents": 200,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 1000,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 420000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 2000,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "characterization": {
-          "unit_cents": 300000,
-          "unit_per_tick_cents": 250,
-          "unit_per_intervention_cents": 8000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 20000,
+              "unit_per_tick_cents": 200,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 60000,
+              "unit_per_tick_cents": 300,
+              "unit_per_tick_per_intervention_cents": 100,
+              "unit_per_intervention_cents": 2500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "protein_screen": {
-          "unit_cents": 750000,
-          "unit_per_tick_cents": 300,
-          "unit_per_intervention_cents": 8000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 60000,
+              "unit_per_tick_cents": 500,
+              "unit_per_tick_per_intervention_cents": 10,
+              "unit_per_intervention_cents": 600,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 150000,
+              "unit_per_tick_cents": 500,
+              "unit_per_tick_per_intervention_cents": 100,
+              "unit_per_intervention_cents": 6000,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "claim_cure": {
-          "unit_cents": 1000000,
-          "unit_per_tick_cents": 500,
-          "unit_per_intervention_cents": 10000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 12000,
+              "unit_per_tick_cents": 300,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 15000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         }
       }
     },
     "hereditary_disease": {
-      "multipliers": {
-        "in_vitro": 0.25,
-        "in_vivo": 1.0
-      },
       "kinds": {
         "bulk_rnaseq": {
-          "unit_cents": 20000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 45000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 70000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "bulk_proteomics": {
-          "unit_cents": 80000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 40000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 65000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "bulk_metabolomics": {
-          "unit_cents": 50000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 25000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 50000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "spatial_transcriptomics": {
-          "unit_cents": 250000,
-          "unit_per_tick_cents": 100,
-          "unit_per_intervention_cents": 4000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 350000,
+              "unit_per_tick_cents": 200,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 1000,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 420000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 2000,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "characterization": {
-          "unit_cents": 300000,
-          "unit_per_tick_cents": 250,
-          "unit_per_intervention_cents": 8000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 20000,
+              "unit_per_tick_cents": 200,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 60000,
+              "unit_per_tick_cents": 300,
+              "unit_per_tick_per_intervention_cents": 100,
+              "unit_per_intervention_cents": 2500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "protein_screen": {
-          "unit_cents": 750000,
-          "unit_per_tick_cents": 300,
-          "unit_per_intervention_cents": 8000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 60000,
+              "unit_per_tick_cents": 500,
+              "unit_per_tick_per_intervention_cents": 10,
+              "unit_per_intervention_cents": 600,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 150000,
+              "unit_per_tick_cents": 500,
+              "unit_per_tick_per_intervention_cents": 100,
+              "unit_per_intervention_cents": 6000,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "claim_cure": {
-          "unit_cents": 1000000,
-          "unit_per_tick_cents": 500,
-          "unit_per_intervention_cents": 10000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 12000,
+              "unit_per_tick_cents": 300,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 15000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         }
       }
     },
     "aging": {
-      "multipliers": {
-        "in_vitro": 0.25,
-        "in_vivo": 1.0
-      },
       "kinds": {
         "bulk_rnaseq": {
-          "unit_cents": 20000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 45000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 70000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "bulk_proteomics": {
-          "unit_cents": 80000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 40000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 65000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "bulk_metabolomics": {
-          "unit_cents": 50000,
-          "unit_per_tick_cents": 50,
-          "unit_per_intervention_cents": 2000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 25000,
+              "unit_per_tick_cents": 100,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 50000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "spatial_transcriptomics": {
-          "unit_cents": 250000,
-          "unit_per_tick_cents": 100,
-          "unit_per_intervention_cents": 4000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 350000,
+              "unit_per_tick_cents": 200,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 1000,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 420000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 2000,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "characterization": {
-          "unit_cents": 300000,
-          "unit_per_tick_cents": 250,
-          "unit_per_intervention_cents": 8000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 20000,
+              "unit_per_tick_cents": 200,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 60000,
+              "unit_per_tick_cents": 300,
+              "unit_per_tick_per_intervention_cents": 100,
+              "unit_per_intervention_cents": 2500,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "protein_screen": {
-          "unit_cents": 750000,
-          "unit_per_tick_cents": 300,
-          "unit_per_intervention_cents": 8000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 60000,
+              "unit_per_tick_cents": 500,
+              "unit_per_tick_per_intervention_cents": 10,
+              "unit_per_intervention_cents": 600,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 150000,
+              "unit_per_tick_cents": 500,
+              "unit_per_tick_per_intervention_cents": 100,
+              "unit_per_intervention_cents": 6000,
+              "intervention_setup_cents": 30000
+            }
+          }
         },
         "claim_cure": {
-          "unit_cents": 1000000,
-          "unit_per_tick_cents": 500,
-          "unit_per_intervention_cents": 10000
+          "contexts": {
+            "in_vitro": {
+              "unit_cents": 12000,
+              "unit_per_tick_cents": 300,
+              "unit_per_tick_per_intervention_cents": 50,
+              "unit_per_intervention_cents": 500,
+              "intervention_setup_cents": 0
+            },
+            "in_vivo": {
+              "unit_cents": 15000,
+              "unit_per_tick_cents": 250,
+              "unit_per_tick_per_intervention_cents": 80,
+              "unit_per_intervention_cents": 1500,
+              "intervention_setup_cents": 30000
+            }
+          }
         }
       }
     }

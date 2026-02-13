@@ -19,7 +19,7 @@
       },
       {
         "name": "morphology_death",
-        "expr": "(2 * count(where=((morphology > 0.5) & (cell > 0.5)))) / (count(where=(morphology > 0.5)) + count(where=(cell > 0.5)) + 1e-9) < 0.95\n"
+        "expr": "(2 * count(where=((morphology > 0.5) & (cell > 0.5)))) / (count(where=(morphology > 0.5)) + count(where=(cell > 0.5)) + 1e-9) < 0.8\n"
       },
       {
         "name": "glucose_death",
