@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Digital Tissue</title>
+    <link rel="stylesheet" href="style.css" />
+    <style>
+      .portal{
+        height:100%;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        padding:28px;
+      }
+      .portalCard{
+        width:min(820px, 100%);
+        background: rgba(22, 23, 26, .85);
+        border:1px solid var(--border);
+        border-radius:16px;
+        padding:22px;
+        backdrop-filter: blur(12px);
+      }
+      .portalTitle{font-weight:750; font-size:18px; margin:0 0 6px 0;}
+      .portalSub{color:var(--muted); margin:0 0 16px 0; line-height:1.5;}
+      .portalActions{display:flex; gap:10px; flex-wrap:wrap;}
+      .portalMeta{margin-top:14px; color:var(--muted); font-size:12px;}
+      .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;}
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar__titleWrap">
+          <div class="topbar__title">Digital Tissue</div>
+          <div class="topbar__fileInfo">Choose a tool</div>
+        </div>
+        <div class="topbar__actions"></div>
+      </header>
+
+      <div class="portal">
+        <div class="portalCard">
+          <h1 class="portalTitle">Workspace</h1>
+          <p class="portalSub">
+            Use the editor to modify grid layers and run the simulation. Use benchmarks to launch and inspect LLM benchmark suites.
+          </p>
+
+          <div class="portalActions">
+            <a class="btn btn--primary" href="/editor">Open Editor</a>
+            <a class="btn btn--secondary" href="/benchmarks" target="_blank" rel="noopener">Open Benchmarks</a>
+          </div>
+
+          <div class="portalMeta">
+            Editor runs on this server. Benchmarks runs on a separate Streamlit server and opens in a new tab.
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

@@ -14,8 +14,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from apply_layer_ops import apply_layer_ops_inplace
-from output_calc import _ExprEval
+from backend.digital_tissue.apply_layer_ops import apply_layer_ops_inplace
+from backend.digital_tissue.output_calc import _ExprEval
 
 
 @dataclass(frozen=True)
@@ -457,7 +457,7 @@ def _optimize_cem(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gridstate", type=str, default=str(Path("array") / "gridstate.json"))
+    ap.add_argument("--gridstate", type=str, default=str(Path("assets") / "examples" / "gridstate.json"))
     ap.add_argument("--measurement", type=str, default="morphological_health")
     ap.add_argument("--control-mode", type=str, default="gene", choices=["gene", "rna", "protein", "molecule", "all"])
     ap.add_argument("--optimizer", type=str, default="random", choices=["random", "cem"])

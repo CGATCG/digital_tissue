@@ -807,8 +807,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--path",
         type=Path,
-        default=Path("array/gridstate.json"),
-        help="Path to gridstate.json (default: array/gridstate.json)",
+        default=Path("assets/examples/gridstate.json"),
+        help="Path to gridstate.json (default: assets/examples/gridstate.json)",
     )
     p.add_argument(
         "--config",

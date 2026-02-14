@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _default_server_python() -> str:
@@ -254,7 +254,7 @@ def main() -> int:
         stderr_f = open(stderr_path, "wb")
 
         proc = subprocess.Popen(
-            [python_exe, str(REPO_ROOT / "runtime_server.py"), str(port)],
+            [python_exe, "-m", "backend.runtime_server", str(port)],
             cwd=str(REPO_ROOT),
             env=env,
             stdout=stdout_f,

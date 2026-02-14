@@ -289,15 +289,17 @@ mean(glucose, where=(circulation==1) & (cell==1))
 
 ## 10) Key source references
 
-- `web_editor/app.js`
+- `backend/runtime_server.py`
+  - parser and validator for `payload["measurements"]`
+  - measurement evaluation and time series construction
+
+- `apps/editor/app.js`
   - `buildFunctionsConfigJson()`
   - `validateMeasurementExpr()`
   - `_parseMeasurementsConfigObject()` and `_convertV2ToV3Measurements()`
 
-- `runtime_server.py`
-  - `_compute_measurements_from_layers()`
   - `_compute_selected_measurements_from_layers()`
   - evolution usage of `fitness_weights.measurements` and `fitness_weights.measurement_aggs`
 
-- `output_calc.py`
+- `backend/digital_tissue/output_calc.py`
   - `_ExprEval` (authoritative measurement expression evaluator)

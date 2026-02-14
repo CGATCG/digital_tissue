@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
 def _atomic_write_json(path: Path, obj: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -33,7 +38,7 @@ def _pid_alive(pid: int) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", dest="run_dir", default="runs/evolution")
+    ap.add_argument("--dir", dest="run_dir", default="var/runs/evolution")
     args = ap.parse_args()
 
     run_dir = Path(str(args.run_dir)).resolve()
@@ -77,7 +82,7 @@ def main() -> int:
         base_payload = {}
 
     try:
-        import runtime_server as rs
+        import backend.runtime_server as rs
 
         rs._setup_logging()
         rs._install_exception_hooks()

@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from apply_layer_ops import apply_layer_ops_inplace
+from backend.digital_tissue.apply_layer_ops import apply_layer_ops_inplace
 
 
 def _b64_f32(a: np.ndarray) -> str:

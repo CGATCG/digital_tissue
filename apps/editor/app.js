@@ -1393,7 +1393,7 @@ async function _rtGetJson(path, opts) {
   const looksLikeHtml = /^\s*<!doctype\s+html/i.test(txt) || /^\s*<html/i.test(txt);
   if (res.status === 501 || (looksLikeHtml && /Unsupported method \('POST'\)/i.test(txt))) {
     throw new Error(
-      "Runtime API not available at this URL. You are likely serving the editor with a static server (e.g. `python -m http.server`).\n\nRun: `python3 runtime_server.py`\nThen open: http://127.0.0.1:8000/"
+      "Runtime API not available at this URL. You are likely serving the editor with a static server (e.g. `python -m http.server`).\n\nRun: `python3 -m backend.runtime_server`\nThen open: http://127.0.0.1:8000/"
     );
   }
   if (!res.ok) {
@@ -2284,7 +2284,7 @@ async function _rtPostJson(path, bodyObj, opts) {
   const looksLikeHtml = /^\s*<!doctype\s+html/i.test(txt) || /^\s*<html/i.test(txt);
   if (res.status === 501 || (looksLikeHtml && /Unsupported method \('POST'\)/i.test(txt))) {
     throw new Error(
-      "Runtime API not available at this URL. You are likely serving the editor with a static server (e.g. `python -m http.server`).\n\nRun: `python3 runtime_server.py`\nThen open: http://127.0.0.1:8000/"
+      "Runtime API not available at this URL. You are likely serving the editor with a static server (e.g. `python -m http.server`).\n\nRun: `python3 -m backend.runtime_server`\nThen open: http://127.0.0.1:8000/"
     );
   }
 
@@ -5400,13 +5400,13 @@ async function _docOpenPrompt(token) {
   const files = Array.isArray(out?.files) ? out.files : [];
   const names = files.map((x) => String(x?.name || "").trim()).filter((x) => x);
   if (!names.length) {
-    alert("No documents found in documents/");
+    alert("No models found in models/");
     return;
   }
   
   // Show picker modal
   console.log("Showing picker modal...");
-  const name = await _docModalPick("Open document", names, "");
+  const name = await _docModalPick("Open model", names, "");
   console.log("Modal returned:", name);
   
   if (!name) {
@@ -13418,7 +13418,7 @@ ui.saveBtn.addEventListener("click", () => {
       await _docAutosaveNow();
       let name = null;
       if (!serverDocPath) {
-        name = await _docModalText("Save as", "untitled.json", "relative to documents/", "Save");
+        name = await _docModalText("Save as", "untitled.json", "relative to models/", "Save");
         if (!name) return;
       }
       await _docPost("/api/doc/save", name ? { name } : {});
@@ -13437,7 +13437,7 @@ if (ui.saveAsBtn) {
         await _docAutosaveNow();
         const base = serverDocPath ? String(serverDocPath).split("/").pop() : "";
         const defName = base && base.trim() ? base : "untitled.json";
-        const name = await _docModalText("Save as", defName, "relative to documents/", "Save");
+        const name = await _docModalText("Save as", defName, "relative to models/", "Save");
         if (!name) return;
         await _docPost("/api/doc/save", { name });
         dirtySinceLastSave = false;
@@ -13471,10 +13471,10 @@ if (ui.deleteBtn) {
           .map((f) => (f && typeof f === "object" ? String(f.name || "").trim() : ""))
           .filter((x) => !!x);
         if (names.length === 0) {
-          alert("No documents to delete.");
+          alert("No models to delete.");
           return;
         }
-        const picked = await _docModalPick("Delete file", names, "");
+        const picked = await _docModalPick("Delete model", names, "");
         if (_docIsStale(token)) return;
         if (!picked) return;
 
@@ -13495,7 +13495,7 @@ if (ui.deleteBtn) {
           .filter((x) => !!x);
         if (names2.includes(String(picked))) {
           throw new Error(
-            `Delete did not remove '${picked}'. Make sure you restarted runtime_server.py and that it has write permission to documents/.`,
+            `Delete did not remove '${picked}'. Make sure you restarted backend.runtime_server and that it has write permission to models/.`,
           );
         }
 

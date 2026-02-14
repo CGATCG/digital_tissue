@@ -9,6 +9,8 @@ venv/
 *.log
 runs/
 vars.sh
+xai_key.txt
+keys.txt
 
 workspace/*.json
 workspace/omics_runs/
@@ -16,5 +18,4 @@ workspace/llm_debug/
 
 preflight_bundle*.json
 costs.csv
-
-xai_key.txt
+var/

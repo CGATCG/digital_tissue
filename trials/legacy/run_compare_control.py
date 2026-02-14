@@ -37,7 +37,7 @@ def _run_one(cmd: List[str]) -> Dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gridstate", type=str, default=str(Path("array") / "gridstate.json"))
+    ap.add_argument("--gridstate", type=str, default=str(Path("assets") / "examples" / "gridstate.json"))
     ap.add_argument("--horizon", type=int, default=8)
     ap.add_argument("--gamma", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=0)

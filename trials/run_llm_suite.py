@@ -13,6 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from backend.env_keys import apply_keys_to_environ
+except Exception:
+    apply_keys_to_environ = None  # type: ignore
+
 
 @dataclass
 class RunSpec:
@@ -87,7 +92,7 @@ def _repo_root() -> Path:
 
 
 def _runs_root() -> Path:
-    return _repo_root() / "runs" / "llm_bench"
+    return _repo_root() / "var" / "runs" / "llm_bench"
 
 
 def _suites_root() -> Path:
@@ -545,6 +550,12 @@ def _write_aggregate_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def main() -> int:
+    try:
+        if apply_keys_to_environ is not None:
+            apply_keys_to_environ()
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser(description="Run multiple LLM benchmark configs sequentially and write a suite summary CSV.")
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
     ap.add_argument("--challenge", default="cancer", choices=["cancer", "hereditary_disease", "aging"])
@@ -553,7 +564,7 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=8000)
     ap.add_argument("--api-timeout", type=float, default=5000.0)
     ap.add_argument("--llm-timeout", type=float, default=5000.0)
-    ap.add_argument("--prompt-file", default="", help="Prompt file under prompts/ to use for all runs in this suite.")
+    ap.add_argument("--prompt-file", default="", help="Prompt file under assets/prompts/ to use for all runs in this suite.")
     ap.add_argument("--reset-first", action="store_true")
     ap.add_argument("--replicates", type=int, default=1)
     ap.add_argument("--cooldown-s", type=float, default=0.0)

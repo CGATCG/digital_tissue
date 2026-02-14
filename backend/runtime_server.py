@@ -34,9 +34,19 @@ import urllib.request
 import numpy as np
 
 try:
+    from backend.env_keys import apply_keys_to_environ
+except Exception:
+    apply_keys_to_environ = None  # type: ignore
+
+try:
     from openai import OpenAI
 except Exception:
     OpenAI = None  # type: ignore
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 _ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
@@ -1026,8 +1036,8 @@ def _http_post_multipart_file(
         obj = {}
     return obj
 
-from apply_layer_ops import _decode_float32_b64, _encode_float32_b64, apply_layer_ops_inplace
-from output_calc import _ExprEval
+from backend.digital_tissue.apply_layer_ops import _decode_float32_b64, _encode_float32_b64, apply_layer_ops_inplace
+from backend.digital_tissue.output_calc import _ExprEval
 
 
 def _pathway_compute_topology(step: Dict[str, Any]) -> Dict[str, Any]:
@@ -1141,39 +1151,57 @@ def _setup_logging() -> None:
     sh.setFormatter(fmt)
     _LOG.addHandler(sh)
 
+    log_dir = None
     try:
-        log_path = (Path(__file__).resolve().parent / "runtime_server.log").resolve()
-        fh = logging.handlers.RotatingFileHandler(
-            str(log_path),
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(fmt)
-        _LOG.addHandler(fh)
+        log_dir = str(os.environ.get("DT_LOG_DIR") or "").strip()
     except Exception:
-        pass
+        log_dir = ""
 
+    base: Optional[Path] = None
     try:
-        err_path = (Path(__file__).resolve().parent / "stderr.log").resolve()
-        eh = logging.handlers.RotatingFileHandler(
-            str(err_path),
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        eh.setLevel(logging.WARNING)
-        eh.setFormatter(fmt)
-        _LOG.addHandler(eh)
+        base = Path(log_dir).expanduser().resolve() if log_dir else (_REPO_ROOT / "var" / "log").resolve()
+        base.mkdir(parents=True, exist_ok=True)
     except Exception:
-        pass
+        base = None
+
+    if base is not None:
+        try:
+            log_path = (base / "runtime_server.log").resolve()
+            fh = logging.handlers.RotatingFileHandler(
+                str(log_path),
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(fmt)
+            _LOG.addHandler(fh)
+        except Exception:
+            pass
+
+    if base is not None:
+        try:
+            err_path = (base / "stderr.log").resolve()
+            eh = logging.handlers.RotatingFileHandler(
+                str(err_path),
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            eh.setLevel(logging.WARNING)
+            eh.setFormatter(fmt)
+            _LOG.addHandler(eh)
+        except Exception:
+            pass
 
     global _FAULT_FH
-    try:
-        fault_path = (Path(__file__).resolve().parent / "runtime_server_faulthandler.log").resolve()
-        _FAULT_FH = open(fault_path, "a", encoding="utf-8")
-    except Exception:
+    if base is not None:
+        try:
+            fault_path = (base / "runtime_server_faulthandler.log").resolve()
+            _FAULT_FH = open(fault_path, "a", encoding="utf-8")
+        except Exception:
+            _FAULT_FH = None
+    else:
         _FAULT_FH = None
 
 
@@ -1206,7 +1234,10 @@ def _install_exception_hooks() -> None:
         else:
             faulthandler.enable(all_threads=True)
         if hasattr(signal, "SIGUSR1"):
-            faulthandler.register(signal.SIGUSR1, all_threads=True)
+            if _FAULT_FH is not None:
+                faulthandler.register(signal.SIGUSR1, file=_FAULT_FH, all_threads=True)
+            else:
+                faulthandler.register(signal.SIGUSR1, all_threads=True)
     except Exception:
         pass
 
@@ -1800,8 +1831,16 @@ def _preflight_death_before_ticks(
     return None
 
 
-_STX_GENESETS_DIR = (Path(__file__).resolve().parent / "spatial_transcriptomics").resolve()
-_BULK_OMICS_DIR = (Path(__file__).resolve().parent / "bulk_omics").resolve()
+_STX_GENESETS_DIR = (_REPO_ROOT / "assets" / "omics" / "spatial_transcriptomics").resolve()
+_BULK_OMICS_DIR = (_REPO_ROOT / "assets" / "omics" / "bulk_omics").resolve()
+
+_STX_GENESETS_DIR_NEW = (_REPO_ROOT / "settings" / "omics" / "spatial_transcriptomics").resolve()
+_BULK_OMICS_DIR_NEW = (_REPO_ROOT / "settings" / "omics" / "bulk_omics").resolve()
+
+if _STX_GENESETS_DIR_NEW.exists() and _STX_GENESETS_DIR_NEW.is_dir():
+    _STX_GENESETS_DIR = _STX_GENESETS_DIR_NEW
+if _BULK_OMICS_DIR_NEW.exists() and _BULK_OMICS_DIR_NEW.is_dir():
+    _BULK_OMICS_DIR = _BULK_OMICS_DIR_NEW
 
 
 _BULK_OMICS_MASK_DICT_LOCK = threading.Lock()
@@ -2280,13 +2319,17 @@ def _profile_run_payload(
     return out
 
 
-_WEB_DIR = Path(__file__).resolve().parent / "web_editor"
-_RUNS_DIR = Path(__file__).resolve().parent / "runs" / "evolution"
-_DOCS_DIR = Path(os.environ.get("DT_DOCS_DIR") or (Path(__file__).resolve().parent / "documents"))
-_WORKSPACE_DIR = Path(os.environ.get("DT_WORKSPACE_DIR") or (Path(__file__).resolve().parent / "workspace"))
+_WEB_DIR = (_REPO_ROOT / "apps" / "editor").resolve()
+_RUNS_DIR = (_REPO_ROOT / "var" / "runs" / "evolution").resolve()
+_DOCS_DIR = Path(
+    os.environ.get("DT_MODELS_DIR")
+    or os.environ.get("DT_DOCS_DIR")
+    or (_REPO_ROOT / "assets" / "models")
+)
+_WORKSPACE_DIR = Path(os.environ.get("DT_WORKSPACE_DIR") or (_REPO_ROOT / "workspace"))
 _OMICS_RUNS_DIR = _WORKSPACE_DIR / "omics_runs"
-_TESTS_DIR = Path(__file__).resolve().parent / "tests"
-_TESTS_PRICING_PATH = _TESTS_DIR / "pricing.json"
+_CHALLENGES_DIR = _REPO_ROOT / "benchmarks" / "challenges"
+_TESTS_PRICING_PATH = (_REPO_ROOT / "settings" / "pricing.json").resolve()
 
 _GAME_STATE_PATH = _WORKSPACE_DIR / "game_state.json"
 _GAME_LOCK = threading.RLock()
@@ -2340,7 +2383,7 @@ def _tests_cancer_model_path(model_key: Any) -> Path:
     fn = _TESTS_CANCER_MODELS.get(key)
     if not fn:
         raise ValueError("unknown model")
-    base = (_TESTS_DIR / "cancer").resolve()
+    base = (_CHALLENGES_DIR / "cancer").resolve()
     p = (base / str(fn)).resolve()
     if base not in p.parents:
         raise ValueError("invalid model")
@@ -2375,7 +2418,7 @@ def _tests_hereditary_disease_model_path(model_key: Any) -> Path:
     fn = _TESTS_HEREDITARY_DISEASE_MODELS.get(key)
     if not fn:
         raise ValueError("unknown model")
-    base = (_TESTS_DIR / "hereditary_disease").resolve()
+    base = (_CHALLENGES_DIR / "hereditary_disease").resolve()
     p = (base / str(fn)).resolve()
     if base not in p.parents:
         raise ValueError("invalid model")
@@ -2396,7 +2439,7 @@ def _tests_aging_model_path(model_key: Any) -> Path:
     fn = _TESTS_AGING_MODELS.get(key)
     if not fn:
         raise ValueError("unknown model")
-    base = (_TESTS_DIR / "aging").resolve()
+    base = (_CHALLENGES_DIR / "aging").resolve()
     p = (base / str(fn)).resolve()
     if base not in p.parents:
         raise ValueError("invalid model")
@@ -6607,16 +6650,16 @@ def _evo_start_runner(payload: Dict[str, Any], cfg: Dict[str, Any]) -> str:
     except Exception:
         pass
 
-    runner_path = (Path(__file__).resolve().parent / "evolution_runner.py").resolve()
+    runner_path = (_REPO_ROOT / "backend" / "digital_tissue" / "evolution_runner.py").resolve()
     if not runner_path.exists():
-        raise ValueError("missing evolution_runner.py")
+        raise ValueError("missing backend/digital_tissue/evolution_runner.py")
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
     try:
         subprocess.Popen(
-            [sys.executable, str(runner_path), "--dir", str(_RUNS_DIR)],
-            cwd=str(Path(__file__).resolve().parent),
+            [sys.executable, "-m", "backend.digital_tissue.evolution_runner", "--dir", str(_RUNS_DIR)],
+            cwd=str(_REPO_ROOT),
             env=env,
             start_new_session=True,
             stdin=subprocess.DEVNULL,
@@ -6806,7 +6849,7 @@ def _pid_looks_like_evo_runner(pid: int) -> bool:
     try:
         cmd = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
         s = cmd.decode("utf-8", errors="ignore")
-        return "evolution_runner.py" in s
+        return ("evolution_runner.py" in s) or ("backend.digital_tissue.evolution_runner" in s)
     except Exception:
         return False
 
@@ -9840,8 +9883,28 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
     def do_HEAD(self):  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/testing_api_points":
-            self.path = "/testing_api_points.html"
+        if path == "/":
+            self.path = "/portal.html"
+            return super().do_HEAD()
+        if path == "/editor":
+            self.path = "/index.html"
+            return super().do_HEAD()
+        if path in ("/benchmarks", "/monitor"):
+            port = 8001
+            try:
+                port = int(os.environ.get("DT_BENCHMARKS_PORT") or os.environ.get("DT_MONITOR_PORT") or "8001")
+            except Exception:
+                port = 8001
+            host = str(self.headers.get("Host") or "127.0.0.1").strip()
+            hostname = host
+            if ":" in host:
+                hostname = host.split(":", 1)[0].strip() or "127.0.0.1"
+            qs = ("?" + parsed.query) if parsed.query else ""
+            loc = f"http://{hostname}:{int(port)}/{qs}" if qs else f"http://{hostname}:{int(port)}/"
+            self.send_response(302)
+            self.send_header("Location", loc)
+            self.end_headers()
+            return
         return super().do_HEAD()
 
     def do_GET(self):  # noqa: N802
@@ -9850,9 +9913,29 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
         try:
-            if path == "/testing_api_points":
-                self.path = "/testing_api_points.html"
+            if path == "/":
+                self.path = "/portal.html"
                 super().do_GET()
+                return
+            if path == "/editor":
+                self.path = "/index.html"
+                super().do_GET()
+                return
+            if path in ("/benchmarks", "/monitor"):
+                port = 8001
+                try:
+                    port = int(os.environ.get("DT_BENCHMARKS_PORT") or os.environ.get("DT_MONITOR_PORT") or "8001")
+                except Exception:
+                    port = 8001
+                host = str(self.headers.get("Host") or "127.0.0.1").strip()
+                hostname = host
+                if ":" in host:
+                    hostname = host.split(":", 1)[0].strip() or "127.0.0.1"
+                qs_raw = ("?" + parsed.query) if parsed.query else ""
+                loc = f"http://{hostname}:{int(port)}/{qs_raw}" if qs_raw else f"http://{hostname}:{int(port)}/"
+                self.send_response(302)
+                self.send_header("Location", loc)
+                self.end_headers()
                 return
             if path == "/api/health":
                 self._send_json(200, {"ok": True, "tick": int(_RT.tick)})
@@ -15552,12 +15635,18 @@ class RuntimeHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> int:
+    try:
+        if apply_keys_to_environ is not None:
+            apply_keys_to_environ()
+    except Exception:
+        pass
+
     _setup_logging()
     _install_exception_hooks()
     _ensure_dirs()
     if not _WEB_DIR.exists():
         try:
-            _LOG.error("web editor dir not found: %s", str(_WEB_DIR))
+            _LOG.error("editor dir not found: %s", str(_WEB_DIR))
         except Exception:
             pass
         return 2

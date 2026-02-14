@@ -13,7 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from apply_layer_ops import apply_layer_ops_inplace  # noqa: E402
+from backend.digital_tissue.apply_layer_ops import apply_layer_ops_inplace  # noqa: E402
 
 
 class _DefaultRngPatch:
@@ -144,7 +144,7 @@ def _metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gridstate", type=str, default=str(Path("array") / "gridstate.json"))
+    ap.add_argument("--gridstate", type=str, default=str(Path("assets") / "examples" / "gridstate.json"))
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default=str(Path("trials") / "baseline_diagnostics.json"))

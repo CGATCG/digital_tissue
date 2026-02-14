@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+try:
+    from backend.env_keys import apply_keys_to_environ
+except Exception:
+    apply_keys_to_environ = None  # type: ignore
+
 
 def _http_post_json(*, url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
     raw = json.dumps(payload).encode("utf-8")
@@ -100,7 +105,7 @@ def _repo_root() -> Path:
 
 
 def _prompts_dir() -> Path:
-    return _repo_root() / "prompts"
+    return _repo_root() / "assets" / "prompts"
 
 
 def _read_prompt_text(prompt_file: Optional[str]) -> Tuple[str, str]:
@@ -3881,6 +3886,12 @@ def run_benchmark(
 
 
 def main() -> int:
+    try:
+        if apply_keys_to_environ is not None:
+            apply_keys_to_environ()
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser(description="LLM benchmark runner for the disease challenge (tool-using biology).")
     ap.add_argument("--base-url", default="http://127.0.0.1:8000", help="Runtime server base URL.")
     ap.add_argument(
@@ -3906,7 +3917,7 @@ def main() -> int:
     ap.add_argument("--artifacts-dir", default="", help="(legacy) Alias for --files-dir.")
     ap.add_argument("--state-out", default="", help="Optional JSON checkpoint file for resuming a run.")
     ap.add_argument("--resume-state", default="", help="Resume a run from a previous --state-out checkpoint.")
-    ap.add_argument("--prompt-file", default="", help="Optional prompt file name (relative to prompts/) or absolute path.")
+    ap.add_argument("--prompt-file", default="", help="Optional prompt file name (relative to assets/prompts/) or absolute path.")
     ap.add_argument("--print-prompt", action="store_true", help="Print the benchmark prompt and exit.")
     ap.add_argument("--run-id", default="", help="Optional run_id label for tracking (e.g. run_...).")
     ap.add_argument("--suite-id", default="", help="Optional suite_id label for tracking (e.g. suite_...).")

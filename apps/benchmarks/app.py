@@ -25,6 +25,11 @@ try:
 except Exception:
     OpenAI = None
 
+try:
+    from backend.env_keys import apply_keys_to_environ
+except Exception:
+    apply_keys_to_environ = None  # type: ignore
+
 
 @dataclass
 class RunPaths:
@@ -54,12 +59,19 @@ class SuitePaths:
     manifest_path: Path
 
 
+try:
+    if apply_keys_to_environ is not None:
+        apply_keys_to_environ()
+except Exception:
+    pass
+
+
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def _prompts_dir() -> Path:
-    return _repo_root() / "prompts"
+    return _repo_root() / "assets" / "prompts"
 
 
 def _list_prompt_files() -> List[str]:
@@ -108,7 +120,7 @@ def _story_executor() -> concurrent.futures.ThreadPoolExecutor:
 
 
 def _runs_root() -> Path:
-    return _repo_root() / "runs" / "llm_bench"
+    return _repo_root() / "var" / "runs" / "llm_bench"
 
 
 def _suites_root() -> Path:
@@ -3009,7 +3021,7 @@ def _stop_proc(proc: Any) -> None:
         pass
 
 
-st.set_page_config(page_title="LLM Benchmark Monitor", layout="wide")
+st.set_page_config(page_title="LLM Benchmarks", layout="wide")
 
 _ensure_session_state()
 _bootstrap_active_run_id()
@@ -3017,7 +3029,7 @@ _bootstrap_active_suite_id()
 
 col_title, col_refresh = st.columns([0.78, 0.22])
 with col_title:
-    st.title("LLM Benchmark Monitor")
+    st.title("LLM Benchmarks")
 with col_refresh:
     manual_refresh_clicked = st.button("Refresh now", use_container_width=True, key="refresh_now_top")
 

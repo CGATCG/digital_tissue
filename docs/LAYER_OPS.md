@@ -2,7 +2,7 @@
 
 This document describes how **Layer Ops** works in the `digital_tissue` project.
 
-Layer Ops is the simulation “update step” system: each tick, a configured sequence of operations reads and writes named **layers** on a 2D grid. Layer Ops is defined by a JSON config embedded in the simulation payload (`gridstate.json` / “payload”), and executed by `apply_layer_ops.py`.
+Layer Ops is the simulation “update step” system: each tick, a configured sequence of operations reads and writes named **layers** on a 2D grid. Layer Ops is defined by a JSON config embedded in the simulation payload (`gridstate.json` / “payload”), and executed by `backend/digital_tissue/apply_layer_ops.py`.
 
 This doc is written to be used as **context for an LLM**.
 
@@ -33,14 +33,14 @@ This doc is written to be used as **context for an LLM**.
 
 ## 2) Where the authoritative behavior lives
 
-- **Executor**: `apply_layer_ops.py`
+- **Executor**: `backend/digital_tissue/apply_layer_ops.py`
   - entry point: `apply_layer_ops_inplace(payload, export_let_layers=False, seed_offset=0) -> int`
   - loads layers from payload (`_extract_layers`)
   - expands `foreach` into concrete steps
   - evaluates steps in order
   - writes updated layers back into payload as base64 float32 buffers
 
-- **UI** (editor/configuration): `web_editor/app.js`
+- **UI** (editor/configuration): `apps/editor/app.js`
   - user edits a structured Layer Ops config
   - the UI performs lightweight validation and provides conveniences like autocomplete
 
@@ -148,7 +148,7 @@ During evaluation, the expression environment contains:
 
 ### Allowed functions
 
-From `apply_layer_ops.py` the core functions are:
+From `backend/digital_tissue/apply_layer_ops.py` the core functions are:
 
 - `where(a, b, c)` → elementwise selection (numpy `where`)
 - `clip(x, lo, hi)`
@@ -712,10 +712,10 @@ If you are generating Layer Ops configs programmatically:
 
 ## 14) Key source references
 
-- `apply_layer_ops.py`
+- `backend/digital_tissue/apply_layer_ops.py`
   - `apply_layer_ops_inplace`
   - `_expand_foreach_steps`
   - expression validation/eval (`_compile_expr_cached`, `_eval_expr_fast`)
 
-- `web_editor/app.js`
+- `apps/editor/app.js`
   - validation helpers and UI rendering for Layer Ops
