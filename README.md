@@ -1,8 +1,16 @@
 # digital_tissue
 
-Digital Tissue is a local-first Python toolkit for building and running simplified tissue simulations and benchmarking LLM agents against them.
+Digital Tissue is a local-first Python toolkit for building and running simplified tissue simulations and benchmarking LLM agents against them. Everything runs locally (no database required).
 
-Everything runs locally by default (no database required). This is a research/teaching tool and is not a medically validated model.
+A tissue is a grid of cells where each cell contains different molecules (genes, RNA, proteins) governed by rules that determine how they change over time. The entire simulation state lives in a single JSON file (`gridstate.json`).
+
+This repo includes:
+
+- A **web-based editor** to create and modify tissues — make them healthy, give them diseases, evolve them toward desired states
+- **LLM benchmark challenges** where an LLM agent interrogates the tissue through API endpoints (running experiments, requesting omics data, proposing interventions) to solve a problem
+- **Evolutionary optimization** to search over initial conditions and find tissue states that maximize an objective
+
+The main goal is to generate environments that are biology-like: many interacting variables, limited observability, noisy data, and open-ended problems that require reasoning to solve.
 
 ## Requirements
 
@@ -88,7 +96,7 @@ python3 trials/run_llm_suite.py --help
 
 ## Extended documentation
 
-I highly recommend to learn how to use this repo by talking to a AI assistant that has read the repo. However, below is an attempt to summarize the key concepts.
+I highly recommend learning how to use this repo by talking to an AI assistant that has read it. However, below is an attempt to summarize the key concepts.
 
 ### What is a tissue simulation?
 
