@@ -929,7 +929,6 @@ def _anthropic_messages_code_execution(
         "tools": [
             {
                 "type": "code_execution_20250825",
-                "name": "code_execution",
             }
         ],
     }
@@ -948,6 +947,22 @@ def _anthropic_messages_code_execution(
         payload["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
         payload["temperature"] = 1.0
 
+    def _strip_disallowed_fields(x: Any) -> None:
+        if isinstance(x, dict):
+            if "use_web_search_purpose" in x:
+                try:
+                    x.pop("use_web_search_purpose", None)
+                except Exception:
+                    pass
+            for v in list(x.values()):
+                _strip_disallowed_fields(v)
+            return
+        if isinstance(x, list):
+            for it in list(x):
+                _strip_disallowed_fields(it)
+
+    _strip_disallowed_fields(payload)
+
     last_err: Optional[str] = None
     for attempt in range(3):
         try:
@@ -964,6 +979,16 @@ def _anthropic_messages_code_execution(
             )
         except Exception as e:
             last_err = str(e)
+            if attempt < 2 and "use_web_search_purpose" in last_err:
+                try:
+                    payload.pop("thinking", None)
+                    payload.pop("temperature", None)
+                    payload.pop("configurations", None)
+                    _strip_disallowed_fields(payload)
+                except Exception:
+                    pass
+                time.sleep(float(0.2 * (2**attempt)))
+                continue
             if "HTTP 529" in last_err or "overloaded_error" in last_err.lower() or "overloaded" in last_err.lower():
                 if attempt < 2:
                     time.sleep(float(0.8 * (2**attempt)))

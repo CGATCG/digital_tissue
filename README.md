@@ -1,78 +1,101 @@
 # digital_tissue
 
-Digital Tissue is a toolkit for making and running **biological puzzles**.
+Digital Tissue is a local-first Python toolkit for building and running simplified tissue simulations and benchmarking LLM agents against them.
 
-The main goal of this repo is to create small, runnable tissue simulations (with “diseases” and measurable outcomes) and then **test how well LLMs can solve them**.
+Everything runs locally by default (no database required). This is a research/teaching tool and is not a medically validated model.
 
-Everything runs locally by default. There is no database requirement.
+## Requirements
 
-This is a research and teaching tool. It is intentionally simplified and is not a medically validated model.
+- Python `3.10+`
+- macOS or Linux (Windows via WSL is likely fine)
 
-## What you can do (high level)
+## Installation
 
-- Explore a tissue simulation in your browser.
-- Create or edit a puzzle model (a JSON file) and rerun instantly.
-- Run “disease challenge” scenarios (cancer / aging / hereditary disease).
-- Run benchmark suites where an LLM acts like an agent that can:
-  - read puzzle instructions
-  - run experiments through the backend API
-  - propose interventions
-  - get scored on whether it improved the outcome
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
 
-## How it works (short version)
+## Quickstart (Editor UI, no LLM keys required)
 
-- **Simulator backend (Python)**: runs the simulation and exposes an HTTP API.
-- **Editor UI (browser)**: lets you load a model, run it step-by-step, and inspect what happened.
-- **Benchmark runner + UI (optional)**: runs suites of LLM-driven puzzle attempts and saves reports.
+Start the backend and UIs:
 
-You can use the editor without any LLM keys. LLM keys are only needed for LLM benchmarks.
+```bash
+python3 -m backend.tools.run_ui
+```
+
+Open:
+
+- `http://127.0.0.1:8000/` (portal)
+- `http://127.0.0.1:8000/editor` (editor)
+
+To change ports:
+
+```bash
+python3 -m backend.tools.run_ui --runtime-port 8000 --benchmarks-port 8001
+```
+
+Backend only (no Streamlit UI):
+
+```bash
+python3 -m backend.runtime_server 8000
+```
+
+## LLM benchmarks (optional)
+
+To run LLM-driven benchmark episodes, you need API keys.
+
+Create `keys.txt` at the repo root (it is gitignored):
+
+```text
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+XAI_API_KEY=
+GEMINI_API_KEY=
+```
+
+Or point to a different file path with `DT_KEYS_FILE`.
+
+Once the servers are running, open the Benchmarks UI:
+
+- `http://127.0.0.1:8001/`
+
+You can also run benchmark scripts directly:
+
+```bash
+python3 trials/run_llm_benchmark.py --help
+python3 trials/run_llm_suite.py --help
+```
+
+## Outputs
+
+- Benchmark run artifacts: `var/runs/llm_bench/` (e.g. `events.jsonl`, `report.json`, logs)
+- Streamlit controller state: `var/runs/benchmarks/`
+- Runtime logs: `var/log/`
+
+## Repository layout
+
+- `backend/`: runtime server + simulation engine
+- `apps/editor/`: static editor UI served by the backend
+- `apps/benchmarks/`: Streamlit benchmarks UI
+- `benchmarks/challenges/`: fixture puzzles backing `/api/tests/*`
+- `assets/`: models, examples, prompts
+- `trials/`: CLI scripts for running/analyzing benchmarks
+- `docs/`: deeper references (`LAYER_OPS.md`, `MEASUREMENTS.md`)
+
+## License
+
+No license file is currently included in this repository.
 
 ---
 
-## Table of contents
+## Extended documentation
 
-- [What you can do (high level)](#what-you-can-do-high-level)
-- [How it works (short version)](#how-it-works-short-version)
-- [Who this is for](#who-this-is-for)
-- [What is a “biological puzzle”?](#what-is-a-biological-puzzle)
-- [How the LLM benchmark works](#how-the-llm-benchmark-works)
-- [Run an LLM benchmark (step-by-step)](#run-an-llm-benchmark-step-by-step)
-- [What you get from a benchmark run](#what-you-get-from-a-benchmark-run)
-- [Make your own puzzle](#make-your-own-puzzle)
-- [Try it in 5 minutes (no LLM keys required)](#try-it-in-5-minutes-no-llm-keys-required)
-- [Quick start (recommended)](#quick-start-recommended)
-- [Using the editor (step-by-step)](#using-the-editor-step-by-step)
-- [Where files and outputs go](#where-files-and-outputs-go)
-- [What the system does](#what-the-system-does)
-- [Repository layout](#repository-layout)
-- [Technical reference](#technical-reference)
-- [Key terms (optional)](#key-terms-optional)
-- [The `gridstate.json` format](#the-gridstatejson-format)
-- [Running the backend + UIs](#running-the-backend--uis)
-- [Web UI overview](#web-ui-overview)
-  - [Runtime screen](#runtime-screen)
-  - [Evolution screen](#evolution-screen)
-- [Benchmarks (optional)](#benchmarks-optional)
-- [Backend API](#backend-api)
-  - [Runtime API](#runtime-api)
-  - [Evolution API](#evolution-api)
-- [Evolution algorithms](#evolution-algorithms)
-- [Performance and profiling](#performance-and-profiling)
-- [Troubleshooting](#troubleshooting)
+The sections below contain a deeper walkthrough of concepts, APIs, UI behavior, and benchmark details.
 
----
-
-If you're new here, you can read the first sections and then jump straight to [Quick start](#quick-start-recommended). You do not need to understand the internal data format to use the editor.
-
-## Who this is for
-
-- If you are a student, you can use this repo to explore a simulation, change variables, and see how outcomes change.
-- If you are a biology researcher, you can use this as a sandbox for toy models and controlled intervention experiments.
-- If you are an AI/ML developer, you can use this as a benchmark harness: an LLM agent interacts with a simulator using tools and gets scored.
-
-## What is a “biological puzzle”?
-
-In this repo, a puzzle is a small simulation scenario with:
+## What is a tissue simulation?
 
 - a starting tissue state (cells + variables like molecules/RNA/proteins)
 - a set of rules that update the tissue over time
@@ -123,7 +146,7 @@ You can run benchmarks through:
 
 This is the easiest way to run the “LLM tries to solve the puzzle” part.
 
-1. Create `keys.txt` (see Quick start) and put in the API key(s) for the provider you want.
+1. Create `keys.txt` (see Quick start) and put in the API key(s) for the provider you want. 
 2. Start the servers:
 
 ```bash
